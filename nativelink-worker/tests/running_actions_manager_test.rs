@@ -67,6 +67,7 @@ mod tests {
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
     };
+    use nativelink_worker::path_digest_cache::PathDigestCache;
     use pretty_assertions::assert_eq;
     use prost::Message;
     use rand::Rng;
@@ -230,6 +231,8 @@ mod tests {
                 fast_store.as_pin(),
                 &root_directory_digest,
                 &download_dir,
+                None,
+                &PathDigestCache::new(),
             )
             .await?;
             download_dir
@@ -335,6 +338,8 @@ mod tests {
                 fast_store.as_pin(),
                 &root_directory_digest,
                 &download_dir,
+                None,
+                &PathDigestCache::new(),
             )
             .await?;
             download_dir
@@ -409,6 +414,8 @@ mod tests {
                 fast_store.as_pin(),
                 &root_directory_digest,
                 &download_dir,
+                None,
+                &PathDigestCache::new(),
             )
             .await?;
             download_dir

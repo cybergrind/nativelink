@@ -48,13 +48,14 @@ pub async fn hardlink_directory_tree(src_dir: &Path, dst_dir: &Path) -> Result<(
         src_dir.display()
     );
 
-    error_if!(
-        dst_dir.exists(),
-        "Destination directory already exists: {}",
-        dst_dir.display()
-    );
+    // Note: we intentionally do NOT reject a pre-existing dst_dir.
+    // The caller (inner_prepare_action) creates the work directory before
+    // invoking directory_cache::get_or_create, so dst_dir always pre-exists
+    // on the cache-hit path. create_dir_all below is idempotent, and
+    // hardlink_directory_tree_recursive will surface per-entry EEXIST errors
+    // on conflicting files if there's a real problem.
 
-    // Create the root destination directory
+    // Create the root destination directory (idempotent)
     fs::create_dir_all(dst_dir).await.err_tip(|| {
         format!(
             "Failed to create destination directory: {}",
@@ -187,9 +188,15 @@ fn set_readonly_recursive_impl<'a>(
             use std::os::unix::fs::PermissionsExt;
             let mut perms = metadata.permissions();
 
-            // If it's a directory, set to r-xr-xr-x (555)
-            // If it's a file, set to r--r--r-- (444)
-            let mode = if metadata.is_dir() { 0o555 } else { 0o444 };
+            // Strip write bits but preserve execute bits already present.
+            // Directories get 0o555. Files get (current_mode & 0o555) which
+            // preserves any existing +x (e.g. clang) while removing +w.
+            let current_mode = perms.mode();
+            let mode = if metadata.is_dir() {
+                0o555
+            } else {
+                current_mode & 0o555
+            };
             perms.set_mode(mode);
 
             fs::set_permissions(path, perms)
@@ -334,6 +341,17 @@ mod tests {
     async fn test_set_readonly_recursive() -> Result<(), Error> {
         let (_temp_dir, test_dir) = create_test_directory().await?;
 
+        // Mark file1.txt as executable BEFORE the readonly step, to cover the
+        // case of executables (e.g. clang) in the directory_cache.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exe_path = test_dir.join("file1.txt");
+            let mut p = fs::metadata(&exe_path).await?.permissions();
+            p.set_mode(0o755);
+            fs::set_permissions(&exe_path, p).await?;
+        }
+
         set_readonly_recursive(&test_dir).await?;
 
         // Verify files are read-only
@@ -342,6 +360,25 @@ mod tests {
 
         let metadata = fs::metadata(test_dir.join("subdir/file2.txt")).await?;
         assert!(metadata.permissions().readonly());
+
+        // Executable file must retain execute bits after readonly step.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exe_meta = fs::metadata(test_dir.join("file1.txt")).await?;
+            let mode = exe_meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o555,
+                "executable file should be 0o555 (r-x for all) after readonly, got {mode:o}",
+            );
+
+            let non_exe_meta = fs::metadata(test_dir.join("subdir/file2.txt")).await?;
+            let non_exe_mode = non_exe_meta.permissions().mode() & 0o777;
+            assert_eq!(
+                non_exe_mode, 0o444,
+                "non-executable file should be 0o444 (r-- for all) after readonly, got {non_exe_mode:o}",
+            );
+        }
 
         Ok(())
     }
@@ -375,10 +412,21 @@ mod tests {
         let (temp_dir, src_dir) = create_test_directory().await?;
         let dst_dir = temp_dir.path().join("existing");
 
+        // Pre-create the destination directory (simulates the common case where
+        // the worker's inner_prepare_action creates the work directory before
+        // calling directory_cache::get_or_create).
         fs::create_dir(&dst_dir).await?;
 
         let result = hardlink_directory_tree(&src_dir, &dst_dir).await;
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "expected ok for pre-existing empty dst, got {:?}",
+            result
+        );
+
+        // Files from src must have been materialized into dst
+        assert!(dst_dir.join("file1.txt").exists());
+        assert!(dst_dir.join("subdir").join("file2.txt").exists());
 
         Ok(())
     }

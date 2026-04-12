@@ -126,8 +126,17 @@ pub fn download_to_directory<'a>(
     filesystem_store: Pin<&'a FilesystemStore>,
     digest: &'a DigestInfo,
     current_directory: &'a str,
+    hint_root: Option<PathBuf>,
+    path_digest_cache: &'a crate::path_digest_cache::PathDigestCache,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
+        // Plan L: Merkle short-circuit. If this Directory subtree has been
+        // fully walked before (same digest = byte-identical content), skip
+        // the entire walk — no CAS fetch, no file loop, no recursion.
+        if path_digest_cache.dir_walked(digest) {
+            return Ok(());
+        }
+
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
             .await
             .err_tip(|| "Converting digest to Directory")?;
@@ -140,6 +149,9 @@ pub fn download_to_directory<'a>(
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
             let dest = format!("{}/{}", current_directory, file.name);
+            let expected_size: u64 = digest.size_bytes();
+            let hint_file: Option<PathBuf> =
+                hint_root.as_ref().map(|root| root.join(&file.name));
             let (mtime, mut unix_mode) = match file.node_properties {
                 Some(properties) => (properties.mtime, properties.unix_mode),
                 None => (None, None),
@@ -148,44 +160,88 @@ pub fn download_to_directory<'a>(
             if file.is_executable {
                 unix_mode = Some(unix_mode.unwrap_or(0o444) | 0o111);
             }
+            let dest_path_for_cache = PathBuf::from(&dest);
             futures.push(
-                cas_store
-                    .populate_fast_store(digest.into())
-                    .and_then(move |()| async move {
+                async move {
+                    // Plan K: cache-first. If this (path, digest) pair is already
+                    // known, skip all filesystem work.
+                    if path_digest_cache.contains(&dest_path_for_cache, &digest) {
+                        return Ok::<(), Error>(());
+                    }
+
+                    let mut did_materialize = false;
+                    let mut wrote_new_file = false;
+
+                    // Plan J: check if dest already exists with the expected size
+                    // (shared-tree mode — file is already in the pre-staged tree).
+                    if let Ok(md) = tokio::fs::metadata(&dest).await {
+                        if md.is_file() && md.len() == expected_size {
+                            did_materialize = true;
+                        }
+                    }
+
+                    // Plan I: try hardlink from hint path if dest wasn't found.
+                    if !did_materialize {
+                        if let Some(ref hint_file_path) = hint_file {
+                            if hint_file_path.as_path() != Path::new(&dest) {
+                                if let Ok(md) = tokio::fs::metadata(hint_file_path).await {
+                                    if md.is_file() && md.len() == expected_size {
+                                        if fs::hard_link(hint_file_path, &dest).await.is_ok() {
+                                            did_materialize = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !did_materialize {
+                        // Plan J: remove stale file before CAS fetch.
+                        drop(tokio::fs::remove_file(&dest).await);
+                        // Original CAS path.
+                        cas_store
+                            .populate_fast_store(digest.into())
+                            .await
+                            .map_err(|e| e.append(format!("populate_fast_store for digest {digest}")))?;
                         if is_zero_digest(digest) {
                             let mut file_slot = fs::create_file(&dest).await?;
                             file_slot.write_all(&[]).await?;
-                        }
-                        else {
+                        } else {
                             let file_entry = filesystem_store
                                 .get_file_entry_for_digest(&digest)
                                 .await
                                 .err_tip(|| "During hard link")?;
-                            // TODO: add a test for #2051: deadlock with large number of files
-                            let src_path = file_entry.get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) }).await?;
-                            fs::hard_link(&src_path, &dest)
-                                .await
-                                .map_err(|e| {
-                                    if e.code == Code::NotFound {
-                                        make_err!(
-                                            Code::Internal,
-                                            "Could not make hardlink, file was likely evicted from cache. {e:?} : {dest}\n\
-                                            This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
-                                            To fix this issue:\n\
-                                            1. Increase the 'max_bytes' value in your filesystem store configuration\n\
-                                            2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
-                                            3. The setting is typically found in your nativelink.json config under:\n\
-                                            stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
-                                            4. Restart NativeLink after making the change\n\n\
-                                            If this error persists after increasing max_bytes several times, please report at:\n\
-                                            https://github.com/TraceMachina/nativelink/issues\n\
-                                            Include your config file and both server and client logs to help us assist you."
-                                        )
-                                    } else {
-                                        make_err!(Code::Internal, "Could not make hardlink, {e:?} : {dest}")
-                                    }
-                                })?;
-                            }
+                            let src_path = file_entry
+                                .get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) })
+                                .await?;
+                            fs::hard_link(&src_path, &dest).await.map_err(|e| {
+                                if e.code == Code::NotFound {
+                                    make_err!(
+                                        Code::Internal,
+                                        "Could not make hardlink, file was likely evicted from cache. {e:?} : {dest}\n\
+                                        This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
+                                        To fix this issue:\n\
+                                        1. Increase the 'max_bytes' value in your filesystem store configuration\n\
+                                        2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
+                                        3. The setting is typically found in your nativelink.json config under:\n\
+                                        stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
+                                        4. Restart NativeLink after making the change\n\n\
+                                        If this error persists after increasing max_bytes several times, please report at:\n\
+                                        https://github.com/TraceMachina/nativelink/issues\n\
+                                        Include your config file and both server and client logs to help us assist you."
+                                    )
+                                } else {
+                                    make_err!(Code::Internal, "Could not make hardlink, {e:?} : {dest}")
+                                }
+                            })?;
+                        }
+                        wrote_new_file = true;
+                    }
+
+                    // Plan K: only apply perms and mtime when we actually wrote a
+                    // new file. Stat-hit and cache-hit paths leave the existing
+                    // on-disk modes and timestamps alone.
+                    if wrote_new_file {
                         #[cfg(target_family = "unix")]
                         if let Some(unix_mode) = unix_mode {
                             fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
@@ -197,13 +253,16 @@ pub fn download_to_directory<'a>(
                                 })?;
                         }
                         if let Some(mtime) = mtime {
+                            let dest_for_mtime = dest.clone();
                             spawn_blocking!("download_to_directory_set_mtime", move || {
                                 set_file_mtime(
-                                    &dest,
+                                    &dest_for_mtime,
                                     FileTime::from_unix_time(mtime.seconds, mtime.nanos as u32),
                                 )
                                 .err_tip(|| {
-                                    format!("Failed to set mtime in download_to_directory {dest}")
+                                    format!(
+                                        "Failed to set mtime in download_to_directory {dest_for_mtime}"
+                                    )
                                 })
                             })
                             .await
@@ -211,10 +270,15 @@ pub fn download_to_directory<'a>(
                                 || "Failed to launch spawn_blocking in download_to_directory",
                             )??;
                         }
-                        Ok(())
-                    })
-                    .map_err(move |e| e.append(format!("for digest {digest}")))
-                    .boxed(),
+                    }
+
+                    // Plan K: record the verified (path, digest) pair.
+                    path_digest_cache.insert(dest_path_for_cache, digest);
+
+                    Ok::<(), Error>(())
+                }
+                .map_err(move |e: Error| e.append(format!("for digest {digest}")))
+                .boxed(),
             );
         }
 
@@ -225,9 +289,13 @@ pub fn download_to_directory<'a>(
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
             let new_directory_path = format!("{}/{}", current_directory, directory.name);
+            let child_hint: Option<PathBuf> =
+                hint_root.as_ref().map(|root| root.join(&directory.name));
             futures.push(
                 async move {
-                    fs::create_dir(&new_directory_path)
+                    // Plan J: create_dir_all is idempotent — shared-tree subdirs
+                    // already exist from the pre-staged tree or a prior action.
+                    fs::create_dir_all(&new_directory_path)
                         .await
                         .err_tip(|| format!("Could not create directory {new_directory_path}"))?;
                     download_to_directory(
@@ -235,6 +303,8 @@ pub fn download_to_directory<'a>(
                         filesystem_store,
                         &digest,
                         &new_directory_path,
+                        child_hint,
+                        path_digest_cache,
                     )
                     .await
                     .err_tip(|| format!("in download_to_directory : {new_directory_path}"))?;
@@ -249,12 +319,20 @@ pub fn download_to_directory<'a>(
             let dest = format!("{}/{}", current_directory, symlink_node.name);
             futures.push(
                 async move {
-                    fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
-                        format!(
-                            "Could not create symlink {} -> {}",
-                            symlink_node.target, dest
-                        )
-                    })?;
+                    // Plan J: idempotent symlink — skip if already present.
+                    match tokio::fs::symlink_metadata(&dest).await {
+                        Ok(_) => {
+                            // Symlink already present; leave it.
+                        }
+                        Err(_) => {
+                            fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
+                                format!(
+                                    "Could not create symlink {} -> {}",
+                                    symlink_node.target, dest
+                                )
+                            })?;
+                        }
+                    }
                     Ok(())
                 }
                 .boxed(),
@@ -262,6 +340,9 @@ pub fn download_to_directory<'a>(
         }
 
         while futures.try_next().await?.is_some() {}
+        // Plan L: mark this Directory subtree as walked. Only inserted
+        // after all child futures succeed — partial walks never pollute.
+        path_digest_cache.mark_dir_walked(*digest);
         Ok(())
     }
     .boxed()
@@ -278,6 +359,8 @@ pub async fn prepare_action_inputs(
     filesystem_store: Pin<&FilesystemStore>,
     digest: &DigestInfo,
     work_directory: &str,
+    hint_root: Option<PathBuf>,
+    path_digest_cache: &crate::path_digest_cache::PathDigestCache,
 ) -> Result<(), Error> {
     // Try cache first if available
     if let Some(cache) = directory_cache {
@@ -304,7 +387,15 @@ pub async fn prepare_action_inputs(
     }
 
     // Traditional path (cache disabled or failed)
-    download_to_directory(cas_store, filesystem_store, digest, work_directory).await
+    download_to_directory(
+        cas_store,
+        filesystem_store,
+        digest,
+        work_directory,
+        hint_root,
+        path_digest_cache,
+    )
+    .await
 }
 
 #[cfg(target_family = "windows")]
@@ -764,7 +855,15 @@ impl RunningActionImpl {
         timeout: Duration,
         running_actions_manager: Arc<RunningActionsManagerImpl>,
     ) -> Self {
-        let work_directory = format!("{}/{}", action_directory, "work");
+        // Plan J: if the action carries an InputRootAbsolutePath platform
+        // property, use that path as the work directory directly. All actions
+        // share one filesystem view — like local `ninja -j20`.
+        let work_directory = action_info
+            .platform_properties
+            .get("InputRootAbsolutePath")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("{}/{}", action_directory, "work"));
         let (kill_channel_tx, kill_channel_rx) = oneshot::channel();
         Self {
             operation_id,
@@ -823,13 +922,21 @@ impl RunningActionImpl {
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
             let (command, ()) = try_join(command_fut, async {
-                fs::create_dir(&self.work_directory)
+                // Plan J: create_dir_all is idempotent. In shared-tree mode,
+                // work_directory is the pre-staged source tree (already exists).
+                fs::create_dir_all(&self.work_directory)
                     .await
                     .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
                 // Now the work directory has been created, we have to clean up.
                 self.did_cleanup.store(false, Ordering::Release);
                 // Download the input files/folder and place them into the temp directory.
                 // Use directory cache if available for better performance.
+                let hint_root: Option<PathBuf> = self
+                    .action_info
+                    .platform_properties
+                    .get("InputRootAbsolutePath")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from);
                 self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -838,6 +945,8 @@ impl RunningActionImpl {
                         filesystem_store_pin,
                         &self.action_info.input_root_digest,
                         &self.work_directory,
+                        hint_root,
+                        &self.running_actions_manager.path_digest_cache,
                     ))
                     .await
             })
@@ -1980,6 +2089,10 @@ pub struct RunningActionsManagerImpl {
     /// Optional directory cache for improving performance by caching reconstructed
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    /// Per-worker path->digest cache. Shared across all concurrent actions so
+    /// that verified (path, digest) pairs and walked Directory subtrees are
+    /// remembered for subsequent actions.
+    path_digest_cache: Arc<crate::path_digest_cache::PathDigestCache>,
 }
 
 impl RunningActionsManagerImpl {
@@ -2024,6 +2137,7 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
+            path_digest_cache: Arc::new(crate::path_digest_cache::PathDigestCache::new()),
         })
     }
 

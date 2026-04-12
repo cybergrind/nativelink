@@ -14,6 +14,7 @@
 
 pub mod directory_cache;
 pub mod local_worker;
+pub mod path_digest_cache;
 pub mod running_actions_manager;
 pub mod worker_api_client_wrapper;
 pub mod worker_utils;
