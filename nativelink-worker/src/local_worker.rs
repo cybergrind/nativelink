@@ -611,6 +611,7 @@ pub async fn new_local_worker(
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
             shared_walked_dirs_redis_url: config.shared_walked_dirs_redis_url.clone(),
+            machine_id: config.machine_id.clone(),
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),

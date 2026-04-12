@@ -854,18 +854,28 @@ pub struct LocalWorkerConfig {
     /// Default: None (directory cache disabled)
     pub directory_cache: Option<DirectoryCacheConfig>,
 
-    /// Optional Redis URL for sharing the walked-dirs Merkle cache across
-    /// workers. When set, all workers connected to the same Redis share a
-    /// set of Directory digests that have been fully walked, so a subtree
-    /// walked by any worker in the cluster can be skipped by all others.
+    /// Optional Redis URL for persisting the walked-dirs Merkle cache.
+    /// When set, walked Directory subtree digests survive worker restarts,
+    /// avoiding the expensive re-walk of ~2000 Directory protobufs on the
+    /// first action after a restart.
+    ///
+    /// The Redis key is namespaced per machine hostname
+    /// (`nativelink:walked_dirs:{hostname}`), so workers on different
+    /// machines never trust each other's walks.
     ///
     /// Format: `redis://host:port` or `redis://user:pass@host:port/db`
     ///
-    /// The Redis key used is `nativelink:walked_dirs` (a Redis SET).
-    ///
-    /// Default: None (local in-memory walked-dirs cache only)
+    /// Default: None (local in-memory walked-dirs cache only, lost on restart)
     #[serde(default)]
     pub shared_walked_dirs_redis_url: Option<String>,
+
+    /// Machine identifier used to namespace the Redis walked-dirs key.
+    /// Typically the machine's IP address (e.g. `"192.168.88.133"`).
+    /// Required when `shared_walked_dirs_redis_url` is set.
+    ///
+    /// The Redis key becomes `nativelink:walked_dirs:{machine_id}`.
+    #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
+    pub machine_id: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

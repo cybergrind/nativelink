@@ -468,6 +468,7 @@ mod tests {
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -593,6 +594,7 @@ mod tests {
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -720,6 +722,7 @@ mod tests {
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -903,6 +906,7 @@ mod tests {
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1087,6 +1091,7 @@ mod tests {
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1297,6 +1302,7 @@ mod tests {
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1434,6 +1440,7 @@ mod tests {
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         #[cfg(target_family = "unix")]
@@ -1639,6 +1646,7 @@ exit 0
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -1817,6 +1825,7 @@ exit 0
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -1989,6 +1998,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2075,6 +2085,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2152,6 +2163,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2235,6 +2247,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2339,6 +2352,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2387,6 +2401,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2457,6 +2472,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2578,6 +2594,7 @@ exit 1
                     timeout_handled_externally: false,
                     directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2667,6 +2684,7 @@ exit 1
                     timeout_handled_externally: false,
                     directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2756,6 +2774,7 @@ exit 1
                     timeout_handled_externally: false,
                     directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2842,6 +2861,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2996,6 +3016,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3167,6 +3188,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3269,6 +3291,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3385,6 +3408,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3567,6 +3591,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3689,6 +3714,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         // Create a simple action
@@ -3832,6 +3858,7 @@ exit 1
                 timeout_handled_externally: false,
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
             })?);
 
         // Create a simple action

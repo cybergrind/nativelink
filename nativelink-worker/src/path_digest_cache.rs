@@ -45,7 +45,13 @@ impl WalkedDirsProvider for LocalWalkedDirs {
 }
 
 /// Redis-backed walked-dirs provider with an L1 in-memory cache.
-/// Shares walked-dirs state across all workers connected to the same Redis.
+/// Persists walked-dirs state in Redis so that it survives worker restarts.
+///
+/// The Redis key is namespaced per machine (hostname) so that workers on
+/// different machines never trust each other's walks — each machine must
+/// verify its own tree at least once. The value of sharing via Redis is
+/// that a worker restart on the same machine doesn't lose the walked-dirs
+/// state, avoiding the expensive re-walk of ~2000 Directory protobufs.
 ///
 /// On `dir_walked`:
 ///   1. Check L1 (local HashSet) — sub-microsecond.
@@ -55,7 +61,7 @@ impl WalkedDirsProvider for LocalWalkedDirs {
 /// On `mark_dir_walked`:
 ///   1. Insert into L1.
 ///   2. Fire-and-forget SADD to Redis (best-effort; if Redis is down,
-///      other workers just re-walk — no correctness issue).
+///      the worker still benefits from L1, just loses persistence).
 #[derive(Debug)]
 pub struct RedisWalkedDirs {
     l1: Mutex<HashSet<DigestInfo>>,
@@ -66,18 +72,26 @@ pub struct RedisWalkedDirs {
 impl RedisWalkedDirs {
     /// Create a new Redis-backed walked-dirs provider.
     /// `url` is a Redis connection string (e.g. `redis://127.0.0.1:6379`).
-    /// `key` is the Redis SET key name (e.g. `nativelink:walked_dirs`).
-    pub fn new(url: &str, key: &str) -> Result<Self, nativelink_error::Error> {
+    ///
+    /// The Redis key is automatically namespaced by `machine_id`:
+    /// `nativelink:walked_dirs:{machine_id}`. This ensures that workers on
+    /// different machines never skip walks based on another machine's state,
+    /// since the pre-staged source trees may differ.
+    ///
+    /// `machine_id` should be something unique per machine — typically the
+    /// machine's IP address (e.g. `"192.168.88.133"`).
+    pub fn new(url: &str, machine_id: &str) -> Result<Self, nativelink_error::Error> {
         let redis_client = redis::Client::open(url).map_err(|e| {
             nativelink_error::make_err!(
                 nativelink_error::Code::Unavailable,
                 "Failed to create Redis client for walked_dirs cache: {e}"
             )
         })?;
+        let redis_key = format!("nativelink:walked_dirs:{machine_id}");
         Ok(Self {
             l1: Mutex::new(HashSet::new()),
             redis_client,
-            redis_key: key.to_string(),
+            redis_key,
         })
     }
 

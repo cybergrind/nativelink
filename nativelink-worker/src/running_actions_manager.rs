@@ -2042,8 +2042,10 @@ pub struct RunningActionsManagerArgs<'a> {
     pub max_upload_timeout: Duration,
     pub timeout_handled_externally: bool,
     pub directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
-    /// Optional Redis URL for shared walked-dirs cache across workers.
+    /// Optional Redis URL for persistent walked-dirs cache.
     pub shared_walked_dirs_redis_url: Option<String>,
+    /// Machine identifier for Redis key namespacing (e.g. IP address).
+    pub machine_id: String,
 }
 
 struct CleanupGuard {
@@ -2141,11 +2143,14 @@ impl RunningActionsManagerImpl {
             directory_cache: args.directory_cache,
             path_digest_cache: Arc::new(
                 if let Some(ref redis_url) = args.shared_walked_dirs_redis_url {
-                    let redis_walked_dirs = crate::path_digest_cache::RedisWalkedDirs::new(
-                        redis_url,
-                        "nativelink:walked_dirs",
-                    )?;
-                    info!("Shared walked-dirs cache enabled via Redis: {redis_url}");
+                    let machine_id = if args.machine_id.is_empty() {
+                        "default"
+                    } else {
+                        &args.machine_id
+                    };
+                    let redis_walked_dirs =
+                        crate::path_digest_cache::RedisWalkedDirs::new(redis_url, machine_id)?;
+                    info!("Per-machine walked-dirs cache enabled via Redis: {redis_url}");
                     crate::path_digest_cache::PathDigestCache::with_walked_dirs(
                         Box::new(redis_walked_dirs),
                     )
