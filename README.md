@@ -53,14 +53,34 @@ Action dispatched by scheduler
   Merkle cache collapses entire subtree walks to a single hash lookup after the
   first action.
 
+- **Redis-persistent walked-dirs (optional)**: The walked-dirs Merkle cache can
+  be backed by Redis so it survives worker restarts. Each machine has its own
+  namespaced Redis key (`nativelink:walked_dirs:{machine_id}`), so machines
+  never trust each other's walks.
+
 ## Target use case
 
 - Chromium (or similar large C++ project) builds on macOS via
   [siso](https://chromium.googlesource.com/infra/infra/+/refs/heads/main/go/src/infra/build/siso/)
   remote execution
 - Workers are trusted Mac Minis on a local network
-- All workers share a byte-identical pre-staged source tree (via rsync)
+- Each worker has its own pre-staged source tree on local disk (synced via rsync)
 - The scheduler can run on Linux; workers must be macOS (Apple Silicon)
+
+## Prerequisites
+
+Each worker machine needs:
+
+| Requirement | Details |
+|---|---|
+| macOS | 14 (Sonoma) or later |
+| Xcode CLI tools | `xcode-select --install` |
+| Rust toolchain | `rustup-init --profile minimal` (not Homebrew) |
+| Pre-staged source tree | Byte-identical copy of the build source at a fixed path |
+| Network | Gigabit Ethernet to the scheduler/CAS |
+| Disk | 50+ GB free for CAS cache |
+| Spotlight disabled on CAS dir | `touch <mac-data>/.metadata_never_index` + `sudo mdutil -i off -d /` |
+| Redis (optional) | Any Redis instance reachable from the workers |
 
 ## Building
 
@@ -87,21 +107,117 @@ cargo test -p nativelink-util --test fs_test
 
 ## Configuration
 
-Worker config must include the `InputRootAbsolutePath` platform property
-pointing to the pre-staged source tree:
+### Worker config (json5)
+
+The worker config must set the following fields to enable shared-tree execution:
+
+```json5
+{
+  workers: [{
+    local: {
+      // ... standard NativeLink worker fields ...
+
+      // REQUIRED: the pre-staged source tree path.
+      // Must match what siso sends in the action's InputRootAbsolutePath.
+      // Each worker machine must have this tree on local disk.
+      platform_properties: {
+        OSFamily: { values: ["darwin"] },
+        ISA: { values: ["aarch64"] },
+        InputRootAbsolutePath: {
+          values: ["/Users/octo/devel/chromium-distributed-compile/src"],
+        },
+      },
+
+      // OPTIONAL: Redis URL for persistent walked-dirs cache.
+      // Survives worker restarts — avoids re-walking ~2000 Directory
+      // protobufs on the first action after restart.
+      // If omitted, the walked-dirs cache is in-memory only (lost on restart).
+      shared_walked_dirs_redis_url: "redis://192.168.88.132:6379",
+
+      // REQUIRED when shared_walked_dirs_redis_url is set.
+      // Unique identifier for this machine — typically its IP address.
+      // The Redis key becomes: nativelink:walked_dirs:{machine_id}
+      // Each machine only reads/writes its own key.
+      machine_id: "192.168.88.133",
+    },
+  }],
+}
+```
+
+### What each field does
+
+| Field | Required | Purpose |
+|---|---|---|
+| `InputRootAbsolutePath` | Yes | Activates shared-tree mode (Plan J). The worker runs actions directly in this directory instead of copying files into per-action sandboxes. |
+| `shared_walked_dirs_redis_url` | No | Redis connection for persistent walked-dirs Merkle cache. Without it, the cache lives in worker process memory and is lost on restart. |
+| `machine_id` | Only with Redis | Namespaces the Redis key per machine. Workers on different machines have independent caches because their source trees may differ. Use the machine's IP address. |
+
+### Minimal config (no Redis)
 
 ```json5
 platform_properties: {
   OSFamily: { values: ["darwin"] },
   ISA: { values: ["aarch64"] },
   InputRootAbsolutePath: {
-    values: ["/path/to/chromium/src"],
+    values: ["/Users/octo/devel/chromium-distributed-compile/src"],
   },
 },
 ```
 
-The shared-tree execution mode activates automatically when
-`InputRootAbsolutePath` is set and non-empty.
+This gives you Plans I + J + K + L with in-memory caches. First action after
+worker restart pays the full walk cost; subsequent actions are fast.
+
+### Full config (with Redis persistence)
+
+```json5
+platform_properties: {
+  OSFamily: { values: ["darwin"] },
+  ISA: { values: ["aarch64"] },
+  InputRootAbsolutePath: {
+    values: ["/Users/octo/devel/chromium-distributed-compile/src"],
+  },
+},
+shared_walked_dirs_redis_url: "redis://192.168.88.132:6379",
+machine_id: "192.168.88.133",
+```
+
+First action after worker restart is also fast (walks are persisted in Redis).
+
+### Pre-staging the source tree
+
+Each worker must have the source tree at the exact path specified in
+`InputRootAbsolutePath`. Sync from the build controller before starting:
+
+```bash
+rsync -av --delete \
+  controller:/path/to/chromium/src/ \
+  /Users/octo/devel/chromium-distributed-compile/src/
+```
+
+Re-sync after any `gclient sync` or source change on the controller.
+
+### macOS-specific setup
+
+**Disable Spotlight on CAS data directory** (required):
+```bash
+touch /path/to/mac-data/.metadata_never_index
+sudo mdutil -i off -d /
+```
+
+**Clean stale work directories after aborted builds**:
+```bash
+rm -rf /path/to/mac-data/worker/work/*
+```
+
+**Create a dereferenced SDK copy** (avoids symlink issues in CAS):
+```bash
+mkdir -p /Users/octo/chromium-sdk-clean
+rsync -aL \
+  --exclude='System/iOSSupport' \
+  --exclude='System/Library/PrivateFrameworks' \
+  /Applications/Xcode.app/.../SDKs/MacOSX.sdk/ \
+  /Users/octo/chromium-sdk-clean/MacOSX.sdk/
+```
 
 ## Upstream
 
