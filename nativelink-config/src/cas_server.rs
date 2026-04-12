@@ -853,6 +853,19 @@ pub struct LocalWorkerConfig {
     /// them from CAS for every action.
     /// Default: None (directory cache disabled)
     pub directory_cache: Option<DirectoryCacheConfig>,
+
+    /// Optional Redis URL for sharing the walked-dirs Merkle cache across
+    /// workers. When set, all workers connected to the same Redis share a
+    /// set of Directory digests that have been fully walked, so a subtree
+    /// walked by any worker in the cluster can be skipped by all others.
+    ///
+    /// Format: `redis://host:port` or `redis://user:pass@host:port/db`
+    ///
+    /// The Redis key used is `nativelink:walked_dirs` (a Redis SET).
+    ///
+    /// Default: None (local in-memory walked-dirs cache only)
+    #[serde(default)]
+    pub shared_walked_dirs_redis_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

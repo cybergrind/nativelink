@@ -610,6 +610,7 @@ pub async fn new_local_worker(
             max_upload_timeout,
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
+            shared_walked_dirs_redis_url: config.shared_walked_dirs_redis_url.clone(),
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),

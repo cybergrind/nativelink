@@ -8,63 +8,185 @@ use std::path::{Path, PathBuf};
 use nativelink_util::common::DigestInfo;
 use parking_lot::Mutex;
 
-/// Per-worker cache that maps absolute filesystem paths to the content digest
-/// last known to be at that path.
-///
-/// Used by `download_to_directory` in shared-tree (Plan J) mode to skip
-/// `stat` + `set_permissions` + `set_file_mtime` syscalls on files whose
-/// `(path, digest)` pair has already been verified by a prior action.
-///
-/// The cache never evicts. Memory footprint: ~150 bytes per entry x file count.
-/// Reset on worker restart.
-#[derive(Debug, Default)]
-pub struct PathDigestCache {
-    map: Mutex<HashMap<PathBuf, DigestInfo>>,
-    /// Merkle cache of Directory digests whose entire subtree has been walked.
-    /// A hit means every file under this Directory is already on disk and
-    /// recorded in `map`. Used by Plan L to skip the entire tree walk.
-    walked_dirs: Mutex<HashSet<DigestInfo>>,
+/// Trait for the walked-dirs cache backend. The local implementation uses an
+/// in-memory HashSet (per-worker). The Redis implementation shares state across
+/// workers so that once any worker in the cluster walks a Directory subtree,
+/// all other workers can skip it.
+pub trait WalkedDirsProvider: Send + Sync + std::fmt::Debug {
+    /// Returns true if the subtree rooted at the given Directory digest has
+    /// been fully walked by any worker sharing this cache.
+    fn dir_walked(&self, digest: &DigestInfo) -> bool;
+
+    /// Records that the subtree rooted at the given Directory digest has been
+    /// fully materialized. Called only after all child futures succeed.
+    fn mark_dir_walked(&self, digest: DigestInfo);
 }
 
-impl PathDigestCache {
+/// In-memory walked-dirs provider. Per-worker, reset on restart.
+#[derive(Debug, Default)]
+pub struct LocalWalkedDirs {
+    set: Mutex<HashSet<DigestInfo>>,
+}
+
+impl LocalWalkedDirs {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    /// Returns true if the cache has an entry for `path` whose recorded
-    /// digest equals `digest`.
+impl WalkedDirsProvider for LocalWalkedDirs {
+    fn dir_walked(&self, digest: &DigestInfo) -> bool {
+        self.set.lock().contains(digest)
+    }
+
+    fn mark_dir_walked(&self, digest: DigestInfo) {
+        self.set.lock().insert(digest);
+    }
+}
+
+/// Redis-backed walked-dirs provider with an L1 in-memory cache.
+/// Shares walked-dirs state across all workers connected to the same Redis.
+///
+/// On `dir_walked`:
+///   1. Check L1 (local HashSet) — sub-microsecond.
+///   2. On miss, check Redis SISMEMBER — one network RTT.
+///   3. On Redis hit, populate L1 so subsequent checks are free.
+///
+/// On `mark_dir_walked`:
+///   1. Insert into L1.
+///   2. Fire-and-forget SADD to Redis (best-effort; if Redis is down,
+///      other workers just re-walk — no correctness issue).
+#[derive(Debug)]
+pub struct RedisWalkedDirs {
+    l1: Mutex<HashSet<DigestInfo>>,
+    redis_client: redis::Client,
+    redis_key: String,
+}
+
+impl RedisWalkedDirs {
+    /// Create a new Redis-backed walked-dirs provider.
+    /// `url` is a Redis connection string (e.g. `redis://127.0.0.1:6379`).
+    /// `key` is the Redis SET key name (e.g. `nativelink:walked_dirs`).
+    pub fn new(url: &str, key: &str) -> Result<Self, nativelink_error::Error> {
+        let redis_client = redis::Client::open(url).map_err(|e| {
+            nativelink_error::make_err!(
+                nativelink_error::Code::Unavailable,
+                "Failed to create Redis client for walked_dirs cache: {e}"
+            )
+        })?;
+        Ok(Self {
+            l1: Mutex::new(HashSet::new()),
+            redis_client,
+            redis_key: key.to_string(),
+        })
+    }
+
+    fn digest_to_member(digest: &DigestInfo) -> String {
+        format!("{}-{}", digest.packed_hash(), digest.size_bytes())
+    }
+}
+
+impl WalkedDirsProvider for RedisWalkedDirs {
+    fn dir_walked(&self, digest: &DigestInfo) -> bool {
+        // L1 hit — no network.
+        if self.l1.lock().contains(digest) {
+            return true;
+        }
+
+        // L2: synchronous Redis check via a short-lived blocking connection.
+        // We use a blocking call here because the WalkedDirsProvider trait is
+        // synchronous (called from within an async context but not on the
+        // critical async path — the check is at the very top of
+        // download_to_directory before any futures are spawned).
+        let member = Self::digest_to_member(digest);
+        let result: bool = (|| {
+            let mut conn = self.redis_client.get_connection().ok()?;
+            redis::cmd("SISMEMBER")
+                .arg(&self.redis_key)
+                .arg(&member)
+                .query::<bool>(&mut conn)
+                .ok()
+        })()
+        .unwrap_or(false);
+
+        if result {
+            // Populate L1 on Redis hit.
+            self.l1.lock().insert(*digest);
+        }
+
+        result
+    }
+
+    fn mark_dir_walked(&self, digest: DigestInfo) {
+        self.l1.lock().insert(digest);
+
+        // Best-effort write to Redis. If Redis is down, only this worker
+        // benefits from the walk — other workers re-walk. No correctness issue.
+        let member = Self::digest_to_member(&digest);
+        if let Ok(mut conn) = self.redis_client.get_connection() {
+            drop(
+                redis::cmd("SADD")
+                    .arg(&self.redis_key)
+                    .arg(&member)
+                    .query::<i64>(&mut conn),
+            );
+        }
+    }
+}
+
+/// Per-worker cache combining path->digest mapping and walked-dirs cache.
+///
+/// The path->digest map is always local (per-file paths are worker-specific).
+/// The walked-dirs cache can be local or Redis-backed depending on config.
+#[derive(Debug)]
+pub struct PathDigestCache {
+    map: Mutex<HashMap<PathBuf, DigestInfo>>,
+    walked_dirs: Box<dyn WalkedDirsProvider>,
+}
+
+impl PathDigestCache {
+    /// Create with local-only walked-dirs (default).
+    pub fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            walked_dirs: Box::new(LocalWalkedDirs::new()),
+        }
+    }
+
+    /// Create with a custom walked-dirs provider (e.g. Redis-backed).
+    pub fn with_walked_dirs(walked_dirs: Box<dyn WalkedDirsProvider>) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            walked_dirs,
+        }
+    }
+
     pub fn contains(&self, path: &Path, digest: &DigestInfo) -> bool {
         let map = self.map.lock();
         map.get(path).is_some_and(|d| d == digest)
     }
 
-    /// Records that `path` now holds the content for `digest`.
     pub fn insert(&self, path: PathBuf, digest: DigestInfo) {
         self.map.lock().insert(path, digest);
     }
 
-    /// Returns true if the subtree rooted at the given Directory digest has
-    /// been fully walked by a prior action on this worker.
     pub fn dir_walked(&self, digest: &DigestInfo) -> bool {
-        self.walked_dirs.lock().contains(digest)
+        self.walked_dirs.dir_walked(digest)
     }
 
-    /// Records that the subtree rooted at the given Directory digest has been
-    /// fully materialized. Only called after all child futures succeed.
     pub fn mark_dir_walked(&self, digest: DigestInfo) {
-        self.walked_dirs.lock().insert(digest);
+        self.walked_dirs.mark_dir_walked(digest);
     }
 
-    /// Number of cached file entries.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.lock().len()
     }
+}
 
-    /// Number of Directory subtrees marked walked.
-    #[allow(dead_code)]
-    pub fn walked_dirs_len(&self) -> usize {
-        self.walked_dirs.lock().len()
+impl Default for PathDigestCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -76,7 +198,6 @@ mod tests {
     fn test_new_cache_is_empty() {
         let cache = PathDigestCache::new();
         assert_eq!(cache.len(), 0);
-        assert_eq!(cache.walked_dirs_len(), 0);
     }
 
     #[test]
@@ -136,7 +257,6 @@ mod tests {
 
         cache.mark_dir_walked(digest);
         assert!(cache.dir_walked(&digest));
-        assert_eq!(cache.walked_dirs_len(), 1);
     }
 
     #[test]
@@ -147,5 +267,24 @@ mod tests {
 
         cache.mark_dir_walked(digest_a);
         assert!(!cache.dir_walked(&digest_b));
+    }
+
+    #[test]
+    fn test_with_custom_walked_dirs_provider() {
+        let provider = Box::new(LocalWalkedDirs::new());
+        let cache = PathDigestCache::with_walked_dirs(provider);
+        let digest = DigestInfo::new([11u8; 32], 1100);
+
+        assert!(!cache.dir_walked(&digest));
+        cache.mark_dir_walked(digest);
+        assert!(cache.dir_walked(&digest));
+    }
+
+    #[test]
+    fn test_redis_walked_dirs_digest_to_member() {
+        let digest = DigestInfo::new([0xABu8; 32], 42);
+        let member = RedisWalkedDirs::digest_to_member(&digest);
+        assert!(member.ends_with("-42"));
+        assert!(member.len() > 3); // hash + "-42"
     }
 }
