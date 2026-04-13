@@ -212,7 +212,23 @@ pub fn download_to_directory<'a>(
                     if !did_materialize {
                         // Plan J: remove stale file before CAS fetch.
                         info!(dest = %dest, ?digest, "CAS fetch — file missing or wrong size, downloading");
-                        drop(tokio::fs::remove_file(&dest).await);
+                        // Remove existing file. It may be read-only (from rsync or
+                        // set_readonly_recursive), so make it writable first.
+                        if let Ok(md) = tokio::fs::metadata(&dest).await {
+                            #[cfg(target_family = "unix")]
+                            {
+                                let mut perms = md.permissions();
+                                perms.set_mode(perms.mode() | 0o200);
+                                drop(tokio::fs::set_permissions(&dest, perms).await);
+                            }
+                            if let Err(e) = tokio::fs::remove_file(&dest).await {
+                                warn!(
+                                    dest = %dest,
+                                    ?e,
+                                    "Failed to remove stale file before CAS fetch"
+                                );
+                            }
+                        }
                         // Original CAS path.
                         cas_store
                             .populate_fast_store(digest.into())
