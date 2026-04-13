@@ -229,6 +229,11 @@ pub fn download_to_directory<'a>(
                             let src_path = file_entry
                                 .get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) })
                                 .await?;
+                            info!(
+                                dest = %dest,
+                                src = %src_path.display(),
+                                "CAS fetch — hardlinking to shared tree"
+                            );
                             fs::hard_link(&src_path, &dest).await.map_err(|e| {
                                 if e.code == Code::NotFound {
                                     make_err!(
@@ -251,6 +256,14 @@ pub fn download_to_directory<'a>(
                             })?;
                         }
                         wrote_new_file = true;
+                        // Verify the file actually landed on disk.
+                        if tokio::fs::metadata(&dest).await.is_err() {
+                            warn!(
+                                dest = %dest,
+                                ?digest,
+                                "BUG: CAS fetch completed but file does NOT exist on disk"
+                            );
+                        }
                     }
 
                     // Plan K: only apply perms and mtime when we actually wrote a
