@@ -14,18 +14,23 @@ use parking_lot::Mutex;
 /// all other workers can skip it.
 pub trait WalkedDirsProvider: Send + Sync + std::fmt::Debug {
     /// Returns true if the subtree rooted at the given Directory digest has
-    /// been fully walked by any worker sharing this cache.
-    fn dir_walked(&self, digest: &DigestInfo) -> bool;
+    /// been fully walked into `directory_path` on this machine.
+    /// Path-aware: walking digest D into path A does NOT imply D was walked
+    /// into path B.
+    fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool;
 
     /// Records that the subtree rooted at the given Directory digest has been
-    /// fully materialized. Called only after all child futures succeed.
-    fn mark_dir_walked(&self, digest: DigestInfo);
+    /// fully materialized at `directory_path`. Called only after all child
+    /// futures succeed.
+    fn mark_dir_walked(&self, directory_path: &str, digest: DigestInfo);
 }
 
 /// In-memory walked-dirs provider. Per-worker, reset on restart.
+/// Keys are `(directory_path, digest)` pairs so the same digest walked into
+/// different target paths are tracked independently.
 #[derive(Debug, Default)]
 pub struct LocalWalkedDirs {
-    set: Mutex<HashSet<DigestInfo>>,
+    set: Mutex<HashSet<(String, DigestInfo)>>,
 }
 
 impl LocalWalkedDirs {
@@ -35,12 +40,12 @@ impl LocalWalkedDirs {
 }
 
 impl WalkedDirsProvider for LocalWalkedDirs {
-    fn dir_walked(&self, digest: &DigestInfo) -> bool {
-        self.set.lock().contains(digest)
+    fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool {
+        self.set.lock().contains(&(directory_path.to_string(), *digest))
     }
 
-    fn mark_dir_walked(&self, digest: DigestInfo) {
-        self.set.lock().insert(digest);
+    fn mark_dir_walked(&self, directory_path: &str, digest: DigestInfo) {
+        self.set.lock().insert((directory_path.to_string(), digest));
     }
 }
 
@@ -64,7 +69,7 @@ impl WalkedDirsProvider for LocalWalkedDirs {
 ///      the worker still benefits from L1, just loses persistence).
 #[derive(Debug)]
 pub struct RedisWalkedDirs {
-    l1: Mutex<HashSet<DigestInfo>>,
+    l1: Mutex<HashSet<(String, DigestInfo)>>,
     redis_client: redis::Client,
     redis_key: String,
 }
@@ -101,18 +106,15 @@ impl RedisWalkedDirs {
 }
 
 impl WalkedDirsProvider for RedisWalkedDirs {
-    fn dir_walked(&self, digest: &DigestInfo) -> bool {
+    fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool {
+        let key = (directory_path.to_string(), *digest);
         // L1 hit — no network.
-        if self.l1.lock().contains(digest) {
+        if self.l1.lock().contains(&key) {
             return true;
         }
 
-        // L2: synchronous Redis check via a short-lived blocking connection.
-        // We use a blocking call here because the WalkedDirsProvider trait is
-        // synchronous (called from within an async context but not on the
-        // critical async path — the check is at the very top of
-        // download_to_directory before any futures are spawned).
-        let member = Self::digest_to_member(digest);
+        // L2: synchronous Redis check.
+        let member = format!("{}|{}", directory_path, Self::digest_to_member(digest));
         let result: bool = (|| {
             let mut conn = self.redis_client.get_connection().ok()?;
             redis::cmd("SISMEMBER")
@@ -124,19 +126,17 @@ impl WalkedDirsProvider for RedisWalkedDirs {
         .unwrap_or(false);
 
         if result {
-            // Populate L1 on Redis hit.
-            self.l1.lock().insert(*digest);
+            self.l1.lock().insert(key);
         }
 
         result
     }
 
-    fn mark_dir_walked(&self, digest: DigestInfo) {
-        self.l1.lock().insert(digest);
+    fn mark_dir_walked(&self, directory_path: &str, digest: DigestInfo) {
+        self.l1.lock().insert((directory_path.to_string(), digest));
 
-        // Best-effort write to Redis. If Redis is down, only this worker
-        // benefits from the walk — other workers re-walk. No correctness issue.
-        let member = Self::digest_to_member(&digest);
+        // Best-effort write to Redis.
+        let member = format!("{}|{}", directory_path, Self::digest_to_member(&digest));
         if let Ok(mut conn) = self.redis_client.get_connection() {
             drop(
                 redis::cmd("SADD")
@@ -323,12 +323,12 @@ impl PathDigestCache {
         self.map.lock().insert(path, digest);
     }
 
-    pub fn dir_walked(&self, digest: &DigestInfo) -> bool {
-        self.walked_dirs.dir_walked(digest)
+    pub fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool {
+        self.walked_dirs.dir_walked(directory_path, digest)
     }
 
-    pub fn mark_dir_walked(&self, digest: DigestInfo) {
-        self.walked_dirs.mark_dir_walked(digest);
+    pub fn mark_dir_walked(&self, directory_path: &str, digest: DigestInfo) {
+        self.walked_dirs.mark_dir_walked(directory_path, digest);
     }
 
     /// Record output files produced by this action. Broadcasts to other
@@ -419,7 +419,7 @@ mod tests {
     fn test_dir_walked_miss_on_empty() {
         let cache = PathDigestCache::new();
         let digest = DigestInfo::new([7u8; 32], 700);
-        assert!(!cache.dir_walked(&digest));
+        assert!(!cache.dir_walked("/some/path", &digest));
     }
 
     #[test]
@@ -427,8 +427,8 @@ mod tests {
         let cache = PathDigestCache::new();
         let digest = DigestInfo::new([8u8; 32], 800);
 
-        cache.mark_dir_walked(digest);
-        assert!(cache.dir_walked(&digest));
+        cache.mark_dir_walked("/src/third_party", digest);
+        assert!(cache.dir_walked("/src/third_party", &digest));
     }
 
     #[test]
@@ -437,8 +437,18 @@ mod tests {
         let digest_a = DigestInfo::new([9u8; 32], 900);
         let digest_b = DigestInfo::new([10u8; 32], 1000);
 
-        cache.mark_dir_walked(digest_a);
-        assert!(!cache.dir_walked(&digest_b));
+        cache.mark_dir_walked("/src/sdk", digest_a);
+        assert!(!cache.dir_walked("/src/sdk", &digest_b));
+    }
+
+    #[test]
+    fn test_dir_walked_same_digest_different_path_is_miss() {
+        let cache = PathDigestCache::new();
+        let digest = DigestInfo::new([12u8; 32], 1200);
+
+        cache.mark_dir_walked("/machine_a/src/out/Mac/obj", digest);
+        // Same digest, different path — must be a MISS.
+        assert!(!cache.dir_walked("/machine_b/src/out/Mac/obj", &digest));
     }
 
     #[test]
@@ -447,9 +457,9 @@ mod tests {
         let cache = PathDigestCache::with_walked_dirs(provider);
         let digest = DigestInfo::new([11u8; 32], 1100);
 
-        assert!(!cache.dir_walked(&digest));
-        cache.mark_dir_walked(digest);
-        assert!(cache.dir_walked(&digest));
+        assert!(!cache.dir_walked("/test/path", &digest));
+        cache.mark_dir_walked("/test/path", digest);
+        assert!(cache.dir_walked("/test/path", &digest));
     }
 
     #[test]

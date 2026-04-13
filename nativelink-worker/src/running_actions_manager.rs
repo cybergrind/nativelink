@@ -130,6 +130,14 @@ pub fn download_to_directory<'a>(
     path_digest_cache: &'a crate::path_digest_cache::PathDigestCache,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
+        // Plan L (path-aware): if this Directory subtree has been fully walked
+        // into THIS specific target path before, skip the walk. The path is
+        // part of the cache key so walking digest D into path A does not imply
+        // D was walked into path B (fixes cross-machine false positives).
+        if path_digest_cache.dir_walked(current_directory, digest) {
+            return Ok(());
+        }
+
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
             .await
             .err_tip(|| "Converting digest to Directory")?;
@@ -333,6 +341,8 @@ pub fn download_to_directory<'a>(
         }
 
         while futures.try_next().await?.is_some() {}
+        // Plan L (path-aware): mark this subtree as walked at this path.
+        path_digest_cache.mark_dir_walked(current_directory, *digest);
         Ok(())
     }
     .boxed()
