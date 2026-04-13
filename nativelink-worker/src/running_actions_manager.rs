@@ -222,31 +222,60 @@ pub fn download_to_directory<'a>(
                             let src_path = file_entry
                                 .get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) })
                                 .await?;
-                            info!(
-                                dest = %dest,
-                                src = %src_path.display(),
-                                "CAS fetch — hardlinking to shared tree"
-                            );
-                            fs::hard_link(&src_path, &dest).await.map_err(|e| {
-                                if e.code == Code::NotFound {
-                                    make_err!(
-                                        Code::Internal,
-                                        "Could not make hardlink, file was likely evicted from cache. {e:?} : {dest}\n\
-                                        This error often occurs when the filesystem store's max_bytes is too small for your workload.\n\
-                                        To fix this issue:\n\
-                                        1. Increase the 'max_bytes' value in your filesystem store configuration\n\
-                                        2. Example: Change 'max_bytes: 10000000000' to 'max_bytes: 50000000000' (or higher)\n\
-                                        3. The setting is typically found in your nativelink.json config under:\n\
-                                        stores -> [your_filesystem_store] -> filesystem -> eviction_policy -> max_bytes\n\
-                                        4. Restart NativeLink after making the change\n\n\
-                                        If this error persists after increasing max_bytes several times, please report at:\n\
-                                        https://github.com/TraceMachina/nativelink/issues\n\
-                                        Include your config file and both server and client logs to help us assist you."
-                                    )
+                            // Try hard_link. If EEXIST, force-remove the existing
+                            // file (chmod writable + remove) and retry. This handles
+                            // read-only files from rsync, immutable flags, etc.
+                            let link_result = fs::hard_link(&src_path, &dest).await;
+                            if let Err(ref e) = link_result {
+                                if e.code == Code::AlreadyExists
+                                    || format!("{e:?}").contains("os error 17")
+                                {
+                                    // Force-remove the blocking file.
+                                    #[cfg(target_family = "unix")]
+                                    if let Ok(md) = tokio::fs::metadata(&dest).await {
+                                        let mut perms = md.permissions();
+                                        perms.set_mode(perms.mode() | 0o200);
+                                        drop(tokio::fs::set_permissions(&dest, perms).await);
+                                    }
+                                    // Also make parent dir writable in case that's the issue.
+                                    #[cfg(target_family = "unix")]
+                                    if let Some(parent) = Path::new(&dest).parent() {
+                                        if let Ok(md) = tokio::fs::metadata(parent).await {
+                                            let mut perms = md.permissions();
+                                            perms.set_mode(perms.mode() | 0o200);
+                                            drop(tokio::fs::set_permissions(parent, perms).await);
+                                        }
+                                    }
+                                    if let Err(rm_err) = tokio::fs::remove_file(&dest).await {
+                                        warn!(
+                                            dest = %dest,
+                                            ?rm_err,
+                                            "Could not remove existing file for hardlink retry"
+                                        );
+                                    }
+                                    // Retry the hardlink.
+                                    fs::hard_link(&src_path, &dest).await.map_err(|e2| {
+                                        make_err!(
+                                            Code::Internal,
+                                            "Could not make hardlink after force-remove, {e2:?} : {dest}"
+                                        )
+                                    })?;
                                 } else {
-                                    make_err!(Code::Internal, "Could not make hardlink, {e:?} : {dest}")
+                                    link_result.map_err(|e| {
+                                        if e.code == Code::NotFound {
+                                            make_err!(
+                                                Code::Internal,
+                                                "Could not make hardlink, file was likely evicted from cache. {e:?} : {dest}"
+                                            )
+                                        } else {
+                                            make_err!(
+                                                Code::Internal,
+                                                "Could not make hardlink, {e:?} : {dest}"
+                                            )
+                                        }
+                                    })?;
                                 }
-                            })?;
+                            }
                         }
                         // Verify the file actually landed on disk.
                         if tokio::fs::metadata(&dest).await.is_err() {
