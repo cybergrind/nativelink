@@ -130,13 +130,6 @@ pub fn download_to_directory<'a>(
     path_digest_cache: &'a crate::path_digest_cache::PathDigestCache,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
-        // Plan L: Merkle short-circuit. If this Directory subtree has been
-        // fully walked before (same digest = byte-identical content), skip
-        // the entire walk — no CAS fetch, no file loop, no recursion.
-        if path_digest_cache.dir_walked(digest) {
-            return Ok(());
-        }
-
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
             .await
             .err_tip(|| "Converting digest to Directory")?;
@@ -340,9 +333,6 @@ pub fn download_to_directory<'a>(
         }
 
         while futures.try_next().await?.is_some() {}
-        // Plan L: mark this Directory subtree as walked. Only inserted
-        // after all child futures succeed — partial walks never pollute.
-        path_digest_cache.mark_dir_walked(*digest);
         Ok(())
     }
     .boxed()

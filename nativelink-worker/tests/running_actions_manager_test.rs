@@ -436,6 +436,97 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test: Plan L (walked_dirs Merkle cache) must not cause files
+    /// to be missing when the same directory digest is walked into a DIFFERENT
+    /// target directory. This simulates the real production bug: machine A walks
+    /// the directory into its tree, Plan L records the digest. Then machine B
+    /// (sharing Plan L via Redis) tries to walk the same digest into its own tree
+    /// where the file doesn't exist. Plan L must not short-circuit.
+    ///
+    /// After the fix (Plan L removed), the walk always proceeds and fetches
+    /// files that are missing from the target directory.
+    #[nativelink_test]
+    async fn download_to_directory_plan_l_must_not_skip_missing_files(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "source.cc";
+        const FILE_CONTENT: &str = "int main() {}";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        let root_directory_digest = {
+            let file_digest = DigestInfo::new([42u8; 32], 32);
+            slow_store
+                .as_ref()
+                .update_oneshot(file_digest, FILE_CONTENT.into())
+                .await?;
+
+            let root_digest = DigestInfo::new([43u8; 32], 32);
+            let root_dir = Directory {
+                files: vec![FileNode {
+                    name: FILE_NAME.to_string(),
+                    digest: Some(file_digest.into()),
+                    is_executable: false,
+                    node_properties: None,
+                }],
+                ..Default::default()
+            };
+            slow_store
+                .as_ref()
+                .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+                .await?;
+            root_digest
+        };
+
+        let cache = PathDigestCache::new();
+
+        // First walk into directory A — populates Plan K and Plan L caches.
+        let dir_a = make_temp_path("plan_l_dir_a");
+        fs::create_dir_all(&dir_a)
+            .await
+            .err_tip(|| "create dir_a")?;
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_directory_digest,
+            &dir_a,
+            None,
+            &cache,
+        )
+        .await?;
+        assert_eq!(
+            from_utf8(&fs::read(format!("{dir_a}/{FILE_NAME}")).await?)?,
+            FILE_CONTENT
+        );
+
+        // Second walk into directory B — a DIFFERENT path where the file
+        // does NOT exist. With Plan L, this would return Ok(()) immediately
+        // without creating the file, because the directory digest was cached.
+        let dir_b = make_temp_path("plan_l_dir_b");
+        fs::create_dir_all(&dir_b)
+            .await
+            .err_tip(|| "create dir_b")?;
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_directory_digest,
+            &dir_b,
+            None,
+            &cache,
+        )
+        .await?;
+
+        // The file MUST exist in dir_b after the second walk.
+        let file_path_b = format!("{dir_b}/{FILE_NAME}");
+        let content = fs::read(&file_path_b).await?;
+        assert_eq!(
+            from_utf8(&content)?,
+            FILE_CONTENT,
+            "File must be fetched into dir_b even though the same digest was walked into dir_a"
+        );
+
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn ensure_output_files_full_directories_are_created_no_working_directory_test()
     -> Result<(), Box<dyn core::error::Error>> {
