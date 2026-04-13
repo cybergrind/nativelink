@@ -135,6 +135,11 @@ pub fn download_to_directory<'a>(
         // part of the cache key so walking digest D into path A does not imply
         // D was walked into path B (fixes cross-machine false positives).
         if path_digest_cache.dir_walked(current_directory, digest) {
+            trace!(
+                ?digest,
+                current_directory,
+                "Plan L: skipping already-walked directory subtree"
+            );
             return Ok(());
         }
 
@@ -169,6 +174,13 @@ pub fn download_to_directory<'a>(
                     if path_digest_cache.contains(&dest_path_for_cache, &digest) {
                         return Ok::<(), Error>(());
                     }
+                    // Diagnostic: log every file that is NOT in Plan K cache.
+                    // This means we're actually checking/fetching it.
+                    trace!(
+                        dest = %dest,
+                        ?digest,
+                        "Plan K miss — checking disk / fetching from CAS"
+                    );
 
                     let mut did_materialize = false;
                     let mut wrote_new_file = false;
@@ -178,6 +190,7 @@ pub fn download_to_directory<'a>(
                     if let Ok(md) = tokio::fs::metadata(&dest).await {
                         if md.is_file() && md.len() == expected_size {
                             did_materialize = true;
+                            trace!(dest = %dest, size = expected_size, "Plan J: stat-hit, file exists with expected size");
                         }
                     }
 
@@ -198,6 +211,7 @@ pub fn download_to_directory<'a>(
 
                     if !did_materialize {
                         // Plan J: remove stale file before CAS fetch.
+                        info!(dest = %dest, ?digest, "CAS fetch — file missing or wrong size, downloading");
                         drop(tokio::fs::remove_file(&dest).await);
                         // Original CAS path.
                         cas_store
