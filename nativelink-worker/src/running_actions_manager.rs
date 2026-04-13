@@ -155,9 +155,6 @@ pub fn download_to_directory<'a>(
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
             let dest = format!("{}/{}", current_directory, file.name);
-            let expected_size: u64 = digest.size_bytes();
-            let hint_file: Option<PathBuf> =
-                hint_root.as_ref().map(|root| root.join(&file.name));
             let (mtime, mut unix_mode) = match file.node_properties {
                 Some(properties) => (properties.mtime, properties.unix_mode),
                 None => (None, None),
@@ -182,36 +179,16 @@ pub fn download_to_directory<'a>(
                         "Plan K miss — checking disk / fetching from CAS"
                     );
 
-                    let mut did_materialize = false;
-                    let mut wrote_new_file = false;
-
-                    // Plan J: check if dest already exists with the expected size
-                    // (shared-tree mode — file is already in the pre-staged tree).
-                    if let Ok(md) = tokio::fs::metadata(&dest).await {
-                        if md.is_file() && md.len() == expected_size {
-                            did_materialize = true;
-                            trace!(dest = %dest, size = expected_size, "Plan J: stat-hit, file exists with expected size");
-                        }
-                    }
-
-                    // Plan I: try hardlink from hint path if dest wasn't found.
-                    if !did_materialize {
-                        if let Some(ref hint_file_path) = hint_file {
-                            if hint_file_path.as_path() != Path::new(&dest) {
-                                if let Ok(md) = tokio::fs::metadata(hint_file_path).await {
-                                    if md.is_file() && md.len() == expected_size {
-                                        if fs::hard_link(hint_file_path, &dest).await.is_ok() {
-                                            did_materialize = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if !did_materialize {
-                        // Plan J: remove stale file before CAS fetch.
-                        info!(dest = %dest, ?digest, "CAS fetch — file missing or wrong size, downloading");
+                    // Plan J stat-hit and Plan I hint-link are DISABLED.
+                    // They checked only file size, not content hash. Same-size
+                    // different-content files (common for generated headers
+                    // that change between builds) were silently accepted,
+                    // causing build failures. Plan K is the only trusted
+                    // fast path — it checks full (path, digest).
+                    //
+                    // On Plan K miss, always go to CAS.
+                    {
+                        info!(dest = %dest, ?digest, "CAS fetch — Plan K miss, downloading from CAS");
                         // Remove existing file. It may be read-only (from rsync or
                         // set_readonly_recursive), so make it writable first.
                         if let Ok(md) = tokio::fs::metadata(&dest).await {
@@ -271,7 +248,6 @@ pub fn download_to_directory<'a>(
                                 }
                             })?;
                         }
-                        wrote_new_file = true;
                         // Verify the file actually landed on disk.
                         if tokio::fs::metadata(&dest).await.is_err() {
                             warn!(
@@ -282,10 +258,9 @@ pub fn download_to_directory<'a>(
                         }
                     }
 
-                    // Plan K: only apply perms and mtime when we actually wrote a
-                    // new file. Stat-hit and cache-hit paths leave the existing
-                    // on-disk modes and timestamps alone.
-                    if wrote_new_file {
+                    // Always apply perms and mtime — we always fetch from CAS
+                    // on Plan K miss.
+                    {
                         #[cfg(target_family = "unix")]
                         if let Some(unix_mode) = unix_mode {
                             fs::set_permissions(&dest, Permissions::from_mode(unix_mode))

@@ -527,6 +527,89 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test: a read-only file from rsync with the same size but
+    /// different content (different digest) must be replaced by the CAS version.
+    /// Before the fix, remove_file silently failed on read-only files (EACCES),
+    /// then hard_link failed with EEXIST, aborting the entire directory walk
+    /// and leaving subsequent files undownloaded.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn download_to_directory_replaces_readonly_stale_file(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "utility";
+        const OLD_CONTENT: &str = "// old rsync"; // 12 bytes
+        const NEW_CONTENT: &str = "// new build"; // 12 bytes — same size!
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        // CAS has the NEW content.
+        let new_digest = DigestInfo::new([50u8; 32], 12);
+        slow_store
+            .as_ref()
+            .update_oneshot(new_digest, NEW_CONTENT.into())
+            .await?;
+
+        let root_digest = DigestInfo::new([51u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(new_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        let download_dir = make_temp_path("readonly_test");
+        fs::create_dir_all(&download_dir)
+            .await
+            .err_tip(|| "create dir")?;
+
+        // Pre-create the file with OLD content and make it read-only
+        // (simulating what rsync + set_readonly_recursive would do).
+        let file_path = format!("{download_dir}/{FILE_NAME}");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::write(&file_path, OLD_CONTENT).await?;
+            tokio::fs::set_permissions(
+                &file_path,
+                std::fs::Permissions::from_mode(0o444),
+            )
+            .await?;
+        }
+
+        // Verify: file exists, read-only, old content.
+        let md = tokio::fs::metadata(&file_path).await?;
+        assert_eq!(md.len(), 12);
+        assert_eq!(from_utf8(&fs::read(&file_path).await?)?, OLD_CONTENT);
+
+        // download_to_directory should replace the stale read-only file
+        // with the CAS version.
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &download_dir,
+            None,
+            &PathDigestCache::new(),
+        )
+        .await?;
+
+        // File must now contain NEW content from CAS.
+        let content = fs::read(&file_path).await?;
+        assert_eq!(
+            from_utf8(&content)?,
+            NEW_CONTENT,
+            "Read-only stale file must be replaced by CAS content"
+        );
+
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn ensure_output_files_full_directories_are_created_no_working_directory_test()
     -> Result<(), Box<dyn core::error::Error>> {
