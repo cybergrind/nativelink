@@ -58,6 +58,13 @@ Action dispatched by scheduler
   namespaced Redis key (`nativelink:walked_dirs:{machine_id}`), so machines
   never trust each other's walks.
 
+- **Cross-machine output sync (optional)**: When Redis is configured, action
+  outputs (`.o`, `.d`, `.pcm` files) produced on one worker are broadcast to
+  other machines via Redis pending lists. Before each action starts, the worker
+  drains its pending list and fetches any missing output files from CAS into
+  the local shared tree. This ensures siso can read depfiles on the controller
+  machine even when the compilation ran on a different worker.
+
 ## Target use case
 
 - Chromium (or similar large C++ project) builds on macOS via
@@ -149,8 +156,8 @@ The worker config must set the following fields to enable shared-tree execution:
 | Field | Required | Purpose |
 |---|---|---|
 | `InputRootAbsolutePath` | Yes | Activates shared-tree mode (Plan J). The worker runs actions directly in this directory instead of copying files into per-action sandboxes. |
-| `shared_walked_dirs_redis_url` | No | Redis connection for persistent walked-dirs Merkle cache. Without it, the cache lives in worker process memory and is lost on restart. |
-| `machine_id` | Only with Redis | Namespaces the Redis key per machine. Workers on different machines have independent caches because their source trees may differ. Use the machine's IP address. |
+| `shared_walked_dirs_redis_url` | No | Redis connection for persistent walked-dirs Merkle cache AND cross-machine output sync. Without it, caches are in-memory only (lost on restart) and outputs from other workers are not synced. |
+| `machine_id` | Only with Redis | Namespaces Redis keys per machine. Used for both walked-dirs (`nativelink:walked_dirs:{machine_id}`) and output sync (`nativelink:pending_outputs:{machine_id}`). Use the machine's IP address. |
 
 ### Minimal config (no Redis)
 

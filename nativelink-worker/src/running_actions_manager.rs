@@ -921,6 +921,52 @@ impl RunningActionImpl {
             });
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
+
+            // Pre-action output sync: drain pending outputs from other
+            // machines and fetch them from CAS into the local shared tree.
+            // This materializes .o/.d/etc files produced on other workers so
+            // that this worker (and siso on this machine) can find them on
+            // the local filesystem.
+            {
+                let pending = self
+                    .running_actions_manager
+                    .path_digest_cache
+                    .drain_pending_outputs();
+                if !pending.is_empty() {
+                    let cas = self.running_actions_manager.cas_store.as_ref();
+                    let fs_store =
+                        Pin::new(self.running_actions_manager.filesystem_store.as_ref());
+                    for (relative_path, digest) in &pending {
+                        let dest = format!("{}/{}", self.work_directory, relative_path);
+                        // Skip if already on disk.
+                        if tokio::fs::metadata(&dest).await.is_ok() {
+                            continue;
+                        }
+                        // Ensure parent directory exists.
+                        if let Some(parent) = Path::new(&dest).parent() {
+                            if let Some(parent_str) = parent.to_str() {
+                                drop(fs::create_dir_all(parent_str).await);
+                            }
+                        }
+                        // Fetch from CAS and hardlink to shared tree.
+                        if cas.populate_fast_store((*digest).into()).await.is_ok() {
+                            if let Ok(entry) = fs_store.get_file_entry_for_digest(digest).await {
+                                if let Ok(src) = entry
+                                    .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
+                                    .await
+                                {
+                                    drop(fs::hard_link(&src, &dest).await);
+                                }
+                            }
+                        }
+                    }
+                    info!(
+                        count = pending.len(),
+                        "synced pending outputs from other workers"
+                    );
+                }
+            }
+
             let (command, ()) = try_join(command_fut, async {
                 // Plan J: create_dir_all is idempotent. In shared-tree mode,
                 // work_directory is the pre-staged source tree (already exists).
@@ -1534,6 +1580,24 @@ impl RunningActionImpl {
         output_folders.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         output_file_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
         output_directory_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
+
+        // Post-action output sync: record all output files in Redis so that
+        // other machines can fetch them before their next action.
+        {
+            let outputs: Vec<(String, DigestInfo)> = output_files
+                .iter()
+                .map(|f| {
+                    let path = match &f.name_or_path {
+                        NameOrPath::Name(s) | NameOrPath::Path(s) => s.clone(),
+                    };
+                    (path, f.digest)
+                })
+                .collect();
+            self.running_actions_manager
+                .path_digest_cache
+                .record_outputs(&outputs);
+        }
+
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
         {
@@ -2150,9 +2214,12 @@ impl RunningActionsManagerImpl {
                     };
                     let redis_walked_dirs =
                         crate::path_digest_cache::RedisWalkedDirs::new(redis_url, machine_id)?;
-                    info!("Per-machine walked-dirs cache enabled via Redis: {redis_url}");
-                    crate::path_digest_cache::PathDigestCache::with_walked_dirs(
+                    let output_sync =
+                        crate::path_digest_cache::RedisOutputSync::new(redis_url, machine_id)?;
+                    info!("Per-machine walked-dirs cache + output sync enabled via Redis: {redis_url}");
+                    crate::path_digest_cache::PathDigestCache::with_walked_dirs_and_output_sync(
                         Box::new(redis_walked_dirs),
+                        output_sync,
                     )
                 } else {
                     crate::path_digest_cache::PathDigestCache::new()

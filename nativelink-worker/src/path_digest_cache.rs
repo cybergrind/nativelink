@@ -148,14 +148,139 @@ impl WalkedDirsProvider for RedisWalkedDirs {
     }
 }
 
+/// Handles cross-machine output synchronization via Redis.
+///
+/// After an action completes, the worker records output file paths + digests
+/// in per-target-machine Redis LISTs. Before the next action starts on any
+/// machine, the worker drains its pending list and the caller fetches missing
+/// files from CAS into the local shared tree.
+///
+/// This ensures outputs produced on machine A become visible on machine B's
+/// filesystem BEFORE machine B's next action — solving the split-filesystem
+/// problem in shared-tree (Plan J) mode.
+#[derive(Debug)]
+pub struct RedisOutputSync {
+    redis_client: redis::Client,
+    machine_id: String,
+}
+
+impl RedisOutputSync {
+    pub fn new(url: &str, machine_id: &str) -> Result<Self, nativelink_error::Error> {
+        let redis_client = redis::Client::open(url).map_err(|e| {
+            nativelink_error::make_err!(
+                nativelink_error::Code::Unavailable,
+                "Failed to create Redis client for output sync: {e}"
+            )
+        })?;
+        // Register this machine so others can discover it.
+        if let Ok(mut conn) = redis_client.get_connection() {
+            drop(
+                redis::cmd("SADD")
+                    .arg("nativelink:machines")
+                    .arg(machine_id)
+                    .query::<i64>(&mut conn),
+            );
+        }
+        Ok(Self {
+            redis_client,
+            machine_id: machine_id.to_string(),
+        })
+    }
+
+    /// Record outputs produced by this machine. Pushes entries to
+    /// `nativelink:pending_outputs:{target}` for every OTHER registered machine.
+    pub fn record_outputs(&self, outputs: &[(String, DigestInfo)]) {
+        if outputs.is_empty() {
+            return;
+        }
+        let Ok(mut conn) = self.redis_client.get_connection() else {
+            return;
+        };
+        // Discover other machines.
+        let other_machines: Vec<String> = redis::cmd("SMEMBERS")
+            .arg("nativelink:machines")
+            .query(&mut conn)
+            .unwrap_or_default();
+        for target in &other_machines {
+            if target == &self.machine_id {
+                continue;
+            }
+            let key = format!("nativelink:pending_outputs:{target}");
+            let mut pipe = redis::pipe();
+            for (path, digest) in outputs {
+                let member = format!(
+                    "{}|{}-{}",
+                    path,
+                    digest.packed_hash(),
+                    digest.size_bytes()
+                );
+                pipe.cmd("RPUSH").arg(&key).arg(&member).ignore();
+            }
+            drop(pipe.query::<()>(&mut conn));
+        }
+    }
+
+    /// Parse a 64-char hex string into [u8; 32]. Returns None on invalid input.
+    fn hex_to_32(s: &str) -> Option<[u8; 32]> {
+        if s.len() != 64 {
+            return None;
+        }
+        let mut arr = [0u8; 32];
+        for i in 0..32 {
+            arr[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(arr)
+    }
+
+    /// Drain pending outputs that OTHER machines produced for THIS machine.
+    /// Returns `(relative_path, DigestInfo)` pairs that need to be fetched
+    /// from CAS and written to the local shared tree.
+    pub fn drain_pending_outputs(&self) -> Vec<(String, DigestInfo)> {
+        let Ok(mut conn) = self.redis_client.get_connection() else {
+            return vec![];
+        };
+        let key = format!("nativelink:pending_outputs:{}", self.machine_id);
+        // Atomic get-and-clear via MULTI/EXEC.
+        let entries: Vec<String> = redis::pipe()
+            .atomic()
+            .cmd("LRANGE")
+            .arg(&key)
+            .arg(0i64)
+            .arg(-1i64)
+            .cmd("DEL")
+            .arg(&key)
+            .ignore()
+            .query(&mut conn)
+            .unwrap_or_default();
+        let mut result = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // Format: "relative/path/to/file.o|<hex_hash>-<size>"
+            if let Some((path, digest_str)) = entry.rsplit_once('|') {
+                if let Some((hash_hex, size_str)) = digest_str.rsplit_once('-') {
+                    if let (Some(hash_arr), Ok(size)) =
+                        (Self::hex_to_32(hash_hex), size_str.parse::<u64>())
+                    {
+                        let digest = DigestInfo::new(hash_arr, size);
+                        result.push((path.to_string(), digest));
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
 /// Per-worker cache combining path->digest mapping and walked-dirs cache.
 ///
 /// The path->digest map is always local (per-file paths are worker-specific).
 /// The walked-dirs cache can be local or Redis-backed depending on config.
+/// The output sync (optional) broadcasts action outputs to other machines via
+/// Redis so that cross-machine builds see each other's produced files.
 #[derive(Debug)]
 pub struct PathDigestCache {
     map: Mutex<HashMap<PathBuf, DigestInfo>>,
     walked_dirs: Box<dyn WalkedDirsProvider>,
+    output_sync: Option<RedisOutputSync>,
 }
 
 impl PathDigestCache {
@@ -164,6 +289,7 @@ impl PathDigestCache {
         Self {
             map: Mutex::new(HashMap::new()),
             walked_dirs: Box::new(LocalWalkedDirs::new()),
+            output_sync: None,
         }
     }
 
@@ -172,6 +298,19 @@ impl PathDigestCache {
         Self {
             map: Mutex::new(HashMap::new()),
             walked_dirs,
+            output_sync: None,
+        }
+    }
+
+    /// Create with both walked-dirs provider and output sync.
+    pub fn with_walked_dirs_and_output_sync(
+        walked_dirs: Box<dyn WalkedDirsProvider>,
+        output_sync: RedisOutputSync,
+    ) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            walked_dirs,
+            output_sync: Some(output_sync),
         }
     }
 
@@ -190,6 +329,25 @@ impl PathDigestCache {
 
     pub fn mark_dir_walked(&self, digest: DigestInfo) {
         self.walked_dirs.mark_dir_walked(digest);
+    }
+
+    /// Record output files produced by this action. Broadcasts to other
+    /// machines via Redis so they can fetch the files before their next action.
+    pub fn record_outputs(&self, outputs: &[(String, DigestInfo)]) {
+        if let Some(ref sync) = self.output_sync {
+            sync.record_outputs(outputs);
+        }
+    }
+
+    /// Drain pending output files from other machines. The caller must
+    /// fetch each returned (relative_path, digest) from CAS and write
+    /// to the local shared tree.
+    pub fn drain_pending_outputs(&self) -> Vec<(String, DigestInfo)> {
+        if let Some(ref sync) = self.output_sync {
+            sync.drain_pending_outputs()
+        } else {
+            vec![]
+        }
     }
 
     #[allow(dead_code)]
@@ -300,5 +458,39 @@ mod tests {
         let member = RedisWalkedDirs::digest_to_member(&digest);
         assert!(member.ends_with("-42"));
         assert!(member.len() > 3); // hash + "-42"
+    }
+
+    #[test]
+    fn test_hex_to_32_valid() {
+        let hex = "ab".repeat(32); // 64 hex chars = 32 bytes of 0xAB
+        let result = RedisOutputSync::hex_to_32(&hex);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), [0xABu8; 32]);
+    }
+
+    #[test]
+    fn test_hex_to_32_invalid_length() {
+        assert!(RedisOutputSync::hex_to_32("abcd").is_none());
+        assert!(RedisOutputSync::hex_to_32("").is_none());
+    }
+
+    #[test]
+    fn test_hex_to_32_invalid_chars() {
+        let hex = "zz".repeat(32);
+        assert!(RedisOutputSync::hex_to_32(&hex).is_none());
+    }
+
+    #[test]
+    fn test_drain_pending_outputs_empty_without_sync() {
+        let cache = PathDigestCache::new();
+        assert!(cache.drain_pending_outputs().is_empty());
+    }
+
+    #[test]
+    fn test_record_outputs_noop_without_sync() {
+        let cache = PathDigestCache::new();
+        let digest = DigestInfo::new([1u8; 32], 100);
+        // Should not panic even without output_sync configured.
+        cache.record_outputs(&[("foo.o".to_string(), digest)]);
     }
 }
