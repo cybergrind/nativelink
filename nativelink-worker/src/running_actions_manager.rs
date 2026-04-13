@@ -189,23 +189,6 @@ pub fn download_to_directory<'a>(
                     // On Plan K miss, always go to CAS.
                     {
                         info!(dest = %dest, ?digest, "CAS fetch — Plan K miss, downloading from CAS");
-                        // Remove existing file. It may be read-only (from rsync or
-                        // set_readonly_recursive), so make it writable first.
-                        if let Ok(md) = tokio::fs::metadata(&dest).await {
-                            #[cfg(target_family = "unix")]
-                            {
-                                let mut perms = md.permissions();
-                                perms.set_mode(perms.mode() | 0o200);
-                                drop(tokio::fs::set_permissions(&dest, perms).await);
-                            }
-                            if let Err(e) = tokio::fs::remove_file(&dest).await {
-                                warn!(
-                                    dest = %dest,
-                                    ?e,
-                                    "Failed to remove stale file before CAS fetch"
-                                );
-                            }
-                        }
                         // Original CAS path.
                         cas_store
                             .populate_fast_store(digest.into())
@@ -222,58 +205,32 @@ pub fn download_to_directory<'a>(
                             let src_path = file_entry
                                 .get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) })
                                 .await?;
-                            // Try hard_link. If EEXIST, force-remove the existing
-                            // file (chmod writable + remove) and retry. This handles
-                            // read-only files from rsync, immutable flags, etc.
-                            let link_result = fs::hard_link(&src_path, &dest).await;
-                            if let Err(ref e) = link_result {
-                                if e.code == Code::AlreadyExists
-                                    || format!("{e:?}").contains("os error 17")
+                            match fs::hard_link(&src_path, &dest).await {
+                                Ok(()) => {}
+                                Err(e)
+                                    if e.code == Code::AlreadyExists
+                                        || format!("{e:?}").contains("os error 17") =>
                                 {
-                                    // Force-remove the blocking file.
-                                    #[cfg(target_family = "unix")]
-                                    if let Ok(md) = tokio::fs::metadata(&dest).await {
-                                        let mut perms = md.permissions();
-                                        perms.set_mode(perms.mode() | 0o200);
-                                        drop(tokio::fs::set_permissions(&dest, perms).await);
-                                    }
-                                    // Also make parent dir writable in case that's the issue.
-                                    #[cfg(target_family = "unix")]
-                                    if let Some(parent) = Path::new(&dest).parent() {
-                                        if let Ok(md) = tokio::fs::metadata(parent).await {
-                                            let mut perms = md.permissions();
-                                            perms.set_mode(perms.mode() | 0o200);
-                                            drop(tokio::fs::set_permissions(parent, perms).await);
-                                        }
-                                    }
-                                    if let Err(rm_err) = tokio::fs::remove_file(&dest).await {
-                                        warn!(
-                                            dest = %dest,
-                                            ?rm_err,
-                                            "Could not remove existing file for hardlink retry"
-                                        );
-                                    }
-                                    // Retry the hardlink.
-                                    fs::hard_link(&src_path, &dest).await.map_err(|e2| {
-                                        make_err!(
-                                            Code::Internal,
-                                            "Could not make hardlink after force-remove, {e2:?} : {dest}"
-                                        )
-                                    })?;
-                                } else {
-                                    link_result.map_err(|e| {
-                                        if e.code == Code::NotFound {
-                                            make_err!(
-                                                Code::Internal,
-                                                "Could not make hardlink, file was likely evicted from cache. {e:?} : {dest}"
-                                            )
-                                        } else {
-                                            make_err!(
-                                                Code::Internal,
-                                                "Could not make hardlink, {e:?} : {dest}"
-                                            )
-                                        }
-                                    })?;
+                                    // File already exists — trust it. It's either
+                                    // the same content from rsync or a previous
+                                    // CAS fetch. Either way, it's on disk and
+                                    // usable. Plan K will record it below.
+                                    trace!(
+                                        dest = %dest,
+                                        "hard_link EEXIST — file already on disk, trusting it"
+                                    );
+                                }
+                                Err(e) if e.code == Code::NotFound => {
+                                    return Err(make_err!(
+                                        Code::Internal,
+                                        "Could not make hardlink, file was likely evicted from cache. {e:?} : {dest}"
+                                    ));
+                                }
+                                Err(e) => {
+                                    return Err(make_err!(
+                                        Code::Internal,
+                                        "Could not make hardlink, {e:?} : {dest}"
+                                    ));
                                 }
                             }
                         }

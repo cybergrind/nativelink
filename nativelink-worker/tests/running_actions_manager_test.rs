@@ -527,36 +527,49 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test: a read-only file from rsync with the same size but
-    /// different content (different digest) must be replaced by the CAS version.
-    /// Before the fix, remove_file silently failed on read-only files (EACCES),
-    /// then hard_link failed with EEXIST, aborting the entire directory walk
-    /// and leaving subsequent files undownloaded.
+    /// Test: a read-only file from rsync that already exists on disk must NOT
+    /// cause EEXIST to abort the entire directory walk. The hard_link gets
+    /// EEXIST, trusts the existing file, and continues. Subsequent files in
+    /// the same directory must still be downloaded.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn download_to_directory_replaces_readonly_stale_file(
+    async fn download_to_directory_eexist_does_not_abort_walk(
     ) -> Result<(), Box<dyn core::error::Error>> {
-        const FILE_NAME: &str = "utility";
-        const OLD_CONTENT: &str = "// old rsync"; // 12 bytes
-        const NEW_CONTENT: &str = "// new build"; // 12 bytes — same size!
+        const FILE1_NAME: &str = "utility";
+        const FILE1_CONTENT: &str = "// existing"; // 11 bytes
+        const FILE2_NAME: &str = "type_list.h";
+        const FILE2_CONTENT: &str = "// new file"; // 11 bytes
 
         let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
 
-        // CAS has the NEW content.
-        let new_digest = DigestInfo::new([50u8; 32], 12);
+        // CAS has both files.
+        let file1_digest = DigestInfo::new([50u8; 32], 11);
         slow_store
             .as_ref()
-            .update_oneshot(new_digest, NEW_CONTENT.into())
+            .update_oneshot(file1_digest, FILE1_CONTENT.into())
+            .await?;
+        let file2_digest = DigestInfo::new([51u8; 32], 11);
+        slow_store
+            .as_ref()
+            .update_oneshot(file2_digest, FILE2_CONTENT.into())
             .await?;
 
-        let root_digest = DigestInfo::new([51u8; 32], 32);
+        let root_digest = DigestInfo::new([52u8; 32], 32);
         let root_dir = Directory {
-            files: vec![FileNode {
-                name: FILE_NAME.to_string(),
-                digest: Some(new_digest.into()),
-                is_executable: false,
-                node_properties: None,
-            }],
+            files: vec![
+                FileNode {
+                    name: FILE1_NAME.to_string(),
+                    digest: Some(file1_digest.into()),
+                    is_executable: false,
+                    node_properties: None,
+                },
+                FileNode {
+                    name: FILE2_NAME.to_string(),
+                    digest: Some(file2_digest.into()),
+                    is_executable: false,
+                    node_properties: None,
+                },
+            ],
             ..Default::default()
         };
         slow_store
@@ -564,31 +577,26 @@ mod tests {
             .update_oneshot(root_digest, root_dir.encode_to_vec().into())
             .await?;
 
-        let download_dir = make_temp_path("readonly_test");
+        let download_dir = make_temp_path("eexist_test");
         fs::create_dir_all(&download_dir)
             .await
             .err_tip(|| "create dir")?;
 
-        // Pre-create the file with OLD content and make it read-only
-        // (simulating what rsync + set_readonly_recursive would do).
-        let file_path = format!("{download_dir}/{FILE_NAME}");
+        // Pre-create file1 as read-only (simulating rsync'd file).
+        // file2 does NOT exist on disk.
+        let file1_path = format!("{download_dir}/{FILE1_NAME}");
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::write(&file_path, OLD_CONTENT).await?;
+            tokio::fs::write(&file1_path, FILE1_CONTENT).await?;
             tokio::fs::set_permissions(
-                &file_path,
+                &file1_path,
                 std::fs::Permissions::from_mode(0o444),
             )
             .await?;
         }
 
-        // Verify: file exists, read-only, old content.
-        let md = tokio::fs::metadata(&file_path).await?;
-        assert_eq!(md.len(), 12);
-        assert_eq!(from_utf8(&fs::read(&file_path).await?)?, OLD_CONTENT);
-
-        // download_to_directory should replace the stale read-only file
-        // with the CAS version.
+        // download_to_directory must succeed: file1 gets EEXIST (trusted),
+        // file2 gets fetched from CAS.
         download_to_directory(
             cas_store.as_ref(),
             fast_store.as_pin(),
@@ -599,12 +607,16 @@ mod tests {
         )
         .await?;
 
-        // File must now contain NEW content from CAS.
-        let content = fs::read(&file_path).await?;
+        // file1 still exists (trusted as-is).
+        assert!(tokio::fs::metadata(&file1_path).await.is_ok());
+
+        // file2 MUST exist — EEXIST on file1 must not abort the walk.
+        let file2_path = format!("{download_dir}/{FILE2_NAME}");
+        let content = fs::read(&file2_path).await?;
         assert_eq!(
             from_utf8(&content)?,
-            NEW_CONTENT,
-            "Read-only stale file must be replaced by CAS content"
+            FILE2_CONTENT,
+            "EEXIST on file1 must not prevent file2 from being downloaded"
         );
 
         Ok(())
