@@ -192,6 +192,102 @@ impl RedisDirIndexResolver {
     }
 }
 
+/// Render a (path, digest) pair into the "path|hash-size" format used
+/// in `nativelink:pending_outputs:{machine_id}` LIST entries. This must
+/// match the format consumed by the worker's drain path.
+pub fn pending_entry_string(path: &str, digest: &DigestInfo) -> String {
+    format!("{path}|{}-{}", digest.packed_hash(), digest.size_bytes())
+}
+
+/// Pure diff function: given the resolved paths from a walk and a lookup
+/// of worker_state (what the worker already has on disk), return only
+/// the entries that need to be pushed to the worker's pending_outputs.
+///
+/// A path is pushed when:
+/// - It is not in worker_state (worker doesn't have it), OR
+/// - The worker_state digest differs from the walk's digest (content changed)
+pub fn diff_against_worker_state<F>(
+    walked: &[(String, DigestInfo)],
+    mut worker_state_get: F,
+) -> Vec<(String, DigestInfo)>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    walked
+        .iter()
+        .filter_map(|(path, digest)| {
+            let expected = format!("{}-{}", digest.packed_hash(), digest.size_bytes());
+            match worker_state_get(path) {
+                Some(current) if current == expected => None,
+                _ => Some((path.clone(), *digest)),
+            }
+        })
+        .collect()
+}
+
+/// Redis-backed journaler that publishes resolved paths to
+/// `nativelink:pending_outputs:{machine_id}` LISTs, deduplicating
+/// against `nativelink:worker_state:{machine_id}` HASHes.
+#[derive(Debug)]
+pub struct DispatchJournaler {
+    redis_client: redis::Client,
+}
+
+impl DispatchJournaler {
+    pub fn new(url: &str) -> Result<Self, redis::RedisError> {
+        let redis_client = redis::Client::open(url)?;
+        Ok(Self { redis_client })
+    }
+
+    /// Push pending_outputs entries for files the given worker doesn't
+    /// already have on disk. Best-effort: Redis errors are logged at
+    /// `warn!` level and swallowed.
+    pub fn publish_for_worker(
+        &self,
+        machine_id: &str,
+        walked: &[(String, DigestInfo)],
+    ) -> Result<usize, redis::RedisError> {
+        if walked.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.redis_client.get_connection()?;
+        let worker_state_key = format!("nativelink:worker_state:{machine_id}");
+
+        // Fetch all relevant paths from worker_state in one HMGET.
+        let paths: Vec<&str> = walked.iter().map(|(p, _)| p.as_str()).collect();
+        let current_values: Vec<Option<String>> = if paths.is_empty() {
+            Vec::new()
+        } else {
+            redis::cmd("HMGET")
+                .arg(&worker_state_key)
+                .arg(&paths)
+                .query(&mut conn)
+                .unwrap_or_default()
+        };
+
+        let mut to_push = Vec::new();
+        for (idx, (path, digest)) in walked.iter().enumerate() {
+            let expected = format!("{}-{}", digest.packed_hash(), digest.size_bytes());
+            let current = current_values.get(idx).cloned().flatten();
+            if current.as_deref() != Some(expected.as_str()) {
+                to_push.push(pending_entry_string(path, digest));
+            }
+        }
+
+        if to_push.is_empty() {
+            return Ok(0);
+        }
+        let pending_key = format!("nativelink:pending_outputs:{machine_id}");
+        let mut cmd = redis::cmd("RPUSH");
+        cmd.arg(&pending_key);
+        for entry in &to_push {
+            cmd.arg(entry);
+        }
+        drop(cmd.query::<i64>(&mut conn));
+        Ok(to_push.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -420,6 +516,88 @@ mod tests {
     #[test]
     fn redis_resolver_rejects_invalid_url() {
         assert!(RedisDirIndexResolver::new("not-a-url").is_err());
+    }
+
+    #[test]
+    fn pending_entry_string_format() {
+        let d = mk_digest(0xAB, 42);
+        let s = pending_entry_string("foo/bar.o", &d);
+        assert!(s.starts_with("foo/bar.o|"));
+        assert!(s.ends_with("-42"));
+    }
+
+    #[test]
+    fn diff_returns_all_when_worker_state_empty() {
+        let d1 = mk_digest(1, 100);
+        let d2 = mk_digest(2, 200);
+        let walked = vec![
+            ("a.o".to_string(), d1),
+            ("sub/b.o".to_string(), d2),
+        ];
+        let diff = diff_against_worker_state(&walked, |_| None);
+        assert_eq!(diff.len(), 2);
+    }
+
+    #[test]
+    fn diff_skips_matching_entries() {
+        let d = mk_digest(1, 100);
+        let walked = vec![("a.o".to_string(), d)];
+        let expected = format!("{}-{}", d.packed_hash(), d.size_bytes());
+        let diff = diff_against_worker_state(&walked, |path| {
+            if path == "a.o" {
+                Some(expected.clone())
+            } else {
+                None
+            }
+        });
+        assert!(diff.is_empty(), "matching entry must be skipped");
+    }
+
+    #[test]
+    fn diff_emits_entries_with_changed_digest() {
+        let d_new = mk_digest(1, 100);
+        let d_old = mk_digest(2, 200);
+        let walked = vec![("a.o".to_string(), d_new)];
+        let old_value = format!("{}-{}", d_old.packed_hash(), d_old.size_bytes());
+        let diff = diff_against_worker_state(&walked, |path| {
+            if path == "a.o" {
+                Some(old_value.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].1, d_new);
+    }
+
+    #[test]
+    fn diff_mixed_hits_and_misses() {
+        let d_same = mk_digest(1, 10);
+        let d_changed = mk_digest(2, 20);
+        let d_new = mk_digest(3, 30);
+        let walked = vec![
+            ("same.o".to_string(), d_same),
+            ("changed.o".to_string(), d_changed),
+            ("new.o".to_string(), d_new),
+        ];
+        let same_value = format!("{}-{}", d_same.packed_hash(), d_same.size_bytes());
+        let old_value = format!("{}-{}", mk_digest(99, 99).packed_hash(), 99);
+        let diff = diff_against_worker_state(&walked, |path| match path {
+            "same.o" => Some(same_value.clone()),
+            "changed.o" => Some(old_value.clone()),
+            _ => None,
+        });
+        assert_eq!(diff.len(), 2);
+        let paths: Vec<_> = diff.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"changed.o"));
+        assert!(paths.contains(&"new.o"));
+        assert!(!paths.contains(&"same.o"));
+    }
+
+    #[test]
+    fn dispatch_journaler_constructible() {
+        assert!(DispatchJournaler::new("redis://127.0.0.1:6379").is_ok());
+        assert!(DispatchJournaler::new("not-a-url").is_err());
     }
 
     #[test]

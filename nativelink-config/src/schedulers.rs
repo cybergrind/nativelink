@@ -166,6 +166,17 @@ pub struct SimpleSpec {
         deserialize_with = "convert_duration_with_shellexpand_and_negative"
     )]
     pub worker_match_logging_interval_s: i64,
+
+    /// Optional Redis URL for the scheduler-side dir_index resolver.
+    /// When set, the scheduler walks action input trees before dispatch
+    /// and publishes any files the target worker is missing to the
+    /// worker's pending_outputs LIST. Must point to the same Redis
+    /// instance that the CAS server's `dir_index_redis_url` points to.
+    ///
+    /// Default: None (dir_index flow disabled; workers use traditional
+    /// download_to_directory walk).
+    #[serde(default)]
+    pub dir_index_redis_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

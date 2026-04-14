@@ -488,6 +488,11 @@ pub struct ApiWorkerScheduler {
 
     /// Performance metrics for observability.
     metrics: Arc<SchedulerMetrics>,
+
+    /// Optional dir_index resolver for walking input trees via Redis.
+    dir_index_resolver: Option<Arc<crate::dir_index_resolver::RedisDirIndexResolver>>,
+    /// Optional journaler for publishing resolved paths to worker pending_outputs.
+    dispatch_journaler: Option<Arc<crate::dir_index_resolver::DispatchJournaler>>,
 }
 
 impl ApiWorkerScheduler {
@@ -499,6 +504,49 @@ impl ApiWorkerScheduler {
         worker_timeout_s: u64,
         worker_registry: SharedWorkerRegistry,
     ) -> Arc<Self> {
+        Self::new_with_dir_index(
+            worker_state_manager,
+            platform_property_manager,
+            allocation_strategy,
+            worker_change_notify,
+            worker_timeout_s,
+            worker_registry,
+            None,
+        )
+    }
+
+    pub fn new_with_dir_index(
+        worker_state_manager: Arc<dyn WorkerStateManager>,
+        platform_property_manager: Arc<PlatformPropertyManager>,
+        allocation_strategy: WorkerAllocationStrategy,
+        worker_change_notify: Arc<Notify>,
+        worker_timeout_s: u64,
+        worker_registry: SharedWorkerRegistry,
+        dir_index_redis_url: Option<&str>,
+    ) -> Arc<Self> {
+        let (dir_index_resolver, dispatch_journaler) =
+            if let Some(url) = dir_index_redis_url.filter(|s| !s.is_empty()) {
+                match (
+                    crate::dir_index_resolver::RedisDirIndexResolver::new(url),
+                    crate::dir_index_resolver::DispatchJournaler::new(url),
+                ) {
+                    (Ok(r), Ok(j)) => {
+                        tracing::info!("Scheduler dir_index enabled via Redis at {url}");
+                        (Some(Arc::new(r)), Some(Arc::new(j)))
+                    }
+                    (r, j) => {
+                        tracing::warn!(
+                            "Failed to initialize dir_index at {url}: resolver={:?}, journaler={:?}",
+                            r.err(),
+                            j.err()
+                        );
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
@@ -513,6 +561,8 @@ impl ApiWorkerScheduler {
             worker_timeout_s,
             worker_registry,
             metrics: Arc::new(SchedulerMetrics::default()),
+            dir_index_resolver,
+            dispatch_journaler,
         })
     }
 
@@ -530,6 +580,53 @@ impl ApiWorkerScheduler {
         self.metrics
             .actions_dispatched
             .fetch_add(1, Ordering::Relaxed);
+
+        // Dir-index hook: before dispatching the action, walk the input
+        // tree via the Redis dir_index and publish any files the target
+        // worker is missing to its pending_outputs list. The worker drains
+        // this list before executing the action. Best-effort: Redis errors
+        // are logged and swallowed — the worker still falls back to the
+        // live download_to_directory walk.
+        if let (Some(resolver), Some(journaler)) =
+            (&self.dir_index_resolver, &self.dispatch_journaler)
+        {
+            let machine_id = worker_id.to_string();
+            let resolver = resolver.clone();
+            let journaler = journaler.clone();
+            let root_digest = action_info.inner.input_root_digest;
+            // Run the walk+publish on a blocking thread — both Redis calls
+            // are synchronous and we don't want to block the async runtime.
+            let join = tokio::task::spawn_blocking(move || {
+                let walked = resolver.resolve_paths(&root_digest);
+                if walked.is_empty() {
+                    return;
+                }
+                match journaler.publish_for_worker(&machine_id, &walked) {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(
+                            machine_id = %machine_id,
+                            pushed = n,
+                            walked = walked.len(),
+                            "dir_index: published pending_outputs for worker"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            machine_id = %machine_id,
+                            ?e,
+                            "dir_index: failed to publish pending_outputs"
+                        );
+                    }
+                }
+            });
+            // Wait for the publish to complete before dispatching the action —
+            // the worker will drain pending_outputs on receipt.
+            if let Err(e) = join.await {
+                tracing::warn!(?e, "dir_index: publish task panicked");
+            }
+        }
+
         let mut inner = self.inner.lock().await;
         inner
             .worker_notify_run_action(worker_id, operation_id, action_info)
