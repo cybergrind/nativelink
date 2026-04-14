@@ -268,6 +268,49 @@ impl RedisOutputSync {
         }
         result
     }
+
+    /// Format the value stored at `worker_state:{machine_id}[path]`.
+    /// Must match the format consumed by the scheduler's dispatch
+    /// journaler (see nativelink-scheduler/src/dir_index_resolver.rs).
+    pub fn worker_state_value(digest: &DigestInfo) -> String {
+        format!("{}-{}", digest.packed_hash(), digest.size_bytes())
+    }
+
+    /// Record that this worker now has `path` at the given digest. Writes
+    /// `HSET worker_state:{machine_id} path "{digest_hex}-{size}"`.
+    /// Best-effort: on Redis failure the update is silently dropped and
+    /// the scheduler will re-publish this file on the next action.
+    pub fn update_worker_state(&self, path: &str, digest: &DigestInfo) {
+        let Ok(mut conn) = self.redis_client.get_connection() else {
+            return;
+        };
+        let key = format!("nativelink:worker_state:{}", self.machine_id);
+        let value = Self::worker_state_value(digest);
+        drop(
+            redis::cmd("HSET")
+                .arg(&key)
+                .arg(path)
+                .arg(&value)
+                .query::<i64>(&mut conn),
+        );
+    }
+
+    /// Batch variant — writes multiple (path, digest) pairs in a single HSET.
+    pub fn update_worker_state_bulk(&self, entries: &[(String, DigestInfo)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let Ok(mut conn) = self.redis_client.get_connection() else {
+            return;
+        };
+        let key = format!("nativelink:worker_state:{}", self.machine_id);
+        let mut cmd = redis::cmd("HSET");
+        cmd.arg(&key);
+        for (path, digest) in entries {
+            cmd.arg(path).arg(Self::worker_state_value(digest));
+        }
+        drop(cmd.query::<i64>(&mut conn));
+    }
 }
 
 /// Per-worker cache combining path->digest mapping and walked-dirs cache.
@@ -347,6 +390,23 @@ impl PathDigestCache {
             sync.drain_pending_outputs()
         } else {
             vec![]
+        }
+    }
+
+    /// Record that this worker now has `path` at the given digest in
+    /// `worker_state:{machine_id}`. Called after a successful
+    /// materialization so the scheduler's next HMGET sees the update and
+    /// stops re-publishing the same file.
+    pub fn update_worker_state(&self, path: &str, digest: &DigestInfo) {
+        if let Some(ref sync) = self.output_sync {
+            sync.update_worker_state(path, digest);
+        }
+    }
+
+    /// Batch variant of `update_worker_state`.
+    pub fn update_worker_state_bulk(&self, entries: &[(String, DigestInfo)]) {
+        if let Some(ref sync) = self.output_sync {
+            sync.update_worker_state_bulk(entries);
         }
     }
 
@@ -502,5 +562,33 @@ mod tests {
         let digest = DigestInfo::new([1u8; 32], 100);
         // Should not panic even without output_sync configured.
         cache.record_outputs(&[("foo.o".to_string(), digest)]);
+    }
+
+    #[test]
+    fn test_worker_state_value_format() {
+        let digest = DigestInfo::new([0xABu8; 32], 42);
+        let v = RedisOutputSync::worker_state_value(&digest);
+        assert!(v.ends_with("-42"));
+        // Must match the value format that the scheduler's
+        // `DispatchJournaler::publish_for_worker` compares against,
+        // which is `"{hash}-{size}"`.
+        assert!(v.contains('-'));
+        assert_eq!(v.matches('-').count(), 1);
+    }
+
+    #[test]
+    fn test_update_worker_state_noop_without_sync() {
+        let cache = PathDigestCache::new();
+        let digest = DigestInfo::new([1u8; 32], 100);
+        // Should not panic without output_sync.
+        cache.update_worker_state("foo.o", &digest);
+        cache.update_worker_state_bulk(&[("a".to_string(), digest)]);
+    }
+
+    #[test]
+    fn test_update_worker_state_bulk_empty_noop() {
+        let cache = PathDigestCache::new();
+        // Empty input must not attempt any Redis work.
+        cache.update_worker_state_bulk(&[]);
     }
 }

@@ -956,10 +956,18 @@ impl RunningActionImpl {
                     let cas = self.running_actions_manager.cas_store.as_ref();
                     let fs_store =
                         Pin::new(self.running_actions_manager.filesystem_store.as_ref());
+                    // Track successfully materialized entries so we can bulk-
+                    // update `worker_state:{machine_id}` in Redis. The
+                    // scheduler's next HMGET will see these and stop
+                    // re-publishing the same paths.
+                    let mut materialized: Vec<(String, DigestInfo)> =
+                        Vec::with_capacity(pending.len());
                     for (relative_path, digest) in &pending {
                         let dest = format!("{}/{}", self.work_directory, relative_path);
-                        // Skip if already on disk.
+                        // Skip if already on disk — but still record the
+                        // worker_state entry so the scheduler knows we have it.
                         if tokio::fs::metadata(&dest).await.is_ok() {
+                            materialized.push((relative_path.clone(), *digest));
                             continue;
                         }
                         // Ensure parent directory exists.
@@ -975,13 +983,21 @@ impl RunningActionImpl {
                                     .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
                                     .await
                                 {
-                                    drop(fs::hard_link(&src, &dest).await);
+                                    if fs::hard_link(&src, &dest).await.is_ok() {
+                                        materialized.push((relative_path.clone(), *digest));
+                                    }
                                 }
                             }
                         }
                     }
+                    // Batch-update worker_state so the scheduler sees our
+                    // new disk contents.
+                    self.running_actions_manager
+                        .path_digest_cache
+                        .update_worker_state_bulk(&materialized);
                     info!(
                         count = pending.len(),
+                        materialized = materialized.len(),
                         "synced pending outputs from other workers"
                     );
                 }
