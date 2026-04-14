@@ -257,12 +257,21 @@ impl RedisOutputSync {
 
     /// Record outputs produced by this machine. Pushes entries to
     /// `nativelink:pending_outputs:{target}` for every OTHER registered machine.
-    /// Each target's push gets a fresh seqnum from `next_seqnum:{target}`
-    /// so the drain + pre-action barrier can reason about per-target ordering.
+    /// INCR next_seqnum + RPUSH happen atomically in a single Lua script
+    /// so the target's bg drain can safely heartbeat `drained_seqnum`
+    /// when it observes `LLEN == 0` (no race where publisher is between
+    /// INCR and RPUSH).
     pub fn record_outputs(&self, outputs: &[(String, DigestInfo)]) {
         if outputs.is_empty() {
             return;
         }
+        const PUBLISH_SCRIPT: &str = r#"
+            local seqnum = redis.call('INCR', KEYS[1])
+            for i=1,#ARGV do
+                redis.call('RPUSH', KEYS[2], ARGV[i] .. '|' .. seqnum)
+            end
+            return seqnum
+        "#;
         drop(self.pool.with_conn(|conn| {
             let other_machines: Vec<String> = redis::cmd("SMEMBERS")
                 .arg("nativelink:machines")
@@ -272,23 +281,21 @@ impl RedisOutputSync {
                 if target == &self.machine_id {
                     continue;
                 }
-                // Allocate a monotonic batch seqnum for this target.
                 let seqnum_key = format!("nativelink:next_seqnum:{target}");
-                let seqnum: i64 = match redis::cmd("INCR").arg(&seqnum_key).query(conn) {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                let key = format!("nativelink:pending_outputs:{target}");
-                let mut cmd = redis::cmd("RPUSH");
-                cmd.arg(&key);
-                for (path, digest) in outputs {
-                    let member = format!(
-                        "{}|{}-{}|{seqnum}",
-                        path,
-                        digest.packed_hash(),
-                        digest.size_bytes()
-                    );
-                    cmd.arg(member);
+                let pending_key = format!("nativelink:pending_outputs:{target}");
+                let prefixes: Vec<String> = outputs
+                    .iter()
+                    .map(|(path, digest)| {
+                        format!("{path}|{}-{}", digest.packed_hash(), digest.size_bytes())
+                    })
+                    .collect();
+                let mut cmd = redis::cmd("EVAL");
+                cmd.arg(PUBLISH_SCRIPT)
+                    .arg(2)
+                    .arg(&seqnum_key)
+                    .arg(&pending_key);
+                for prefix in &prefixes {
+                    cmd.arg(prefix);
                 }
                 drop(cmd.query::<i64>(conn));
             }
@@ -433,7 +440,6 @@ impl RedisOutputSync {
             return;
         }
         let key = format!("nativelink:drained_seqnum:{}", self.machine_id);
-        // Lua script: only SET if new value > existing (or existing is missing).
         const SCRIPT: &str = r"
             local cur = redis.call('GET', KEYS[1])
             if not cur or tonumber(cur) < tonumber(ARGV[1]) then
@@ -443,12 +449,57 @@ impl RedisOutputSync {
                 return tonumber(cur)
             end
         ";
+        let new_value: Option<i64> = self
+            .pool
+            .with_conn(|conn| {
+                redis::cmd("EVAL")
+                    .arg(SCRIPT)
+                    .arg(1)
+                    .arg(&key)
+                    .arg(seqnum)
+                    .query::<i64>(conn)
+            })
+            .and_then(Result::ok);
+        tracing::info!(
+            machine_id = %self.machine_id,
+            requested = seqnum,
+            current = new_value.unwrap_or(-1),
+            "advance_drained_seqnum"
+        );
+    }
+
+    /// Heartbeat: when `pending_outputs:{machine_id}` is empty, the worker
+    /// has materialized everything published so far. Atomically advance
+    /// `drained_seqnum` to match `next_seqnum` so the scheduler's barrier
+    /// observes a live cursor even when no materialization work arrived.
+    ///
+    /// Safe because `next_seqnum` is only ever incremented atomically
+    /// together with the RPUSH (via the publish Lua script). So observing
+    /// `LLEN == 0` guarantees every seqnum issued so far has been
+    /// popped/materialized — no publisher is half-way through INCR+RPUSH.
+    pub fn heartbeat_drained_if_empty(&self) {
+        let pending = format!("nativelink:pending_outputs:{}", self.machine_id);
+        let next_key = format!("nativelink:next_seqnum:{}", self.machine_id);
+        let drained = format!("nativelink:drained_seqnum:{}", self.machine_id);
+        const SCRIPT: &str = r"
+            if redis.call('LLEN', KEYS[1]) ~= 0 then
+                return -1
+            end
+            local n = tonumber(redis.call('GET', KEYS[2]) or '0')
+            local cur = tonumber(redis.call('GET', KEYS[3]) or '0')
+            if n > cur then
+                redis.call('SET', KEYS[3], n)
+                return n
+            end
+            return cur
+        ";
         drop(self.pool.with_conn(|conn| {
             redis::cmd("EVAL")
                 .arg(SCRIPT)
-                .arg(1)
-                .arg(&key)
-                .arg(seqnum)
+                .arg(3)
+                .arg(&pending)
+                .arg(&next_key)
+                .arg(&drained)
                 .query::<i64>(conn)
         }));
     }
@@ -588,6 +639,15 @@ impl PathDigestCache {
     pub fn advance_drained_seqnum(&self, seqnum: i64) {
         if let Some(ref sync) = self.output_sync {
             sync.advance_drained_seqnum(seqnum);
+        }
+    }
+
+    /// Heartbeat when the pending_outputs list is empty: advance
+    /// `drained_seqnum` to `next_seqnum` atomically. Silent no-op without
+    /// Redis output_sync.
+    pub fn heartbeat_drained_if_empty(&self) {
+        if let Some(ref sync) = self.output_sync {
+            sync.heartbeat_drained_if_empty();
         }
     }
 

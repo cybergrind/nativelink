@@ -2474,6 +2474,14 @@ impl RunningActionsManagerImpl {
                             "background",
                         )
                         .await;
+                        // Heartbeat: if pending_outputs is now empty, tell
+                        // the scheduler we're caught up by advancing
+                        // drained_seqnum to next_seqnum atomically. Without
+                        // this, a worker that's polled an empty queue has
+                        // nothing to materialize → never writes the cursor,
+                        // so the scheduler's barrier waits indefinitely
+                        // even though the worker has no backlog.
+                        cache.heartbeat_drained_if_empty();
                     }
                 });
             }

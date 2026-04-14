@@ -427,31 +427,44 @@ impl DispatchJournaler {
             return Ok((0, 0));
         }
 
-        // Allocate a monotonic batch seqnum. Every entry in this RPUSH
-        // carries the same seqnum; the worker's drain reports progress
-        // back to `drained_seqnum:{machine_id}` at batch granularity so
-        // the scheduler can implement a pre-action barrier by comparing
-        // `drained_seqnum >= required_txid`.
+        // Atomic publish via Lua: INCR next_seqnum + RPUSH entries with
+        // that seqnum baked in, in a single Redis round-trip that nothing
+        // else can interleave. This is critical for the heartbeat on the
+        // worker side — if the worker observes `LLEN == 0` it can safely
+        // advance `drained_seqnum` to `next_seqnum` knowing no publisher
+        // is half-way through a non-atomic INCR+RPUSH.
+        const PUBLISH_SCRIPT: &str = r#"
+            local seqnum = redis.call('INCR', KEYS[1])
+            for i=1,#ARGV do
+                redis.call('RPUSH', KEYS[2], ARGV[i] .. '|' .. seqnum)
+            end
+            return seqnum
+        "#;
         let seqnum_key = format!("nativelink:next_seqnum:{machine_id}");
-        let seqnum: i64 = match redis::cmd("INCR").arg(&seqnum_key).query(&mut conn) {
-            Ok(n) => n,
-            Err(e) => return Err(e),
-        };
-
-        let to_push: Vec<String> = to_push_raw
-            .iter()
-            .map(|(path, digest)| pending_entry_string(path, digest, seqnum))
-            .collect();
         let pending_key = format!("nativelink:pending_outputs:{machine_id}");
-        let mut cmd = redis::cmd("RPUSH");
-        cmd.arg(&pending_key);
-        for entry in &to_push {
-            cmd.arg(entry);
+        // ARGV entries are the 2-field prefix ("path|hex-size"); Lua
+        // appends "|seqnum" so the worker's parser gets the full 3-field.
+        let prefixes: Vec<String> = to_push_raw
+            .iter()
+            .map(|(path, digest)| {
+                format!("{path}|{}-{}", digest.packed_hash(), digest.size_bytes())
+            })
+            .collect();
+        let mut script_cmd = redis::cmd("EVAL");
+        script_cmd
+            .arg(PUBLISH_SCRIPT)
+            .arg(2)
+            .arg(&seqnum_key)
+            .arg(&pending_key);
+        for prefix in &prefixes {
+            script_cmd.arg(prefix);
         }
-        let rpush_result: i64 = match cmd.query::<i64>(&mut conn) {
+        let seqnum: i64 = match script_cmd.query::<i64>(&mut conn) {
             Ok(n) => n,
             Err(e) => return Err(e),
         };
+        let to_push = prefixes;
+        let rpush_result: i64 = to_push.len() as i64;
         let post_llen: i64 = redis::cmd("LLEN")
             .arg(&pending_key)
             .query(&mut conn)
