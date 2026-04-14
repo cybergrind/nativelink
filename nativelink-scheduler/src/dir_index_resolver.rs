@@ -327,10 +327,28 @@ impl DispatchJournaler {
         for entry in &to_push {
             cmd.arg(entry);
         }
-        if let Err(e) = cmd.query::<i64>(conn) {
-            *slot = None;
-            return Err(e);
-        }
+        let rpush_result: i64 = match cmd.query::<i64>(conn) {
+            Ok(n) => n,
+            Err(e) => {
+                *slot = None;
+                return Err(e);
+            }
+        };
+        // Diagnostic: verify the list actually contains what we pushed. If
+        // post_llen < rpush_result, something cleared the list between the
+        // RPUSH and this LLEN (likely a concurrent DEL from the worker).
+        let post_llen: i64 = redis::cmd("LLEN")
+            .arg(&pending_key)
+            .query(conn)
+            .unwrap_or(-1);
+        tracing::info!(
+            machine_id = %machine_id,
+            key = %pending_key,
+            pushed_count = to_push.len(),
+            rpush_result,
+            post_llen,
+            "publish: post-RPUSH Redis state"
+        );
         Ok(to_push.len())
     }
 }

@@ -280,20 +280,36 @@ impl RedisOutputSync {
     /// Drain pending outputs that OTHER machines produced for THIS machine.
     /// Returns `(relative_path, DigestInfo)` pairs that need to be fetched
     /// from CAS and written to the local shared tree.
+    ///
+    /// Uses explicit LRANGE + DEL (not atomic pipeline) so failures at any
+    /// step are observable. Logs the raw LLEN result for diagnosis.
     pub fn drain_pending_outputs(&self) -> Vec<(String, DigestInfo)> {
         let key = format!("nativelink:pending_outputs:{}", self.machine_id);
         let entries: Vec<String> = self
-            .with_conn(|conn| {
-                redis::pipe()
-                    .atomic()
-                    .cmd("LRANGE")
+            .with_conn(|conn| -> Result<Vec<String>, redis::RedisError> {
+                // Diagnostic: log LLEN before LRANGE so we can see the server's
+                // view regardless of how LRANGE parses.
+                let pre_llen: i64 = redis::cmd("LLEN")
+                    .arg(&key)
+                    .query(conn)
+                    .unwrap_or(-1);
+                tracing::info!(
+                    key = %key,
+                    pre_llen,
+                    "drain: LLEN before LRANGE"
+                );
+                let lr: Vec<String> = redis::cmd("LRANGE")
                     .arg(&key)
                     .arg(0i64)
                     .arg(-1i64)
-                    .cmd("DEL")
-                    .arg(&key)
-                    .ignore()
-                    .query(conn)
+                    .query(conn)?;
+                tracing::info!(
+                    key = %key,
+                    lrange_count = lr.len(),
+                    "drain: LRANGE result"
+                );
+                drop(redis::cmd("DEL").arg(&key).query::<i64>(conn));
+                Ok(lr)
             })
             .unwrap_or_default();
         let mut result = Vec::with_capacity(entries.len());
