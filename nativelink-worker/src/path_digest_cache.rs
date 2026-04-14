@@ -355,33 +355,33 @@ impl RedisOutputSync {
                     .arg(&key)
                     .query(conn)
                     .unwrap_or(-1);
-                tracing::info!(
-                    key = %key,
-                    pre_llen,
-                    "drain: LLEN before LRANGE"
-                );
                 if pre_llen <= 0 {
+                    tracing::info!(key = %key, pre_llen, "drain: empty, skipping");
                     return Ok(Vec::new());
                 }
-                // Atomically take the first `pre_llen` entries: LRANGE +
-                // LTRIM inside a MULTI/EXEC so concurrent RPUSH-after-LRANGE
-                // doesn't get clobbered by a DEL. This preserves any entries
-                // a publisher adds between our LRANGE and our trim.
-                let (lr, _): (Vec<String>, i64) = redis::pipe()
-                    .atomic()
-                    .cmd("LRANGE")
+                // Read the first `pre_llen` entries, then LTRIM by the SAME
+                // count. LTRIM is index-based: `LTRIM key N -1` keeps
+                // indices N..end, removing exactly the first N. Any entry
+                // an RPUSH appends between our LRANGE and our LTRIM lands
+                // at index >= N and is preserved — no atomic pipe needed,
+                // no chance of misparsing a MULTI/EXEC reply tuple.
+                let lr: Vec<String> = redis::cmd("LRANGE")
                     .arg(&key)
                     .arg(0i64)
                     .arg(pre_llen - 1)
-                    .cmd("LTRIM")
-                    .arg(&key)
-                    .arg(pre_llen)
-                    .arg(-1i64)
                     .query(conn)?;
+                let taken = lr.len() as i64;
+                let ltrim: Result<(), redis::RedisError> = redis::cmd("LTRIM")
+                    .arg(&key)
+                    .arg(taken)
+                    .arg(-1i64)
+                    .query(conn);
                 tracing::info!(
                     key = %key,
-                    lrange_count = lr.len(),
-                    "drain: LRANGE+LTRIM result"
+                    pre_llen,
+                    taken,
+                    ltrim_ok = ltrim.is_ok(),
+                    "drain: LRANGE + LTRIM-by-count"
                 );
                 Ok(lr)
             })

@@ -603,13 +603,17 @@ pub async fn drain_and_materialize_pending_outputs(
     // Advance the drained cursor iff every entry materialized. A partial
     // materialization must NOT advance the cursor — otherwise the pre-action
     // barrier would unblock for a txid whose files aren't all on disk.
-    if materialized.len() == pending_len && max_seqnum > 0 {
+    let advanced = if materialized.len() == pending_len && max_seqnum > 0 {
         path_digest_cache.advance_drained_seqnum(max_seqnum);
-    }
+        true
+    } else {
+        false
+    };
     info!(
         count = pending_len,
         materialized = materialized.len(),
         max_seqnum,
+        advanced_cursor = advanced,
         reason,
         "synced pending outputs"
     );
