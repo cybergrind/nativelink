@@ -952,6 +952,13 @@ impl RunningActionImpl {
                     .running_actions_manager
                     .path_digest_cache
                     .drain_pending_outputs();
+                // Always log the drain result, even if empty — lets us confirm
+                // the pre-action sync hook is actually running.
+                info!(
+                    pending_count = pending.len(),
+                    work_directory = %self.work_directory,
+                    "pre-action drain: pending_outputs snapshot"
+                );
                 if !pending.is_empty() {
                     let cas = self.running_actions_manager.cas_store.as_ref();
                     let fs_store =

@@ -122,16 +122,54 @@ pub fn try_decode_directory(blob: &[u8]) -> Option<Vec<DirChild>> {
 /// The writer is best-effort: if Redis is unavailable, the record is
 /// silently dropped — the walk will fall back to decoding Directory
 /// protos from CAS directly.
-#[derive(Debug)]
+///
+/// Connection reuse: holds a single persistent `redis::Connection` behind
+/// a `parking_lot::Mutex`. Opening a new TCP socket per call would
+/// exhaust macOS ephemeral ports (~16k) within seconds on a large build
+/// (~5k+ Directory protos + more).
 pub struct DirIndexWriter {
     redis_client: redis::Client,
+    conn: parking_lot::Mutex<Option<redis::Connection>>,
+}
+
+impl std::fmt::Debug for DirIndexWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirIndexWriter")
+            .field("redis_client", &self.redis_client)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DirIndexWriter {
     /// `url` is a Redis connection string (e.g. `redis://127.0.0.1:6379`).
     pub fn new(url: &str) -> Result<Self, redis::RedisError> {
         let redis_client = redis::Client::open(url)?;
-        Ok(Self { redis_client })
+        Ok(Self {
+            redis_client,
+            conn: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// Runs `op` with a cached Redis connection, lazily opening one on
+    /// first use and reconnecting on error. Keeps the connection alive
+    /// across many calls to avoid TCP ephemeral port exhaustion.
+    fn with_conn<T, F>(&self, op: F) -> Result<T, redis::RedisError>
+    where
+        F: FnOnce(&mut redis::Connection) -> Result<T, redis::RedisError>,
+    {
+        let mut slot = self.conn.lock();
+        if slot.is_none() {
+            *slot = Some(self.redis_client.get_connection()?);
+        }
+        let conn = slot.as_mut().expect("just populated");
+        match op(conn) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // Drop the connection so the next call reconnects.
+                *slot = None;
+                Err(e)
+            }
+        }
     }
 
     /// Build the Redis HASH key for a directory with the given digest hash
@@ -161,15 +199,14 @@ impl DirIndexWriter {
         let key = Self::key_for(digest_hex, size);
         let pairs = Self::build_field_values(children);
 
-        let Ok(mut conn) = self.redis_client.get_connection() else {
-            return;
-        };
-        let mut cmd = redis::cmd("HSET");
-        cmd.arg(&key);
-        for (field, value) in &pairs {
-            cmd.arg(field).arg(value);
-        }
-        drop(cmd.query::<i64>(&mut conn));
+        drop(self.with_conn(|conn| {
+            let mut cmd = redis::cmd("HSET");
+            cmd.arg(&key);
+            for (field, value) in &pairs {
+                cmd.arg(field).arg(value);
+            }
+            cmd.query::<i64>(conn)
+        }));
     }
 
     /// Hook to be called after every successful CAS write. Attempts to

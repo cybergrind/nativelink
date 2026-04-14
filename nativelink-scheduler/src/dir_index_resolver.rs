@@ -145,15 +145,26 @@ fn digest_info(hex: &str, size: i64) -> Option<DigestInfo> {
 /// Redis-backed dir_index resolver. Walks a Directory subtree by reading
 /// `nativelink:dir_index:{digest_hex}-{size}` HASHes populated by the
 /// CAS-server upload hook.
-#[derive(Debug)]
 pub struct RedisDirIndexResolver {
     redis_client: redis::Client,
+    conn: parking_lot::Mutex<Option<redis::Connection>>,
+}
+
+impl std::fmt::Debug for RedisDirIndexResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisDirIndexResolver")
+            .field("redis_client", &self.redis_client)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RedisDirIndexResolver {
     pub fn new(url: &str) -> Result<Self, redis::RedisError> {
         let redis_client = redis::Client::open(url)?;
-        Ok(Self { redis_client })
+        Ok(Self {
+            redis_client,
+            conn: parking_lot::Mutex::new(None),
+        })
     }
 
     fn key_for(digest: &DigestInfo) -> String {
@@ -168,11 +179,21 @@ impl RedisDirIndexResolver {
     /// and parse its entries. Returns `None` if the key doesn't exist or
     /// Redis is unreachable.
     pub fn lookup(&self, digest: &DigestInfo) -> Option<Vec<DirEntry>> {
-        let mut conn = self.redis_client.get_connection().ok()?;
-        let pairs: Vec<(String, String)> = redis::cmd("HGETALL")
-            .arg(Self::key_for(digest))
-            .query(&mut conn)
-            .ok()?;
+        let key = Self::key_for(digest);
+        let pairs: Vec<(String, String)> = {
+            let mut slot = self.conn.lock();
+            if slot.is_none() {
+                *slot = self.redis_client.get_connection().ok();
+            }
+            let conn = slot.as_mut()?;
+            match redis::cmd("HGETALL").arg(&key).query(conn) {
+                Ok(v) => v,
+                Err(_) => {
+                    *slot = None;
+                    return None;
+                }
+            }
+        };
         if pairs.is_empty() {
             return None;
         }
@@ -228,15 +249,26 @@ where
 /// Redis-backed journaler that publishes resolved paths to
 /// `nativelink:pending_outputs:{machine_id}` LISTs, deduplicating
 /// against `nativelink:worker_state:{machine_id}` HASHes.
-#[derive(Debug)]
 pub struct DispatchJournaler {
     redis_client: redis::Client,
+    conn: parking_lot::Mutex<Option<redis::Connection>>,
+}
+
+impl std::fmt::Debug for DispatchJournaler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchJournaler")
+            .field("redis_client", &self.redis_client)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DispatchJournaler {
     pub fn new(url: &str) -> Result<Self, redis::RedisError> {
         let redis_client = redis::Client::open(url)?;
-        Ok(Self { redis_client })
+        Ok(Self {
+            redis_client,
+            conn: parking_lot::Mutex::new(None),
+        })
     }
 
     /// Push pending_outputs entries for files the given worker doesn't
@@ -250,7 +282,11 @@ impl DispatchJournaler {
         if walked.is_empty() {
             return Ok(0);
         }
-        let mut conn = self.redis_client.get_connection()?;
+        let mut slot = self.conn.lock();
+        if slot.is_none() {
+            *slot = Some(self.redis_client.get_connection()?);
+        }
+        let conn = slot.as_mut().expect("just populated");
         let worker_state_key = format!("nativelink:worker_state:{machine_id}");
 
         // Fetch all relevant paths from worker_state in one HMGET.
@@ -258,11 +294,18 @@ impl DispatchJournaler {
         let current_values: Vec<Option<String>> = if paths.is_empty() {
             Vec::new()
         } else {
-            redis::cmd("HMGET")
+            match redis::cmd("HMGET")
                 .arg(&worker_state_key)
                 .arg(&paths)
-                .query(&mut conn)
-                .unwrap_or_default()
+                .query(conn)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // Drop connection so next call reconnects.
+                    *slot = None;
+                    return Err(e);
+                }
+            }
         };
 
         let mut to_push = Vec::new();
@@ -277,13 +320,17 @@ impl DispatchJournaler {
         if to_push.is_empty() {
             return Ok(0);
         }
+        let conn = slot.as_mut().expect("still populated");
         let pending_key = format!("nativelink:pending_outputs:{machine_id}");
         let mut cmd = redis::cmd("RPUSH");
         cmd.arg(&pending_key);
         for entry in &to_push {
             cmd.arg(entry);
         }
-        drop(cmd.query::<i64>(&mut conn));
+        if let Err(e) = cmd.query::<i64>(conn) {
+            *slot = None;
+            return Err(e);
+        }
         Ok(to_push.len())
     }
 }
