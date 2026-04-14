@@ -67,7 +67,10 @@ Recommended value: the machine's IP address as a plain string.
 ## Step 3 — CAS server config (`.132`)
 
 In the combined scheduler + worker config file (e.g. `mac-combined.json5`),
-add `dir_index_redis_url` to every `byte_stream` entry:
+add `dir_index_redis_url` to **both** the `byte_stream` entries AND the `cas`
+entries. Siso uploads small blobs (including Directory protos) via
+`ContentAddressableStorage.BatchUpdateBlobs`, NOT `ByteStream.Write` — so
+both hook points must be configured or the dir_index stays empty.
 
 ```json5
 {
@@ -78,12 +81,23 @@ add `dir_index_redis_url` to every `byte_stream` entry:
     persist_stream_on_disconnect_timeout: 10,            // existing
     dir_index_redis_url: "redis://127.0.0.1:6379",       // ← NEW
   }],
+
+  cas: [{
+    instance_name: "main",
+    cas_store: "CAS_STORE",                              // existing
+    dir_index_redis_url: "redis://127.0.0.1:6379",       // ← NEW
+  }],
 }
 ```
 
-**Effect**: every blob the client uploads via `ByteStream.Write` is probed as a
-Directory protobuf; successful decodes are recorded in Redis as
+**Effect**: every blob the client uploads via `ByteStream.Write` **or**
+`ContentAddressableStorage.BatchUpdateBlobs` is probed as a Directory
+protobuf; successful decodes are recorded in Redis as
 `nativelink:dir_index:{digest}-{size}` HASHes.
+
+**IMPORTANT**: if only the `byte_stream` hook is configured (or only the
+`cas` hook), most Directory protos won't be indexed because siso picks the
+batch API for small blobs. Configure both.
 
 ---
 

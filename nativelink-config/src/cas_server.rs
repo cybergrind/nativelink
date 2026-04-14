@@ -128,6 +128,19 @@ pub struct CasStoreConfig {
     /// This store name referenced here may be reused multiple times.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub cas_store: StoreRefName,
+
+    /// Optional Redis URL for the Directory index. When set, every blob
+    /// uploaded via `ContentAddressableStorage.BatchUpdateBlobs` is probed
+    /// as a Directory protobuf; successful decodes are stored in Redis so
+    /// the scheduler can walk Directory chains without re-fetching protos.
+    ///
+    /// Must point to the same Redis instance used by the `ByteStream`
+    /// service's `dir_index_redis_url` and the scheduler's
+    /// `dir_index_redis_url`.
+    ///
+    /// Default: None (Directory index disabled on the batch upload path)
+    #[serde(default)]
+    pub dir_index_redis_url: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]

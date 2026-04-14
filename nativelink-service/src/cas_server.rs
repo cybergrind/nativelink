@@ -16,10 +16,14 @@ use core::convert::Into;
 use core::pin::Pin;
 use std::collections::{HashMap, VecDeque};
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, Stream};
 use futures::{StreamExt, TryStreamExt};
 use nativelink_config::cas_server::{CasStoreConfig, WithInstanceName};
+
+use crate::dir_index::DirIndexWriter;
 use nativelink_error::{Code, Error, ResultExt, error_if, make_input_err};
 use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::{
     ContentAddressableStorage, ContentAddressableStorageServer as Server,
@@ -42,8 +46,14 @@ use tonic::{Request, Response, Status};
 use tracing::{Instrument, Level, debug, error_span, instrument};
 
 #[derive(Debug)]
+struct CasInstance {
+    store: Store,
+    dir_index_writer: Option<Arc<DirIndexWriter>>,
+}
+
+#[derive(Debug)]
 pub struct CasServer {
-    stores: HashMap<String, Store>,
+    stores: HashMap<String, CasInstance>,
 }
 
 type GetTreeStream = Pin<Box<dyn Stream<Item = Result<GetTreeResponse, Status>> + Send + 'static>>;
@@ -58,7 +68,34 @@ impl CasServer {
             let store = store_manager.get_store(&config.cas_store).ok_or_else(|| {
                 make_input_err!("'cas_store': '{}' does not exist", config.cas_store)
             })?;
-            stores.insert(config.instance_name.to_string(), store);
+            let dir_index_writer = match config.dir_index_redis_url.as_deref() {
+                Some(url) if !url.is_empty() => match DirIndexWriter::new(url) {
+                    Ok(w) => {
+                        tracing::info!(
+                            "CAS dir-index writer enabled for instance {} at {}",
+                            config.instance_name,
+                            url
+                        );
+                        Some(Arc::new(w))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to create CAS dir-index writer for {}: {:?}",
+                            url,
+                            e
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            };
+            stores.insert(
+                config.instance_name.to_string(),
+                CasInstance {
+                    store,
+                    dir_index_writer,
+                },
+            );
         }
         Ok(Self { stores })
     }
@@ -72,11 +109,11 @@ impl CasServer {
         request: FindMissingBlobsRequest,
     ) -> Result<Response<FindMissingBlobsResponse>, Error> {
         let instance_name = &request.instance_name;
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
-            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
-            .clone();
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let store = instance.store.clone();
 
         let mut requested_blobs = Vec::with_capacity(request.blob_digests.len());
         for digest in &request.blob_digests {
@@ -103,11 +140,12 @@ impl CasServer {
     ) -> Result<Response<BatchUpdateBlobsResponse>, Error> {
         let instance_name = &request.instance_name;
 
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
-            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
-            .clone();
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let store = instance.store.clone();
+        let dir_index_writer = instance.dir_index_writer.clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
         // Note: We don't know the digests here, so we try perform a very shallow
@@ -117,6 +155,7 @@ impl CasServer {
         }
 
         let store_ref = &store;
+        let writer_ref = dir_index_writer.as_deref();
         let update_futures: FuturesUnordered<_> = request
             .requests
             .into_iter()
@@ -135,10 +174,29 @@ impl CasServer {
                     size_bytes,
                     request_data.len()
                 );
+                // Clone bytes before update so we can also probe them for
+                // the dir-index hook. The buffer is typically small for
+                // Directory protos (<1 MB), so the clone is cheap.
+                let data_for_hook = request_data.clone();
                 let result = store_ref
                     .update_oneshot(digest_info, request_data)
                     .await
                     .err_tip(|| "Error writing to store");
+
+                // Dir-index hook: if the blob is a Directory protobuf,
+                // record its children in Redis so the scheduler can walk
+                // Directory chains. Runs on successful writes only.
+                if result.is_ok() {
+                    if let Some(writer) = writer_ref {
+                        let digest_hex = format!("{}", digest_info.packed_hash());
+                        writer.maybe_record_from_blob(
+                            &digest_hex,
+                            digest_info.size_bytes() as i64,
+                            &data_for_hook,
+                        );
+                    }
+                }
+
                 Ok::<_, Error>(batch_update_blobs_response::Response {
                     digest: Some(digest),
                     status: Some(result.map_or_else(Into::into, |()| GrpcStatus::default())),
@@ -158,11 +216,11 @@ impl CasServer {
     ) -> Result<Response<BatchReadBlobsResponse>, Error> {
         let instance_name = &request.instance_name;
 
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
-            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
-            .clone();
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let store = instance.store.clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
         // Note: We don't know the digests here, so we try perform a very shallow
@@ -215,11 +273,11 @@ impl CasServer {
     ) -> Result<impl Stream<Item = Result<GetTreeResponse, Status>> + Send + use<>, Error> {
         let instance_name = &request.instance_name;
 
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
-            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
-            .clone();
+            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?;
+        let store = instance.store.clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
         // Note: We don't know the digests here, so we try perform a very shallow
