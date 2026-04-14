@@ -77,6 +77,48 @@ impl DirEntry {
 ///
 /// Paths are built relative to the root with `/` separators. Symlinks
 /// are not followed or emitted.
+/// Like `walk_tree`, but consults a `fallback` lookup whenever the
+/// `primary` lookup returns `None`. This handles the case where some
+/// Directory protos uploaded by the client never made it into the
+/// dir_index (transient REAPI errors, etc.) — the fallback can fetch
+/// the Directory live from CAS so the walk doesn't silently drop a
+/// subtree.
+///
+/// On every fallback hit, a `tracing::warn!` is emitted so operators can
+/// see when the dir_index is incomplete and how often the fallback path
+/// is exercised.
+pub fn walk_tree_with_fallback<P, S>(
+    root_digest: &DigestInfo,
+    mut primary: P,
+    mut fallback: S,
+) -> Vec<(String, DigestInfo)>
+where
+    P: FnMut(&DigestInfo) -> Option<Vec<DirEntry>>,
+    S: FnMut(&DigestInfo) -> Option<Vec<DirEntry>>,
+{
+    walk_tree(root_digest, |d| match primary(d) {
+        Some(entries) => Some(entries),
+        None => match fallback(d) {
+            Some(entries) => {
+                tracing::warn!(
+                    digest_hex = %d.packed_hash(),
+                    size = d.size_bytes(),
+                    "dir_index walk: primary missed, fallback served"
+                );
+                Some(entries)
+            }
+            None => {
+                tracing::warn!(
+                    digest_hex = %d.packed_hash(),
+                    size = d.size_bytes(),
+                    "dir_index walk: BOTH primary and fallback missed — subtree dropped"
+                );
+                None
+            }
+        },
+    })
+}
+
 pub fn walk_tree<F>(root_digest: &DigestInfo, mut lookup: F) -> Vec<(String, DigestInfo)>
 where
     F: FnMut(&DigestInfo) -> Option<Vec<DirEntry>>,
@@ -206,10 +248,17 @@ impl RedisDirIndexResolver {
 
     /// Walk the subtree rooted at `root_digest`, producing every
     /// `(full_path, digest)` pair. Subtrees whose Directory digest is not
-    /// cached in Redis are skipped silently — the caller is expected to
-    /// fall back to the live Directory-proto walk on the worker.
+    /// cached in Redis trigger a `warn!` log so operators can see when
+    /// the dir_index is incomplete (Bug F from cas_journal_failure_report_05).
     pub fn resolve_paths(&self, root_digest: &DigestInfo) -> Vec<(String, DigestInfo)> {
-        walk_tree(root_digest, |d| self.lookup(d))
+        walk_tree_with_fallback(
+            root_digest,
+            |d| self.lookup(d),
+            // No CAS fallback yet — this just enables the "primary missed"
+            // warn! logging in walk_tree_with_fallback. A real CAS-backed
+            // fallback would need the CAS store plumbed into the scheduler.
+            |_| None,
+        )
     }
 }
 
@@ -526,6 +575,105 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, "cached/foo.h");
+    }
+
+    /// Bug F regression: when a Directory digest is not in the primary
+    /// dir_index, the walker must consult the fallback (live CAS fetch)
+    /// instead of silently dropping the subtree.
+    #[test]
+    fn walk_with_fallback_uses_fallback_for_uncached_subdir() {
+        let root = mk_digest(1, 10);
+        let cached_sub = mk_digest(2, 20);
+        let uncached_sub = mk_digest(9, 99);
+        let cached_file = mk_digest(3, 50);
+        let fallback_file = mk_digest(4, 51);
+
+        // Primary index knows root + cached_sub but NOT uncached_sub.
+        let mut primary: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        primary.insert(
+            format!("{}-{}", hex_of(&root), root.size_bytes()),
+            vec![
+                DirEntry::Dir {
+                    name: "cached".to_string(),
+                    digest_hex: hex_of(&cached_sub),
+                    size: cached_sub.size_bytes() as i64,
+                },
+                DirEntry::Dir {
+                    name: "uncached".to_string(),
+                    digest_hex: hex_of(&uncached_sub),
+                    size: uncached_sub.size_bytes() as i64,
+                },
+            ],
+        );
+        primary.insert(
+            format!("{}-{}", hex_of(&cached_sub), cached_sub.size_bytes()),
+            vec![DirEntry::File {
+                name: "foo.h".to_string(),
+                digest_hex: hex_of(&cached_file),
+                size: cached_file.size_bytes() as i64,
+            }],
+        );
+
+        // Fallback knows uncached_sub.
+        let mut fallback: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        fallback.insert(
+            format!("{}-{}", hex_of(&uncached_sub), uncached_sub.size_bytes()),
+            vec![DirEntry::File {
+                name: "bar.h".to_string(),
+                digest_hex: hex_of(&fallback_file),
+                size: fallback_file.size_bytes() as i64,
+            }],
+        );
+
+        let out = walk_tree_with_fallback(
+            &root,
+            |d| {
+                primary
+                    .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                    .cloned()
+            },
+            |d| {
+                fallback
+                    .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                    .cloned()
+            },
+        );
+
+        // We expect BOTH files: cached/foo.h and uncached/bar.h.
+        assert_eq!(out.len(), 2, "expected files from cached + fallback subtrees, got {out:?}");
+        let paths: Vec<_> = out.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"cached/foo.h"), "missing cached file in {paths:?}");
+        assert!(paths.contains(&"uncached/bar.h"), "missing fallback file in {paths:?}");
+    }
+
+    /// Walking with a fallback that also returns None must behave exactly
+    /// like the primary-only walk (no panic, just skip).
+    #[test]
+    fn walk_with_fallback_no_fallback_data_skips_subdir() {
+        let root = mk_digest(1, 10);
+        let uncached_sub = mk_digest(9, 99);
+
+        let mut primary: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        primary.insert(
+            format!("{}-{}", hex_of(&root), root.size_bytes()),
+            vec![DirEntry::Dir {
+                name: "uncached".to_string(),
+                digest_hex: hex_of(&uncached_sub),
+                size: uncached_sub.size_bytes() as i64,
+            }],
+        );
+
+        let out = walk_tree_with_fallback(
+            &root,
+            |d| {
+                primary
+                    .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                    .cloned()
+            },
+            |_| None, // fallback also empty
+        );
+
+        assert!(out.is_empty(), "no fallback data → empty walk");
     }
 
     #[test]
