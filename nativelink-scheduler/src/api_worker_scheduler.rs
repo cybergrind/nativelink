@@ -590,7 +590,19 @@ impl ApiWorkerScheduler {
         if let (Some(resolver), Some(journaler)) =
             (&self.dir_index_resolver, &self.dispatch_journaler)
         {
-            let machine_id = worker_id.to_string();
+            // WorkerId is formatted as `{prefix}{uuid_v6_hyphenated}` on
+            // registration (see worker_api_server.rs). The prefix comes
+            // from the worker's `config.name`, and is the value the
+            // operator sets to identify the machine (e.g. its IP).
+            // We strip the 36-char hyphenated UUID suffix to get back
+            // the prefix, which must match the worker's `machine_id`
+            // config field so the Redis keys align on both sides.
+            let worker_id_str = worker_id.to_string();
+            let machine_id = if worker_id_str.len() > 36 {
+                worker_id_str[..worker_id_str.len() - 36].to_string()
+            } else {
+                worker_id_str.clone()
+            };
             let resolver = resolver.clone();
             let journaler = journaler.clone();
             let root_digest = action_info.inner.input_root_digest;
