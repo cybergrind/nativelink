@@ -119,6 +119,21 @@ where
     })
 }
 
+/// SHA-256 of the empty byte string — the canonical REAPI digest used for
+/// empty Directory protobufs (a Directory with no files, no subdirs, no
+/// symlinks). The hook never indexes this digest because the corresponding
+/// Directory has no children to journal, so any walk that probes Redis or
+/// the live-CAS fallback for it gets a miss and erroneously logs
+/// "subtree dropped". Short-circuit it as a known-empty subtree instead.
+const EMPTY_BLOB_HASH: [u8; 32] = [
+    0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+    0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+];
+
+fn is_empty_directory_digest(digest: &DigestInfo) -> bool {
+    digest.size_bytes() == 0 && digest.packed_hash().as_ref() == EMPTY_BLOB_HASH
+}
+
 pub fn walk_tree<F>(root_digest: &DigestInfo, mut lookup: F) -> Vec<(String, DigestInfo)>
 where
     F: FnMut(&DigestInfo) -> Option<Vec<DirEntry>>,
@@ -128,6 +143,9 @@ where
     stack.push_back((String::new(), *root_digest));
 
     while let Some((prefix, dir_digest)) = stack.pop_front() {
+        if is_empty_directory_digest(&dir_digest) {
+            continue;
+        }
         let Some(children) = lookup(&dir_digest) else {
             continue;
         };
@@ -669,6 +687,76 @@ mod tests {
         let paths: Vec<_> = out.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"cached/foo.h"), "missing cached file in {paths:?}");
         assert!(paths.contains(&"uncached/bar.h"), "missing fallback file in {paths:?}");
+    }
+
+    /// Bug G: the canonical empty-Directory digest (sha256 of empty bytes,
+    /// size 0) is the well-known REAPI placeholder for "directory with no
+    /// entries". The walker must short-circuit this digest as a known-empty
+    /// subtree rather than probing Redis (miss) → fallback (miss) → emitting
+    /// `BOTH primary and fallback missed — subtree dropped` warnings. In
+    /// production we observed 126 such warns in 3 minutes, all for this
+    /// one digest, causing real subtrees to be elided alongside the empty
+    /// ones (workers never received `module.pcm` etc. via pending_outputs).
+    #[test]
+    fn walk_short_circuits_empty_directory_digest() {
+        let empty_hash: [u8; 32] = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
+        let empty_digest = DigestInfo::new(empty_hash, 0);
+        let root = mk_digest(1, 10);
+        let cached_sub = mk_digest(2, 20);
+        let file = mk_digest(3, 50);
+
+        let mut primary: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        primary.insert(
+            format!("{}-{}", hex_of(&root), root.size_bytes()),
+            vec![
+                DirEntry::Dir {
+                    name: "cached".to_string(),
+                    digest_hex: hex_of(&cached_sub),
+                    size: cached_sub.size_bytes() as i64,
+                },
+                DirEntry::Dir {
+                    name: "empty".to_string(),
+                    digest_hex: hex_of(&empty_digest),
+                    size: 0,
+                },
+            ],
+        );
+        primary.insert(
+            format!("{}-{}", hex_of(&cached_sub), cached_sub.size_bytes()),
+            vec![DirEntry::File {
+                name: "foo.h".to_string(),
+                digest_hex: hex_of(&file),
+                size: file.size_bytes() as i64,
+            }],
+        );
+
+        let mut fallback_called_for_empty = false;
+        let out = walk_tree_with_fallback(
+            &root,
+            |d| {
+                primary
+                    .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                    .cloned()
+            },
+            |d| {
+                if d == &empty_digest {
+                    fallback_called_for_empty = true;
+                }
+                None
+            },
+        );
+
+        assert!(
+            !fallback_called_for_empty,
+            "fallback must NOT be probed for the canonical empty-directory digest"
+        );
+        let paths: Vec<_> = out.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(out.len(), 1, "expected only cached/foo.h, got {paths:?}");
+        assert!(paths.contains(&"cached/foo.h"), "missing {paths:?}");
     }
 
     /// Walking with a fallback that also returns None must behave exactly
