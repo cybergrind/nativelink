@@ -66,6 +66,7 @@ mod tests {
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
+        prepare_action_inputs,
     };
     use nativelink_worker::path_digest_cache::PathDigestCache;
     use pretty_assertions::assert_eq;
@@ -618,6 +619,123 @@ mod tests {
             FILE2_CONTENT,
             "EEXIST on file1 must not prevent file2 from being downloaded"
         );
+
+        Ok(())
+    }
+
+    /// Test: when `skip_input_tree_walk` is true, `prepare_action_inputs` must
+    /// NOT walk the input tree or create any files. This is the fast path for
+    /// shared-tree (InputRootAbsolutePath) mode where the tree is pre-staged
+    /// via rsync + cross-machine output sync, so walking is unnecessary.
+    #[nativelink_test]
+    async fn prepare_action_inputs_skips_walk_when_flagged(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "should_not_be_created.txt";
+        const FILE_CONTENT: &str = "if this appears, the walk ran";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        // Put a file in CAS that WOULD be created if the walk ran.
+        let file_digest = DigestInfo::new([77u8; 32], 32);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, FILE_CONTENT.into())
+            .await?;
+
+        let root_digest = DigestInfo::new([78u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        let work_dir = make_temp_path("skip_walk_test");
+        fs::create_dir_all(&work_dir)
+            .await
+            .err_tip(|| "create work_dir")?;
+
+        // Call prepare_action_inputs with skip_input_tree_walk=true.
+        prepare_action_inputs(
+            &None, // no directory cache
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &work_dir,
+            None, // no hint_root
+            &PathDigestCache::new(),
+            true, // skip_input_tree_walk
+        )
+        .await?;
+
+        // The file must NOT exist — the walk was skipped.
+        let file_path = format!("{work_dir}/{FILE_NAME}");
+        assert!(
+            tokio::fs::metadata(&file_path).await.is_err(),
+            "File must not be created when skip_input_tree_walk=true"
+        );
+
+        Ok(())
+    }
+
+    /// Test: when `skip_input_tree_walk` is false, `prepare_action_inputs`
+    /// walks the input tree as before.
+    #[nativelink_test]
+    async fn prepare_action_inputs_walks_when_not_flagged(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "should_be_created.txt";
+        const FILE_CONTENT: &str = "walk ran as expected";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        let file_digest = DigestInfo::new([79u8; 32], 20);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, FILE_CONTENT.into())
+            .await?;
+
+        let root_digest = DigestInfo::new([80u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        let work_dir = make_temp_path("walk_test");
+        fs::create_dir_all(&work_dir)
+            .await
+            .err_tip(|| "create work_dir")?;
+
+        prepare_action_inputs(
+            &None,
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &work_dir,
+            None,
+            &PathDigestCache::new(),
+            false, // walk as usual
+        )
+        .await?;
+
+        let file_path = format!("{work_dir}/{FILE_NAME}");
+        let content = fs::read(&file_path).await?;
+        assert_eq!(from_utf8(&content)?, FILE_CONTENT);
 
         Ok(())
     }

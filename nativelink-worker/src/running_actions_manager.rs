@@ -365,7 +365,23 @@ pub async fn prepare_action_inputs(
     work_directory: &str,
     hint_root: Option<PathBuf>,
     path_digest_cache: &crate::path_digest_cache::PathDigestCache,
+    skip_input_tree_walk: bool,
 ) -> Result<(), Error> {
+    // Shared-tree fast path: when the caller guarantees the work_directory
+    // is pre-populated (rsync + cross-machine output sync), skip the input
+    // tree walk entirely. download_to_directory is expensive — 2000+
+    // Directory protobuf fetches + 30k file checks per action. The caller
+    // is responsible for ensuring disk state is consistent before setting
+    // this flag.
+    if skip_input_tree_walk {
+        trace!(
+            ?digest,
+            work_directory,
+            "prepare_action_inputs: skipping input tree walk (shared-tree fast path)"
+        );
+        return Ok(());
+    }
+
     // Try cache first if available
     if let Some(cache) = directory_cache {
         match cache
@@ -987,6 +1003,12 @@ impl RunningActionImpl {
                     .get("InputRootAbsolutePath")
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from);
+                // Shared-tree fast path: when InputRootAbsolutePath is set, the
+                // worker's work_directory IS the pre-staged source tree. It is
+                // kept in sync by rsync (at build start) + cross-machine output
+                // sync via Redis pending_outputs (during the build). Skip the
+                // expensive input tree walk entirely.
+                let skip_input_tree_walk = hint_root.is_some();
                 self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -997,6 +1019,7 @@ impl RunningActionImpl {
                         &self.work_directory,
                         hint_root,
                         &self.running_actions_manager.path_digest_cache,
+                        skip_input_tree_walk,
                     ))
                     .await
             })
