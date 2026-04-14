@@ -16,9 +16,14 @@ use nativelink_proto::build::bazel::remote::execution::v2::Directory as ProtoDir
 use prost::Message;
 
 /// Maximum blob size we will attempt to decode as a Directory protobuf.
-/// Directory protos are typically small (a few KB). Decoding huge blobs as
-/// protos wastes CPU for no benefit.
-pub const MAX_DIR_DECODE_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
+/// Most Directory protos are small (a few KB), but Chromium-scale builds
+/// can produce Directories with thousands of file entries that exceed
+/// 1 MiB. Bug F (cas_journal_failure_report_05) traced a missing-file
+/// failure to a Directory proto that wasn't indexed because it exceeded
+/// the previous 1 MiB cap. 32 MiB is generous headroom; non-Directory
+/// blobs above that size (compiled binaries, etc.) skip decoding cheaply
+/// since the proto parser fails fast on non-proto bytes.
+pub const MAX_DIR_DECODE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// A single child entry in a Directory protobuf, flattened for indexing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +384,50 @@ mod tests {
     fn decode_oversized_blob_returns_none() {
         let blob = vec![0u8; MAX_DIR_DECODE_BYTES + 1];
         assert!(try_decode_directory(&blob).is_none());
+    }
+
+    /// Bug F regression (cas_journal_failure_report_05): the limit must be
+    /// large enough to handle real-world Chromium Directory protos. A
+    /// Directory listing thousands of files in deep subdirectories can
+    /// exceed 1 MiB. Lock the limit at >= 16 MiB so we don't silently
+    /// drop indexing for large directories.
+    #[test]
+    fn max_dir_decode_bytes_is_at_least_16_mib() {
+        assert!(
+            MAX_DIR_DECODE_BYTES >= 16 * 1024 * 1024,
+            "MAX_DIR_DECODE_BYTES={} must be >= 16 MiB to handle Chromium-scale Directory protos",
+            MAX_DIR_DECODE_BYTES
+        );
+    }
+
+    /// Decoding a Directory proto in the 1-2 MiB range must succeed.
+    /// (Constructed by stuffing many file entries to force a large proto.)
+    #[test]
+    fn decode_directory_above_one_mib() {
+        // Build a Directory with enough file entries to exceed 1 MiB.
+        // Each FileNode at the bytes level: name (string) + digest (struct
+        // with hash string + size). Use ~96-byte names to amplify.
+        let long_name: String = "a".repeat(96);
+        let files: Vec<FileNode> = (0..20_000)
+            .map(|i| FileNode {
+                name: format!("{long_name}_{i}"),
+                digest: Some(digest("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 100)),
+                is_executable: false,
+                node_properties: None,
+            })
+            .collect();
+        let dir = ProtoDirectory {
+            files,
+            ..Default::default()
+        };
+        let blob = dir.encode_to_vec();
+        assert!(
+            blob.len() > 1 * 1024 * 1024,
+            "test setup: expected >1 MiB, got {} bytes",
+            blob.len()
+        );
+        let children = try_decode_directory(&blob).expect("should decode large Directory");
+        assert_eq!(children.len(), 20_000);
     }
 
     #[test]
