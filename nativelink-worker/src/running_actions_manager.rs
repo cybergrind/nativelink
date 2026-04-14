@@ -433,6 +433,69 @@ fn is_executable(metadata: &std::fs::Metadata, _full_path: &impl AsRef<Path>) ->
 
 type DigestUploader = Arc<tokio::sync::OnceCell<()>>;
 
+/// Walk a Tree protobuf (returned by `upload_directory` for action output
+/// directories) and produce `(full_path, DigestInfo)` pairs for every file
+/// in the subtree, including transitively-nested subdirectories. Symlinks
+/// are not emitted.
+///
+/// `base_path` is prepended to each emitted path. Caller typically passes
+/// the output directory's path relative to the work_directory so the
+/// resulting paths can be journaled into `pending_outputs` for other
+/// workers to materialize.
+pub fn walk_output_tree_for_paths(
+    tree: &ProtoTree,
+    base_path: &str,
+) -> Vec<(String, DigestInfo)> {
+    use std::collections::HashMap;
+    let Some(root) = &tree.root else {
+        return Vec::new();
+    };
+
+    // Build a digest -> Directory map for the children so we can walk
+    // DirectoryNode references without re-scanning the children list.
+    let mut by_digest: HashMap<DigestInfo, &ProtoDirectory> = HashMap::new();
+    for child in &tree.children {
+        let bytes = child.encode_to_vec();
+        let digest = compute_buf_digest(&bytes, &mut DigestHasherFunc::Sha256.hasher());
+        by_digest.insert(digest, child);
+    }
+
+    let mut out = Vec::new();
+    let mut stack: VecDeque<(String, &ProtoDirectory)> = VecDeque::new();
+    stack.push_back((base_path.to_string(), root));
+
+    while let Some((prefix, dir)) = stack.pop_front() {
+        for f in &dir.files {
+            let Some(d) = &f.digest else { continue };
+            let Ok(digest_info) = DigestInfo::try_from(d.clone()) else {
+                continue;
+            };
+            let full_path = if prefix.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{prefix}/{}", f.name)
+            };
+            out.push((full_path, digest_info));
+        }
+        for d in &dir.directories {
+            let Some(dig) = &d.digest else { continue };
+            let Ok(digest_info) = DigestInfo::try_from(dig.clone()) else {
+                continue;
+            };
+            let Some(child) = by_digest.get(&digest_info) else {
+                continue;
+            };
+            let new_prefix = if prefix.is_empty() {
+                d.name.clone()
+            } else {
+                format!("{prefix}/{}", d.name)
+            };
+            stack.push_back((new_prefix, child));
+        }
+    }
+    out
+}
+
 /// Drain `nativelink:pending_outputs:{machine_id}` from Redis, fetch each
 /// entry's blob from CAS, hardlink it into the shared tree at
 /// `work_directory`, and record success in `worker_state:{machine_id}` so
@@ -1638,10 +1701,12 @@ impl RunningActionImpl {
         output_file_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
         output_directory_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
 
-        // Post-action output sync: record all output files in Redis so that
-        // other machines can fetch them before their next action.
+        // Post-action output sync: record EVERY file the action produced
+        // in Redis so that other machines can fetch them before their
+        // next action. Covers both top-level output_files AND files
+        // inside output_directories (whose Tree proto we fetch from CAS).
         {
-            let outputs: Vec<(String, DigestInfo)> = output_files
+            let mut outputs: Vec<(String, DigestInfo)> = output_files
                 .iter()
                 .map(|f| {
                     let path = match &f.name_or_path {
@@ -1650,6 +1715,36 @@ impl RunningActionImpl {
                     (path, f.digest)
                 })
                 .collect();
+
+            // For each output directory, fetch its Tree from CAS and walk
+            // it to enumerate every file inside. Best-effort: errors are
+            // logged and that directory's contents are skipped.
+            let cas_store = self.running_actions_manager.cas_store.as_ref();
+            for dir_info in &output_folders {
+                match get_and_decode_digest::<ProtoTree>(cas_store, dir_info.tree_digest.into())
+                    .await
+                {
+                    Ok(tree) => {
+                        let inner_files = walk_output_tree_for_paths(&tree, &dir_info.path);
+                        outputs.extend(inner_files);
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %dir_info.path,
+                            ?e,
+                            "post-action: failed to fetch Tree for output_directory; \
+                             files inside will not be journaled"
+                        );
+                    }
+                }
+            }
+
+            info!(
+                output_files_count = output_files.len(),
+                output_folders_count = output_folders.len(),
+                journal_entries = outputs.len(),
+                "post-action: journaling outputs"
+            );
             self.running_actions_manager
                 .path_digest_cache
                 .record_outputs(&outputs);

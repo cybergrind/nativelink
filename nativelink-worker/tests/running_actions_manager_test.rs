@@ -740,6 +740,64 @@ mod tests {
         Ok(())
     }
 
+    /// Slice 4 RED/GREEN: walk a Tree proto and produce (path, digest) for
+    /// every file inside, including nested subdirectories. Captures the
+    /// gap where output_directories' contents were never journaled.
+    #[test]
+    fn walk_output_tree_collects_files_recursively() {
+        use nativelink_store::ac_utils::compute_buf_digest;
+        use nativelink_worker::running_actions_manager::walk_output_tree_for_paths;
+
+        let inner_file_digest = DigestInfo::new([10u8; 32], 100);
+        let inner_dir = Directory {
+            files: vec![FileNode {
+                name: "deep.h".to_string(),
+                digest: Some(inner_file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        // Compute inner_dir's digest so we can reference it from the root.
+        let inner_dir_bytes = inner_dir.encode_to_vec();
+        let inner_dir_digest =
+            compute_buf_digest(&inner_dir_bytes, &mut DigestHasherFunc::Sha256.hasher());
+
+        let root_file_digest = DigestInfo::new([20u8; 32], 200);
+        let root = Directory {
+            files: vec![FileNode {
+                name: "top.h".to_string(),
+                digest: Some(root_file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            directories: vec![DirectoryNode {
+                name: "subdir".to_string(),
+                digest: Some(inner_dir_digest.into()),
+            }],
+            ..Default::default()
+        };
+
+        let tree = Tree {
+            root: Some(root),
+            children: vec![inner_dir],
+        };
+
+        let pairs = walk_output_tree_for_paths(&tree, "out/Mac/gen/foo");
+
+        // Expect: out/Mac/gen/foo/top.h + out/Mac/gen/foo/subdir/deep.h
+        assert_eq!(pairs.len(), 2);
+        let pairs_map: HashMap<_, _> = pairs.into_iter().collect();
+        assert_eq!(
+            pairs_map.get("out/Mac/gen/foo/top.h"),
+            Some(&root_file_digest)
+        );
+        assert_eq!(
+            pairs_map.get("out/Mac/gen/foo/subdir/deep.h"),
+            Some(&inner_file_digest)
+        );
+    }
+
     /// Slice 3: RunningActionsManagerArgs must carry a `shared_tree_path`
     /// option so the worker can spawn a background drain task for it.
     /// Compile-only: the field access alone proves the struct carries it.
