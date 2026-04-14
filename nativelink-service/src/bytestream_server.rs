@@ -254,6 +254,9 @@ pub struct InstanceInfo {
     metrics: Arc<ByteStreamMetrics>,
     /// Handle to the global sweeper task. Kept alive for the lifetime of the instance.
     _sweeper_handle: Arc<JoinHandleDropGuard<()>>,
+    /// Optional Directory-index writer. When present, every CAS upload
+    /// is probed as a Directory protobuf and recorded in Redis.
+    dir_index_writer: Option<Arc<crate::dir_index::DirIndexWriter>>,
 }
 
 impl Debug for InstanceInfo {
@@ -460,6 +463,22 @@ impl ByteStreamServer {
             }
         });
 
+        let dir_index_writer = match config.dir_index_redis_url.as_deref() {
+            Some(url) if !url.is_empty() => {
+                match crate::dir_index::DirIndexWriter::new(url) {
+                    Ok(w) => {
+                        info!("Dir-index writer enabled for {url}");
+                        Some(Arc::new(w))
+                    }
+                    Err(e) => {
+                        warn!("Failed to create dir-index writer for {url}: {e:?}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Ok(InstanceInfo {
             store,
             max_bytes_per_stream,
@@ -467,6 +486,7 @@ impl ByteStreamServer {
             idle_stream_timeout,
             metrics,
             _sweeper_handle: Arc::new(sweeper_handle),
+            dir_index_writer,
         })
     }
 
@@ -904,10 +924,19 @@ impl ByteStreamServer {
 
         // Direct update without channel overhead
         let store = instance_info.store.clone();
+        let blob = buffer.freeze();
         store
-            .update_oneshot(digest, buffer.freeze())
+            .update_oneshot(digest, blob.clone())
             .await
             .err_tip(|| "Error in update_oneshot")?;
+
+        // Dir-index hook: if this blob is a Directory protobuf, record
+        // its children in Redis so the scheduler can walk dir chains
+        // without re-decoding. Best-effort: errors are swallowed.
+        if let Some(writer) = &instance_info.dir_index_writer {
+            let digest_hex = format!("{}", digest.packed_hash());
+            writer.maybe_record_from_blob(&digest_hex, digest.size_bytes() as i64, &blob);
+        }
 
         // Note: bytes_written_total is updated in the caller (bytestream_write) based on result
 

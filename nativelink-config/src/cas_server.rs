@@ -226,6 +226,18 @@ pub struct ByteStreamConfig {
         skip_serializing_if = "is_default"
     )]
     pub persist_stream_on_disconnect_timeout: usize,
+
+    /// Optional Redis URL for the Directory index. When set, every CAS
+    /// upload is probed as a Directory protobuf; successful decodes are
+    /// stored in Redis so the scheduler can walk Directory chains without
+    /// re-fetching protos from CAS. Enables the CAS-journal flow for
+    /// shared-tree distributed builds.
+    ///
+    /// Format: `redis://host:port` or `redis://user:pass@host:port/db`
+    ///
+    /// Default: None (Directory index disabled)
+    #[serde(default)]
+    pub dir_index_redis_url: Option<String>,
 }
 
 // Older bytestream config. All fields are as per the newer docs, but this requires

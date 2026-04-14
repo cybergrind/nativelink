@@ -171,6 +171,44 @@ impl DirIndexWriter {
         }
         drop(cmd.query::<i64>(&mut conn));
     }
+
+    /// Hook to be called after every successful CAS write. Attempts to
+    /// detect if the blob is a Directory protobuf, and if so, records its
+    /// children in Redis. Safe to call on any blob — non-Directory blobs
+    /// are cheaply rejected.
+    pub fn maybe_record_from_blob(&self, digest_hex: &str, size: i64, blob: &[u8]) {
+        if let Some(children) = try_decode_directory(blob) {
+            self.record_directory(digest_hex, size, &children);
+        }
+    }
+}
+
+/// Side-effect-free result of the after-upload hook. Returned for testing
+/// so we can assert "hook would have recorded these children" without
+/// needing a live Redis. The real hook passes this through to Redis.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HookResult {
+    /// Blob was identified as a Directory proto with these children.
+    Indexed {
+        digest_hex: String,
+        size: i64,
+        children: Vec<DirChild>,
+    },
+    /// Blob is not a Directory proto; no indexing needed.
+    Skipped,
+}
+
+/// Pure hook logic — decodes the blob and reports what would be recorded.
+/// Testable without any Redis or I/O.
+pub fn after_upload_hook(digest_hex: &str, size: i64, blob: &[u8]) -> HookResult {
+    match try_decode_directory(blob) {
+        Some(children) => HookResult::Indexed {
+            digest_hex: digest_hex.to_string(),
+            size,
+            children,
+        },
+        None => HookResult::Skipped,
+    }
 }
 
 #[cfg(test)]
@@ -382,5 +420,57 @@ mod tests {
     #[test]
     fn dir_index_writer_rejects_invalid_url() {
         assert!(DirIndexWriter::new("not-a-url").is_err());
+    }
+
+    #[test]
+    fn after_upload_hook_indexes_directory_proto() {
+        let dir = ProtoDirectory {
+            files: vec![FileNode {
+                name: "cmath".to_string(),
+                digest: Some(digest("abc", 42)),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        let blob = dir.encode_to_vec();
+        let blob_digest = "rootdigest";
+        let blob_size = blob.len() as i64;
+
+        let result = after_upload_hook(blob_digest, blob_size, &blob);
+        match result {
+            HookResult::Indexed {
+                digest_hex,
+                size,
+                children,
+            } => {
+                assert_eq!(digest_hex, "rootdigest");
+                assert_eq!(size, blob_size);
+                assert_eq!(children.len(), 1);
+                assert_eq!(children[0].name(), "cmath");
+            }
+            HookResult::Skipped => panic!("expected Indexed, got Skipped"),
+        }
+    }
+
+    #[test]
+    fn after_upload_hook_skips_non_directory_blob() {
+        // Random bytes that are not a valid non-empty Directory proto.
+        let blob = b"this is just a file content, not a Directory proto";
+        let result = after_upload_hook("somedigest", blob.len() as i64, blob);
+        assert_eq!(result, HookResult::Skipped);
+    }
+
+    #[test]
+    fn after_upload_hook_skips_empty_blob() {
+        let result = after_upload_hook("somedigest", 0, &[]);
+        assert_eq!(result, HookResult::Skipped);
+    }
+
+    #[test]
+    fn after_upload_hook_skips_large_blob() {
+        let blob = vec![0u8; MAX_DIR_DECODE_BYTES + 1];
+        let result = after_upload_hook("somedigest", blob.len() as i64, &blob);
+        assert_eq!(result, HookResult::Skipped);
     }
 }

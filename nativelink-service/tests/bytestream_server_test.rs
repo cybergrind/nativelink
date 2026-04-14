@@ -80,6 +80,7 @@ fn make_bytestream_server(
                 cas_store: "main_cas".to_string(),
                 persist_stream_on_disconnect_timeout: 0,
                 max_bytes_per_stream: 1024,
+                dir_index_redis_url: None,
             },
         }]
     });
