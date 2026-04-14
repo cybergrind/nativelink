@@ -257,12 +257,13 @@ impl RedisOutputSync {
 
     /// Record outputs produced by this machine. Pushes entries to
     /// `nativelink:pending_outputs:{target}` for every OTHER registered machine.
+    /// Each target's push gets a fresh seqnum from `next_seqnum:{target}`
+    /// so the drain + pre-action barrier can reason about per-target ordering.
     pub fn record_outputs(&self, outputs: &[(String, DigestInfo)]) {
         if outputs.is_empty() {
             return;
         }
         drop(self.pool.with_conn(|conn| {
-            // Discover other machines.
             let other_machines: Vec<String> = redis::cmd("SMEMBERS")
                 .arg("nativelink:machines")
                 .query(conn)
@@ -271,12 +272,18 @@ impl RedisOutputSync {
                 if target == &self.machine_id {
                     continue;
                 }
+                // Allocate a monotonic batch seqnum for this target.
+                let seqnum_key = format!("nativelink:next_seqnum:{target}");
+                let seqnum: i64 = match redis::cmd("INCR").arg(&seqnum_key).query(conn) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
                 let key = format!("nativelink:pending_outputs:{target}");
                 let mut cmd = redis::cmd("RPUSH");
                 cmd.arg(&key);
                 for (path, digest) in outputs {
                     let member = format!(
-                        "{}|{}-{}",
+                        "{}|{}-{}|{seqnum}",
                         path,
                         digest.packed_hash(),
                         digest.size_bytes()
@@ -300,14 +307,46 @@ impl RedisOutputSync {
         }
         Some(arr)
     }
+}
+
+/// Parse a `pending_outputs` list entry into `(path, digest, seqnum)`.
+/// The canonical format is `"<relative_path>|<hex_hash>-<size>|<seqnum>"`.
+/// Legacy 2-field entries are rejected (returns `None`) so the drain
+/// never treats them as seqnum=0 — that would let the pre-action barrier
+/// race ahead of a batch that hasn't actually been materialized.
+pub fn parse_pending_entry(raw: &str) -> Option<(String, DigestInfo, i64)> {
+    // Split into exactly 3 fields: path, digest, seqnum.
+    let mut parts = raw.splitn(3, '|');
+    let path = parts.next()?;
+    let digest_str = parts.next()?;
+    let seqnum_str = parts.next()?;
+    if parts.next().is_some() {
+        // More than 3 fields — reject.
+        return None;
+    }
+    if path.is_empty() {
+        return None;
+    }
+    let (hash_hex, size_str) = digest_str.rsplit_once('-')?;
+    let size: u64 = size_str.parse().ok()?;
+    let hash_arr = RedisOutputSync::hex_to_32(hash_hex)?;
+    let seqnum: i64 = seqnum_str.parse().ok()?;
+    Some((path.to_string(), DigestInfo::new(hash_arr, size), seqnum))
+}
+
+impl RedisOutputSync {
 
     /// Drain pending outputs that OTHER machines produced for THIS machine.
-    /// Returns `(relative_path, DigestInfo)` pairs that need to be fetched
-    /// from CAS and written to the local shared tree.
+    /// Returns `(entries, max_seqnum)`: the list of `(relative_path, digest)`
+    /// to materialize and the highest batch seqnum observed in the drained
+    /// entries. The caller uses `max_seqnum` to advance
+    /// `nativelink:drained_seqnum:{machine_id}` once materialization succeeds
+    /// so the pre-action barrier can compare `drained_seqnum >= required_txid`.
+    /// A zero `max_seqnum` means nothing was drained this call.
     ///
     /// Uses explicit LRANGE + DEL (not atomic pipeline) so failures at any
     /// step are observable. Logs the raw LLEN result for diagnosis.
-    pub fn drain_pending_outputs(&self) -> Vec<(String, DigestInfo)> {
+    pub fn drain_pending_outputs(&self) -> (Vec<(String, DigestInfo)>, i64) {
         let key = format!("nativelink:pending_outputs:{}", self.machine_id);
         let entries: Vec<String> = self
             .pool
@@ -339,20 +378,16 @@ impl RedisOutputSync {
             .and_then(Result::ok)
             .unwrap_or_default();
         let mut result = Vec::with_capacity(entries.len());
+        let mut max_seqnum: i64 = 0;
         for entry in entries {
-            // Format: "relative/path/to/file.o|<hex_hash>-<size>"
-            if let Some((path, digest_str)) = entry.rsplit_once('|') {
-                if let Some((hash_hex, size_str)) = digest_str.rsplit_once('-') {
-                    if let (Some(hash_arr), Ok(size)) =
-                        (Self::hex_to_32(hash_hex), size_str.parse::<u64>())
-                    {
-                        let digest = DigestInfo::new(hash_arr, size);
-                        result.push((path.to_string(), digest));
-                    }
+            if let Some((path, digest, seqnum)) = parse_pending_entry(&entry) {
+                if seqnum > max_seqnum {
+                    max_seqnum = seqnum;
                 }
+                result.push((path, digest));
             }
         }
-        result
+        (result, max_seqnum)
     }
 
     /// Format the value stored at `worker_state:{machine_id}[path]`.
@@ -376,6 +411,49 @@ impl RedisOutputSync {
                 .arg(&value)
                 .query::<i64>(conn)
         }));
+    }
+
+    /// Advance `nativelink:drained_seqnum:{machine_id}` to at least
+    /// `seqnum`. Uses a Lua CAS so concurrent drains (background vs
+    /// pre-action) can't clobber each other: the key only moves forward,
+    /// never backward. This is the cursor the scheduler's pre-action
+    /// barrier polls via `GET drained_seqnum:{B}`.
+    pub fn advance_drained_seqnum(&self, seqnum: i64) {
+        if seqnum <= 0 {
+            return;
+        }
+        let key = format!("nativelink:drained_seqnum:{}", self.machine_id);
+        // Lua script: only SET if new value > existing (or existing is missing).
+        const SCRIPT: &str = r"
+            local cur = redis.call('GET', KEYS[1])
+            if not cur or tonumber(cur) < tonumber(ARGV[1]) then
+                redis.call('SET', KEYS[1], ARGV[1])
+                return tonumber(ARGV[1])
+            else
+                return tonumber(cur)
+            end
+        ";
+        drop(self.pool.with_conn(|conn| {
+            redis::cmd("EVAL")
+                .arg(SCRIPT)
+                .arg(1)
+                .arg(&key)
+                .arg(seqnum)
+                .query::<i64>(conn)
+        }));
+    }
+
+    /// Read the current `drained_seqnum:{machine_id}` (or 0 if unset).
+    /// Used by the scheduler's pre-action barrier.
+    pub fn get_drained_seqnum(&self) -> i64 {
+        let key = format!("nativelink:drained_seqnum:{}", self.machine_id);
+        self.pool
+            .with_conn(|conn| -> Result<i64, redis::RedisError> {
+                let v: Option<i64> = redis::cmd("GET").arg(&key).query(conn)?;
+                Ok(v.unwrap_or(0))
+            })
+            .and_then(Result::ok)
+            .unwrap_or(0)
     }
 
     /// Batch variant — writes multiple (path, digest) pairs in a single HSET.
@@ -464,14 +542,17 @@ impl PathDigestCache {
         }
     }
 
-    /// Drain pending output files from other machines. The caller must
-    /// fetch each returned (relative_path, digest) from CAS and write
-    /// to the local shared tree.
-    pub fn drain_pending_outputs(&self) -> Vec<(String, DigestInfo)> {
+    /// Drain pending output files from other machines. Returns
+    /// `(entries, max_seqnum)` — the caller must materialize each entry
+    /// and then advance `drained_seqnum:{machine_id}` to `max_seqnum` so
+    /// the pre-action barrier can unblock. A `max_seqnum` of 0 means
+    /// nothing was drained (either no Redis output_sync configured or the
+    /// list was empty).
+    pub fn drain_pending_outputs(&self) -> (Vec<(String, DigestInfo)>, i64) {
         if let Some(ref sync) = self.output_sync {
             sync.drain_pending_outputs()
         } else {
-            vec![]
+            (vec![], 0)
         }
     }
 
@@ -492,6 +573,23 @@ impl PathDigestCache {
         }
     }
 
+    /// Advance the per-machine drained seqnum cursor. Silent no-op when no
+    /// Redis output_sync is configured.
+    pub fn advance_drained_seqnum(&self, seqnum: i64) {
+        if let Some(ref sync) = self.output_sync {
+            sync.advance_drained_seqnum(seqnum);
+        }
+    }
+
+    /// Read the per-machine drained seqnum cursor (0 when unset or no
+    /// Redis output_sync configured).
+    #[must_use]
+    pub fn get_drained_seqnum(&self) -> i64 {
+        self.output_sync
+            .as_ref()
+            .map_or(0, RedisOutputSync::get_drained_seqnum)
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.lock().len()
@@ -507,6 +605,43 @@ impl Default for PathDigestCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slice B RED: the pending_outputs entries now carry a seqnum in the
+    /// third pipe-separated field. The parser must extract all three
+    /// fields (path, digest, seqnum) and reject malformed entries.
+    #[test]
+    fn parse_pending_entry_returns_seqnum() {
+        let hash_hex = "aabb".repeat(16); // 64 hex chars
+        let raw = format!("some/path/foo.o|{hash_hex}-42|7");
+        let parsed = parse_pending_entry(&raw).expect("valid entry must parse");
+        assert_eq!(parsed.0, "some/path/foo.o");
+        assert_eq!(parsed.1.size_bytes(), 42);
+        assert_eq!(parsed.2, 7);
+    }
+
+    #[test]
+    fn parse_pending_entry_rejects_two_field_legacy_format() {
+        let hash_hex = "aabb".repeat(16);
+        let raw = format!("some/path/foo.o|{hash_hex}-42");
+        assert!(
+            parse_pending_entry(&raw).is_none(),
+            "legacy 2-field entries must be rejected so a drain never silently \
+             treats them as seqnum=0 (which would let the pre-action barrier \
+             think 'everything up to 0 is materialized' and race ahead)"
+        );
+    }
+
+    #[test]
+    fn parse_pending_entry_rejects_malformed() {
+        assert!(parse_pending_entry("").is_none());
+        assert!(parse_pending_entry("no pipes").is_none());
+        assert!(parse_pending_entry("a|b").is_none());
+        // Non-numeric seqnum.
+        let hash_hex = "aabb".repeat(16);
+        assert!(parse_pending_entry(&format!("p|{hash_hex}-10|notnum")).is_none());
+        // Non-numeric size.
+        assert!(parse_pending_entry(&format!("p|{hash_hex}-x|1")).is_none());
+    }
 
     #[test]
     fn test_new_cache_is_empty() {
@@ -635,7 +770,9 @@ mod tests {
     #[test]
     fn test_drain_pending_outputs_empty_without_sync() {
         let cache = PathDigestCache::new();
-        assert!(cache.drain_pending_outputs().is_empty());
+        let (entries, max_seqnum) = cache.drain_pending_outputs();
+        assert!(entries.is_empty());
+        assert_eq!(max_seqnum, 0);
     }
 
     #[test]

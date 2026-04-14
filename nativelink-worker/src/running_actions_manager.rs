@@ -562,10 +562,10 @@ pub async fn drain_and_materialize_pending_outputs(
     work_directory: &str,
     reason: &'static str,
 ) {
-    let pending = path_digest_cache.drain_pending_outputs();
+    let (pending, max_seqnum) = path_digest_cache.drain_pending_outputs();
     info!(
         pending_count = pending.len(),
-        work_directory, reason, "drain: pending_outputs snapshot"
+        max_seqnum, work_directory, reason, "drain: pending_outputs snapshot"
     );
     if pending.is_empty() {
         return;
@@ -578,20 +578,21 @@ pub async fn drain_and_materialize_pending_outputs(
     // it, even though tokio spawns each action as a task, every task ends
     // up serializing on the slow store's per-call latency inside its own
     // drain loop.
+    let pending_len = pending.len();
     let mut futures: FuturesUnordered<_> = pending
-        .iter()
+        .into_iter()
         .map(|(relative_path, digest)| {
             materialize_pending_entry(
                 cas_store,
                 fs_store,
                 work_directory.to_string(),
-                relative_path.clone(),
-                *digest,
+                relative_path,
+                digest,
             )
         })
         .collect();
 
-    let mut materialized: Vec<(String, DigestInfo)> = Vec::with_capacity(pending.len());
+    let mut materialized: Vec<(String, DigestInfo)> = Vec::with_capacity(pending_len);
     while let Some(opt) = futures.next().await {
         if let Some(entry) = opt {
             materialized.push(entry);
@@ -599,9 +600,16 @@ pub async fn drain_and_materialize_pending_outputs(
     }
 
     path_digest_cache.update_worker_state_bulk(&materialized);
+    // Advance the drained cursor iff every entry materialized. A partial
+    // materialization must NOT advance the cursor — otherwise the pre-action
+    // barrier would unblock for a txid whose files aren't all on disk.
+    if materialized.len() == pending_len && max_seqnum > 0 {
+        path_digest_cache.advance_drained_seqnum(max_seqnum);
+    }
     info!(
-        count = pending.len(),
+        count = pending_len,
         materialized = materialized.len(),
+        max_seqnum,
         reason,
         "synced pending outputs"
     );
