@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
+use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt, future};
 use nativelink_config::schedulers::SimpleSpec;
 use nativelink_error::{Code, Error, ResultExt};
@@ -320,17 +321,47 @@ impl SimpleScheduler {
             );
         }
 
-        while let Some(action_state_result) = stream.next().await {
-            result = result.merge(
-                match_action_to_worker(
-                    action_state_result.as_ref(),
-                    self.worker_scheduler.as_ref(),
-                    self.matching_engine_state_manager.as_ref(),
-                    self.platform_property_manager.as_ref(),
-                    full_worker_logging,
-                )
-                .await,
-            );
+        // Dispatch matched actions CONCURRENTLY rather than serially. Each
+        // dispatch runs the dir_index walk + Redis publish hook (~500ms),
+        // which previously serialized the whole queue at ~2 dispatches/sec.
+        // With concurrent dispatch (cap 32 in-flight), the scheduler can
+        // saturate worker `max_inflight_tasks` slots quickly enough for
+        // multiple clangs per worker. The inner WorkerScheduler mutex still
+        // serializes the worker-selection step, preventing double-dispatch.
+        const MAX_CONCURRENT_DISPATCH: usize = 32;
+        let workers = self.worker_scheduler.as_ref();
+        let mes = self.matching_engine_state_manager.as_ref();
+        let ppm = self.platform_property_manager.as_ref();
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut stream_done = false;
+        loop {
+            // Top up the in-flight set from the queue.
+            while !stream_done && in_flight.len() < MAX_CONCURRENT_DISPATCH {
+                match stream.next().await {
+                    Some(action_state_result) => {
+                        in_flight.push(async move {
+                            match_action_to_worker(
+                                action_state_result.as_ref(),
+                                workers,
+                                mes,
+                                ppm,
+                                full_worker_logging,
+                            )
+                            .await
+                        });
+                    }
+                    None => {
+                        stream_done = true;
+                        break;
+                    }
+                }
+            }
+            // Drain a completion if any are queued; exit when both queue
+            // and in-flight are empty.
+            match in_flight.next().await {
+                Some(r) => result = result.merge(r),
+                None => break,
+            }
         }
 
         let total_elapsed = start.elapsed();
