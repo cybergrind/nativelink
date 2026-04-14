@@ -66,7 +66,7 @@ mod tests {
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
-        drain_and_materialize_pending_outputs, prepare_action_inputs,
+        drain_and_materialize_pending_outputs, materialize_pending_entry, prepare_action_inputs,
     };
     use nativelink_worker::path_digest_cache::PathDigestCache;
     use pretty_assertions::assert_eq;
@@ -812,6 +812,60 @@ mod tests {
         // Force the function to be monomorphized/referenced.
         let _ = _assert_field_exists
             as for<'a> fn(&'a RunningActionsManagerArgs<'_>) -> &'a Option<String>;
+    }
+
+    /// Bug H (from cas_journal_failure_report_10.md): when the drain finds a
+    /// dest path already on disk, it must not blindly certify it as
+    /// materialized. An rsync baseline file at the same path with older
+    /// content has the wrong size → drain must refetch from CAS so the
+    /// on-disk content actually matches the digest we'll publish to
+    /// `worker_state`. Otherwise future actions see the scheduler skip
+    /// pushing this file (HMGET hit on worker_state) and clang reads stale
+    /// bytes or errors on a sibling header the drain silently didn't heal.
+    #[nativelink_test]
+    async fn materialize_pending_entry_replaces_stale_sized_dest(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let work_dir = make_temp_path("materialize_stale_dest");
+        fs::create_dir_all(&work_dir).await?;
+
+        // Seed CAS with the NEW content (what the drain should put on disk).
+        let new_content = Bytes::from_static(b"NEW_GENERATED_CONTENT_EXACTLY_32B");
+        let new_len = new_content.len() as u64;
+        let new_digest = DigestInfo::new([9u8; 32], new_len);
+        cas_store
+            .update_oneshot(new_digest, new_content.clone())
+            .await?;
+
+        // Pre-stage dest with OLD content (rsync baseline), different size.
+        let relative_path = "gen/foo.h";
+        let dest_abs = format!("{work_dir}/{relative_path}");
+        fs::create_dir_all(format!("{work_dir}/gen")).await?;
+        tokio::fs::write(&dest_abs, b"OLD_STALE_CONTENT").await?;
+        let old_size = tokio::fs::metadata(&dest_abs).await?.len();
+        assert_ne!(old_size, new_len, "precondition: sizes must differ");
+
+        let result = materialize_pending_entry(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            work_dir.clone(),
+            relative_path.to_string(),
+            new_digest,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Some((relative_path.to_string(), new_digest)),
+            "materialize must report success for a size-mismatch refetch"
+        );
+        let on_disk = tokio::fs::read(&dest_abs).await?;
+        assert_eq!(
+            on_disk,
+            new_content.as_ref(),
+            "dest must contain NEW content after refetch, not stale bytes"
+        );
+        Ok(())
     }
 
     /// Slice 1 RED/GREEN: the extracted drain helper must be a silent no-op

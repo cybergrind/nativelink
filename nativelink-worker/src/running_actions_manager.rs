@@ -496,6 +496,52 @@ pub fn walk_output_tree_for_paths(
     out
 }
 
+/// Materialize a single pending-output entry into the shared tree.
+/// Returns `Some((relative_path, digest))` on success (file is now on disk
+/// matching `digest`), `None` if the CAS fetch or hardlink failed.
+///
+/// Fast path: if `dest` already exists with the correct size, we skip the
+/// CAS fetch — the file was either placed by a prior drain, rsync, or a
+/// sibling action. A mismatched size means the on-disk file is stale; we
+/// must remove it and refetch to avoid certifying wrong content in
+/// `worker_state`.
+pub async fn materialize_pending_entry(
+    cas_store: &FastSlowStore,
+    fs_store: Pin<&FilesystemStore>,
+    work_directory: String,
+    relative_path: String,
+    digest: DigestInfo,
+) -> Option<(String, DigestInfo)> {
+    let dest = format!("{work_directory}/{relative_path}");
+    if let Ok(meta) = tokio::fs::metadata(&dest).await {
+        if meta.len() == digest.size_bytes() {
+            return Some((relative_path, digest));
+        }
+        // Size mismatch: the on-disk file is stale (e.g. rsync baseline).
+        // Certifying it would poison `worker_state` and cause the scheduler
+        // to skip future pushes for this path. Remove and refetch.
+        drop(tokio::fs::remove_file(&dest).await);
+    }
+    if let Some(parent) = Path::new(&dest).parent() {
+        if let Some(parent_str) = parent.to_str() {
+            drop(fs::create_dir_all(parent_str).await);
+        }
+    }
+    if cas_store.populate_fast_store(digest.into()).await.is_ok() {
+        if let Ok(entry) = fs_store.get_file_entry_for_digest(&digest).await {
+            if let Ok(src) = entry
+                .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
+                .await
+            {
+                if fs::hard_link(&src, &dest).await.is_ok() {
+                    return Some((relative_path, digest));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Drain `nativelink:pending_outputs:{machine_id}` from Redis, fetch each
 /// entry's blob from CAS, hardlink it into the shared tree at
 /// `work_directory`, and record success in `worker_state:{machine_id}` so
@@ -535,33 +581,13 @@ pub async fn drain_and_materialize_pending_outputs(
     let mut futures: FuturesUnordered<_> = pending
         .iter()
         .map(|(relative_path, digest)| {
-            let work_directory = work_directory.to_string();
-            let relative_path = relative_path.clone();
-            let digest = *digest;
-            async move {
-                let dest = format!("{work_directory}/{relative_path}");
-                if tokio::fs::metadata(&dest).await.is_ok() {
-                    return Some((relative_path, digest));
-                }
-                if let Some(parent) = Path::new(&dest).parent() {
-                    if let Some(parent_str) = parent.to_str() {
-                        drop(fs::create_dir_all(parent_str).await);
-                    }
-                }
-                if cas_store.populate_fast_store(digest.into()).await.is_ok() {
-                    if let Ok(entry) = fs_store.get_file_entry_for_digest(&digest).await {
-                        if let Ok(src) = entry
-                            .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
-                            .await
-                        {
-                            if fs::hard_link(&src, &dest).await.is_ok() {
-                                return Some((relative_path, digest));
-                            }
-                        }
-                    }
-                }
-                None
-            }
+            materialize_pending_entry(
+                cas_store,
+                fs_store,
+                work_directory.to_string(),
+                relative_path.clone(),
+                *digest,
+            )
         })
         .collect();
 
