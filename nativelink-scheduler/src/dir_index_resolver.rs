@@ -468,6 +468,55 @@ impl DispatchJournaler {
         self.return_conn(conn);
         Ok((to_push.len(), seqnum))
     }
+
+    /// Read `nativelink:drained_seqnum:{machine_id}` (0 when unset). This
+    /// is the worker's monotonic cursor of batches it has fully
+    /// materialized. The pre-action barrier waits until this is >=
+    /// `required_txid` before unblocking action dispatch.
+    pub fn get_drained_seqnum(&self, machine_id: &str) -> Result<i64, redis::RedisError> {
+        let mut conn = self.take_conn()?;
+        let key = format!("nativelink:drained_seqnum:{machine_id}");
+        let res: Option<i64> = match redis::cmd("GET").arg(&key).query(&mut conn) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
+        self.return_conn(conn);
+        Ok(res.unwrap_or(0))
+    }
+}
+
+/// Pure decision function for the pre-action barrier: given a snapshot of
+/// the target worker's `drained_seqnum` cursor and the action's
+/// `required_txid`, decide whether to unblock (`Ready`), keep polling
+/// (`Wait`), or give up after the deadline (`Timeout`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierStep {
+    Ready,
+    Wait,
+    Timeout,
+}
+
+/// Inputs: current `drained_seqnum`, `required_txid`, elapsed time since
+/// barrier started, and the barrier's max wait. Kept pure so the
+/// scheduler's polling loop is trivially testable without a live Redis.
+#[must_use]
+pub fn barrier_decision(
+    drained_seqnum: i64,
+    required_txid: i64,
+    elapsed: std::time::Duration,
+    max_wait: std::time::Duration,
+) -> BarrierStep {
+    if required_txid <= 0 {
+        // Nothing was published for this action — no barrier required.
+        return BarrierStep::Ready;
+    }
+    if drained_seqnum >= required_txid {
+        return BarrierStep::Ready;
+    }
+    if elapsed >= max_wait {
+        return BarrierStep::Timeout;
+    }
+    BarrierStep::Wait
 }
 
 #[cfg(test)]
@@ -482,6 +531,48 @@ mod tests {
 
     fn hex_of(d: &DigestInfo) -> String {
         format!("{}", d.packed_hash())
+    }
+
+    use std::time::Duration;
+
+    /// Slice D: pre-action barrier decision table. Verifies the pure
+    /// decision function used by the scheduler's polling loop.
+    #[test]
+    fn barrier_ready_when_cursor_reaches_required() {
+        let d = barrier_decision(7, 7, Duration::from_millis(100), Duration::from_secs(1));
+        assert_eq!(d, BarrierStep::Ready);
+    }
+
+    #[test]
+    fn barrier_ready_when_cursor_exceeds_required() {
+        let d = barrier_decision(9, 7, Duration::from_millis(100), Duration::from_secs(1));
+        assert_eq!(d, BarrierStep::Ready);
+    }
+
+    #[test]
+    fn barrier_wait_when_cursor_behind_required_and_within_budget() {
+        let d = barrier_decision(5, 7, Duration::from_millis(100), Duration::from_secs(1));
+        assert_eq!(d, BarrierStep::Wait);
+    }
+
+    #[test]
+    fn barrier_timeout_when_cursor_behind_and_past_deadline() {
+        let d = barrier_decision(5, 7, Duration::from_millis(2_000), Duration::from_secs(1));
+        assert_eq!(d, BarrierStep::Timeout);
+    }
+
+    #[test]
+    fn barrier_ready_immediately_when_required_txid_zero() {
+        // When publish_for_worker pushes nothing, seqnum=0 — no barrier.
+        let d = barrier_decision(0, 0, Duration::from_millis(0), Duration::from_secs(1));
+        assert_eq!(d, BarrierStep::Ready);
+    }
+
+    #[test]
+    fn barrier_ready_immediately_when_required_txid_negative() {
+        // Defensive: unspecified / error seqnum must not block.
+        let d = barrier_decision(100, -1, Duration::from_millis(0), Duration::from_secs(1));
+        assert_eq!(d, BarrierStep::Ready);
     }
 
     #[test]

@@ -604,16 +604,18 @@ impl ApiWorkerScheduler {
                 worker_id_str.clone()
             };
             let resolver = resolver.clone();
-            let journaler = journaler.clone();
+            let publish_journaler = journaler.clone();
+            let barrier_journaler = journaler.clone();
             let root_digest = action_info.inner.input_root_digest;
+            let barrier_machine_id = machine_id.clone();
             // Run the walk+publish on a blocking thread — both Redis calls
             // are synchronous and we don't want to block the async runtime.
-            let join = tokio::task::spawn_blocking(move || {
+            let join = tokio::task::spawn_blocking(move || -> i64 {
                 let walked = resolver.resolve_paths(&root_digest);
                 if walked.is_empty() {
-                    return;
+                    return 0;
                 }
-                match journaler.publish_for_worker(&machine_id, &walked) {
+                match publish_journaler.publish_for_worker(&machine_id, &walked) {
                     Ok((n, seqnum)) if n > 0 => {
                         tracing::info!(
                             machine_id = %machine_id,
@@ -622,21 +624,83 @@ impl ApiWorkerScheduler {
                             seqnum,
                             "dir_index: published pending_outputs for worker"
                         );
+                        seqnum
                     }
-                    Ok(_) => {}
+                    Ok(_) => 0,
                     Err(e) => {
                         tracing::warn!(
                             machine_id = %machine_id,
                             ?e,
                             "dir_index: failed to publish pending_outputs"
                         );
+                        0
                     }
                 }
             });
-            // Wait for the publish to complete before dispatching the action —
-            // the worker will drain pending_outputs on receipt.
-            if let Err(e) = join.await {
-                tracing::warn!(?e, "dir_index: publish task panicked");
+            let required_txid = match join.await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(?e, "dir_index: publish task panicked");
+                    0
+                }
+            };
+
+            // Pre-action barrier: block dispatch until the worker's
+            // drained_seqnum cursor reaches required_txid. This closes the
+            // publish-vs-drain race: without it, the worker could start the
+            // action before its background drain has materialized the files
+            // we just pushed. We poll every 10ms up to the max wait; on
+            // timeout we dispatch anyway (best-effort — the worker will
+            // still run its pre-action drain, just without ordering
+            // guarantees for this action).
+            if required_txid > 0 {
+                use crate::dir_index_resolver::{BarrierStep, barrier_decision};
+                const MAX_WAIT: Duration = Duration::from_millis(2_000);
+                const POLL_INTERVAL: Duration = Duration::from_millis(10);
+                let barrier_start = std::time::Instant::now();
+                loop {
+                    let drained = {
+                        let j = barrier_journaler.clone();
+                        let mid = barrier_machine_id.clone();
+                        match tokio::task::spawn_blocking(move || j.get_drained_seqnum(&mid)).await
+                        {
+                            Ok(Ok(n)) => n,
+                            _ => 0,
+                        }
+                    };
+                    let step = barrier_decision(
+                        drained,
+                        required_txid,
+                        barrier_start.elapsed(),
+                        MAX_WAIT,
+                    );
+                    match step {
+                        BarrierStep::Ready => {
+                            tracing::debug!(
+                                machine_id = %barrier_machine_id,
+                                required_txid,
+                                drained,
+                                elapsed_ms = barrier_start.elapsed().as_millis() as i64,
+                                "barrier: drained_seqnum caught up",
+                            );
+                            break;
+                        }
+                        BarrierStep::Timeout => {
+                            tracing::warn!(
+                                machine_id = %barrier_machine_id,
+                                required_txid,
+                                drained,
+                                elapsed_ms = barrier_start.elapsed().as_millis() as i64,
+                                "barrier: timeout waiting for drained_seqnum; \
+                                 dispatching anyway (best-effort)",
+                            );
+                            break;
+                        }
+                        BarrierStep::Wait => {
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                        }
+                    }
+                }
             }
         }
 
