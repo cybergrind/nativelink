@@ -2449,10 +2449,11 @@ impl RunningActionsManagerImpl {
         };
 
         // Spawn a background drain task if Redis + shared-tree are configured.
-        // This materializes pending_outputs on disk even when no remote action
-        // is being dispatched to this worker (e.g. during siso-local link
-        // steps on the scheduler machine). 1-second cadence balances freshness
-        // against Redis traffic.
+        // This materializes pending_outputs on disk so the scheduler's
+        // pre-action barrier observes `drained_seqnum` catching up to
+        // `required_txid`. 100ms cadence (was 1s): the barrier budget is
+        // 5s, so we get ~50 drain cycles per barrier window even under
+        // load. Most polls find LLEN=0 and return in <1ms.
         if args.shared_walked_dirs_redis_url.is_some() {
             if let Some(shared_tree) = args.shared_tree_path {
                 let cas_store = this.cas_store.clone();
@@ -2461,10 +2462,10 @@ impl RunningActionsManagerImpl {
                 tokio::spawn(async move {
                     info!(
                         shared_tree = %shared_tree,
-                        "background drain task started (interval: 1s)"
+                        "background drain task started (interval: 100ms)"
                     );
                     loop {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         drain_and_materialize_pending_outputs(
                             cas_store.as_ref(),
                             Pin::new(fs_store.as_ref()),

@@ -655,7 +655,11 @@ impl ApiWorkerScheduler {
             // guarantees for this action).
             if required_txid > 0 {
                 use crate::dir_index_resolver::{BarrierStep, barrier_decision};
-                const MAX_WAIT: Duration = Duration::from_millis(2_000);
+                // 5s (was 2s): worker's background drain polls at 100ms,
+                // so most barriers complete in well under 1s. 5s absorbs
+                // occasional CAS-fetch hiccups (large blobs, slow-store
+                // cold miss) without falsely giving up on the ACK.
+                const MAX_WAIT: Duration = Duration::from_millis(5_000);
                 const POLL_INTERVAL: Duration = Duration::from_millis(10);
                 let barrier_start = std::time::Instant::now();
                 loop {
