@@ -464,14 +464,13 @@ impl SimpleScheduler {
             Some(worker_registry.clone()),
         );
 
-        let worker_scheduler = ApiWorkerScheduler::new_with_dir_index(
+        let worker_scheduler = ApiWorkerScheduler::new(
             state_manager.clone(),
             platform_property_manager.clone(),
             spec.allocation_strategy,
             worker_change_notify.clone(),
             worker_timeout_s,
             worker_registry,
-            spec.dir_index_redis_url.as_deref(),
         );
 
         let worker_scheduler_clone = worker_scheduler.clone();

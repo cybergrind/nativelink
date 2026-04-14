@@ -365,22 +365,15 @@ pub async fn prepare_action_inputs(
     work_directory: &str,
     hint_root: Option<PathBuf>,
     path_digest_cache: &crate::path_digest_cache::PathDigestCache,
-    skip_input_tree_walk: bool,
 ) -> Result<(), Error> {
-    // Shared-tree fast path: when the caller guarantees the work_directory
-    // is pre-populated (rsync + cross-machine output sync), skip the input
-    // tree walk entirely. download_to_directory is expensive — 2000+
-    // Directory protobuf fetches + 30k file checks per action. The caller
-    // is responsible for ensuring disk state is consistent before setting
-    // this flag.
-    if skip_input_tree_walk {
-        trace!(
-            ?digest,
-            work_directory,
-            "prepare_action_inputs: skipping input tree walk (shared-tree fast path)"
-        );
-        return Ok(());
-    }
+    // Architectural contract: every call walks the input tree. Missing
+    // files are fetched from CAS; Plan K (path_digest_cache) and Plan L
+    // (walked_dirs) handle the fast path so the walk is cheap on rebuilds.
+    // The previous `skip_input_tree_walk` fast path required a separate
+    // cross-machine publish/barrier/drain mechanism to pre-stage outputs,
+    // which proved unreliable in practice — every failure report #8-#15
+    // traced back to a race in that external sync. Keeping the walk
+    // unconditional makes correctness local to each action.
 
     // Try cache first if available
     if let Some(cache) = directory_cache {
@@ -494,129 +487,6 @@ pub fn walk_output_tree_for_paths(
         }
     }
     out
-}
-
-/// Materialize a single pending-output entry into the shared tree.
-/// Returns `Some((relative_path, digest))` on success (file is now on disk
-/// matching `digest`), `None` if the CAS fetch or hardlink failed.
-///
-/// Fast path: if `dest` already exists with the correct size, we skip the
-/// CAS fetch — the file was either placed by a prior drain, rsync, or a
-/// sibling action. A mismatched size means the on-disk file is stale; we
-/// must remove it and refetch to avoid certifying wrong content in
-/// `worker_state`.
-pub async fn materialize_pending_entry(
-    cas_store: &FastSlowStore,
-    fs_store: Pin<&FilesystemStore>,
-    work_directory: String,
-    relative_path: String,
-    digest: DigestInfo,
-) -> Option<(String, DigestInfo)> {
-    let dest = format!("{work_directory}/{relative_path}");
-    if let Ok(meta) = tokio::fs::metadata(&dest).await {
-        if meta.len() == digest.size_bytes() {
-            return Some((relative_path, digest));
-        }
-        // Size mismatch: the on-disk file is stale (e.g. rsync baseline).
-        // Certifying it would poison `worker_state` and cause the scheduler
-        // to skip future pushes for this path. Remove and refetch.
-        drop(tokio::fs::remove_file(&dest).await);
-    }
-    if let Some(parent) = Path::new(&dest).parent() {
-        if let Some(parent_str) = parent.to_str() {
-            drop(fs::create_dir_all(parent_str).await);
-        }
-    }
-    if cas_store.populate_fast_store(digest.into()).await.is_ok() {
-        if let Ok(entry) = fs_store.get_file_entry_for_digest(&digest).await {
-            if let Ok(src) = entry
-                .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
-                .await
-            {
-                if fs::hard_link(&src, &dest).await.is_ok() {
-                    return Some((relative_path, digest));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Drain `nativelink:pending_outputs:{machine_id}` from Redis, fetch each
-/// entry's blob from CAS, hardlink it into the shared tree at
-/// `work_directory`, and record success in `worker_state:{machine_id}` so
-/// the scheduler dedups on its next dispatch.
-///
-/// Called both:
-/// - pre-action from `inner_prepare_action` (so any outputs produced by
-///   other workers since the last action are on disk before clang runs)
-/// - from a background timer task (so siso-local steps like SOLINK on the
-///   scheduler machine see fresh outputs without waiting for a worker
-///   action dispatch to this machine).
-///
-/// Silent no-op when the cache has no Redis output_sync configured.
-pub async fn drain_and_materialize_pending_outputs(
-    cas_store: &FastSlowStore,
-    fs_store: Pin<&FilesystemStore>,
-    path_digest_cache: &crate::path_digest_cache::PathDigestCache,
-    work_directory: &str,
-    reason: &'static str,
-) {
-    let (pending, max_seqnum) = path_digest_cache.drain_pending_outputs();
-    info!(
-        pending_count = pending.len(),
-        max_seqnum, work_directory, reason, "drain: pending_outputs snapshot"
-    );
-    if pending.is_empty() {
-        return;
-    }
-
-    // Materialize all entries CONCURRENTLY rather than serially. CAS fetches
-    // dominate the per-action cost (each ~10-100ms gRPC round-trip), so a
-    // 14-entry pending list went from ~1.4s serial to ~0.1s parallel. This
-    // is the key fix for cross-action throughput on the cluster — without
-    // it, even though tokio spawns each action as a task, every task ends
-    // up serializing on the slow store's per-call latency inside its own
-    // drain loop.
-    let pending_len = pending.len();
-    let mut futures: FuturesUnordered<_> = pending
-        .into_iter()
-        .map(|(relative_path, digest)| {
-            materialize_pending_entry(
-                cas_store,
-                fs_store,
-                work_directory.to_string(),
-                relative_path,
-                digest,
-            )
-        })
-        .collect();
-
-    let mut materialized: Vec<(String, DigestInfo)> = Vec::with_capacity(pending_len);
-    while let Some(opt) = futures.next().await {
-        if let Some(entry) = opt {
-            materialized.push(entry);
-        }
-    }
-
-    path_digest_cache.update_worker_state_bulk(&materialized);
-    // Advance the drained cursor iff every entry materialized. A partial
-    // materialization must NOT advance the cursor — otherwise the pre-action
-    // barrier would unblock for a txid whose files aren't all on disk.
-    let advanced = if materialized.len() == pending_len && max_seqnum > 0 {
-        path_digest_cache.advance_drained_seqnum(max_seqnum);
-        true
-    } else {
-        false
-    };
-    info!(
-        count = pending_len,
-        materialized = materialized.len(),
-        max_seqnum,
-        advanced_cursor = advanced,
-        reason,
-        "synced pending outputs"
-    );
 }
 
 async fn upload_file(
@@ -1128,41 +998,17 @@ impl RunningActionImpl {
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
 
-            // Pre-action output sync: drain pending_outputs from other
-            // machines and materialize them on local disk. Delegated to the
-            // standalone helper so the same logic is used by the background
-            // timer task at worker startup.
-            drain_and_materialize_pending_outputs(
-                self.running_actions_manager.cas_store.as_ref(),
-                Pin::new(self.running_actions_manager.filesystem_store.as_ref()),
-                &self.running_actions_manager.path_digest_cache,
-                &self.work_directory,
-                "pre-action",
-            )
-            .await;
-
             let (command, ()) = try_join(command_fut, async {
-                // Plan J: create_dir_all is idempotent. In shared-tree mode,
-                // work_directory is the pre-staged source tree (already exists).
                 fs::create_dir_all(&self.work_directory)
                     .await
                     .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
-                // Now the work directory has been created, we have to clean up.
                 self.did_cleanup.store(false, Ordering::Release);
-                // Download the input files/folder and place them into the temp directory.
-                // Use directory cache if available for better performance.
                 let hint_root: Option<PathBuf> = self
                     .action_info
                     .platform_properties
                     .get("InputRootAbsolutePath")
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from);
-                // Shared-tree fast path: when InputRootAbsolutePath is set, the
-                // worker's work_directory IS the pre-staged source tree. It is
-                // kept in sync by rsync (at build start) + cross-machine output
-                // sync via Redis pending_outputs (during the build). Skip the
-                // expensive input tree walk entirely.
-                let skip_input_tree_walk = hint_root.is_some();
                 self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -1173,7 +1019,6 @@ impl RunningActionImpl {
                         &self.work_directory,
                         hint_root,
                         &self.running_actions_manager.path_digest_cache,
-                        skip_input_tree_walk,
                     ))
                     .await
             })
@@ -1761,55 +1606,6 @@ impl RunningActionImpl {
         output_folders.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         output_file_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
         output_directory_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
-
-        // Post-action output sync: record EVERY file the action produced
-        // in Redis so that other machines can fetch them before their
-        // next action. Covers both top-level output_files AND files
-        // inside output_directories (whose Tree proto we fetch from CAS).
-        {
-            let mut outputs: Vec<(String, DigestInfo)> = output_files
-                .iter()
-                .map(|f| {
-                    let path = match &f.name_or_path {
-                        NameOrPath::Name(s) | NameOrPath::Path(s) => s.clone(),
-                    };
-                    (path, f.digest)
-                })
-                .collect();
-
-            // For each output directory, fetch its Tree from CAS and walk
-            // it to enumerate every file inside. Best-effort: errors are
-            // logged and that directory's contents are skipped.
-            let cas_store = self.running_actions_manager.cas_store.as_ref();
-            for dir_info in &output_folders {
-                match get_and_decode_digest::<ProtoTree>(cas_store, dir_info.tree_digest.into())
-                    .await
-                {
-                    Ok(tree) => {
-                        let inner_files = walk_output_tree_for_paths(&tree, &dir_info.path);
-                        outputs.extend(inner_files);
-                    }
-                    Err(e) => {
-                        warn!(
-                            path = %dir_info.path,
-                            ?e,
-                            "post-action: failed to fetch Tree for output_directory; \
-                             files inside will not be journaled"
-                        );
-                    }
-                }
-            }
-
-            info!(
-                output_files_count = output_files.len(),
-                output_folders_count = output_folders.len(),
-                journal_entries = outputs.len(),
-                "post-action: journaling outputs"
-            );
-            self.running_actions_manager
-                .path_digest_cache
-                .record_outputs(&outputs);
-        }
 
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
@@ -2435,57 +2231,15 @@ impl RunningActionsManagerImpl {
                     };
                     let redis_walked_dirs =
                         crate::path_digest_cache::RedisWalkedDirs::new(redis_url, machine_id)?;
-                    let output_sync =
-                        crate::path_digest_cache::RedisOutputSync::new(redis_url, machine_id)?;
-                    info!("Per-machine walked-dirs cache + output sync enabled via Redis: {redis_url}");
-                    crate::path_digest_cache::PathDigestCache::with_walked_dirs_and_output_sync(
+                    info!("Per-machine walked-dirs cache enabled via Redis: {redis_url}");
+                    crate::path_digest_cache::PathDigestCache::with_walked_dirs(
                         Box::new(redis_walked_dirs),
-                        output_sync,
                     )
                 } else {
                     crate::path_digest_cache::PathDigestCache::new()
                 },
             ),
         };
-
-        // Spawn a background drain task if Redis + shared-tree are configured.
-        // This materializes pending_outputs on disk so the scheduler's
-        // pre-action barrier observes `drained_seqnum` catching up to
-        // `required_txid`. 100ms cadence (was 1s): the barrier budget is
-        // 5s, so we get ~50 drain cycles per barrier window even under
-        // load. Most polls find LLEN=0 and return in <1ms.
-        if args.shared_walked_dirs_redis_url.is_some() {
-            if let Some(shared_tree) = args.shared_tree_path {
-                let cas_store = this.cas_store.clone();
-                let fs_store = this.filesystem_store.clone();
-                let cache = this.path_digest_cache.clone();
-                tokio::spawn(async move {
-                    info!(
-                        shared_tree = %shared_tree,
-                        "background drain task started (interval: 100ms)"
-                    );
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        drain_and_materialize_pending_outputs(
-                            cas_store.as_ref(),
-                            Pin::new(fs_store.as_ref()),
-                            &cache,
-                            &shared_tree,
-                            "background",
-                        )
-                        .await;
-                        // Heartbeat: if pending_outputs is now empty, tell
-                        // the scheduler we're caught up by advancing
-                        // drained_seqnum to next_seqnum atomically. Without
-                        // this, a worker that's polled an empty queue has
-                        // nothing to materialize → never writes the cursor,
-                        // so the scheduler's barrier waits indefinitely
-                        // even though the worker has no backlog.
-                        cache.heartbeat_drained_if_empty();
-                    }
-                });
-            }
-        }
 
         Ok(this)
     }

@@ -488,11 +488,6 @@ pub struct ApiWorkerScheduler {
 
     /// Performance metrics for observability.
     metrics: Arc<SchedulerMetrics>,
-
-    /// Optional dir_index resolver for walking input trees via Redis.
-    dir_index_resolver: Option<Arc<crate::dir_index_resolver::RedisDirIndexResolver>>,
-    /// Optional journaler for publishing resolved paths to worker pending_outputs.
-    dispatch_journaler: Option<Arc<crate::dir_index_resolver::DispatchJournaler>>,
 }
 
 impl ApiWorkerScheduler {
@@ -504,49 +499,6 @@ impl ApiWorkerScheduler {
         worker_timeout_s: u64,
         worker_registry: SharedWorkerRegistry,
     ) -> Arc<Self> {
-        Self::new_with_dir_index(
-            worker_state_manager,
-            platform_property_manager,
-            allocation_strategy,
-            worker_change_notify,
-            worker_timeout_s,
-            worker_registry,
-            None,
-        )
-    }
-
-    pub fn new_with_dir_index(
-        worker_state_manager: Arc<dyn WorkerStateManager>,
-        platform_property_manager: Arc<PlatformPropertyManager>,
-        allocation_strategy: WorkerAllocationStrategy,
-        worker_change_notify: Arc<Notify>,
-        worker_timeout_s: u64,
-        worker_registry: SharedWorkerRegistry,
-        dir_index_redis_url: Option<&str>,
-    ) -> Arc<Self> {
-        let (dir_index_resolver, dispatch_journaler) =
-            if let Some(url) = dir_index_redis_url.filter(|s| !s.is_empty()) {
-                match (
-                    crate::dir_index_resolver::RedisDirIndexResolver::new(url),
-                    crate::dir_index_resolver::DispatchJournaler::new(url),
-                ) {
-                    (Ok(r), Ok(j)) => {
-                        tracing::info!("Scheduler dir_index enabled via Redis at {url}");
-                        (Some(Arc::new(r)), Some(Arc::new(j)))
-                    }
-                    (r, j) => {
-                        tracing::warn!(
-                            "Failed to initialize dir_index at {url}: resolver={:?}, journaler={:?}",
-                            r.err(),
-                            j.err()
-                        );
-                        (None, None)
-                    }
-                }
-            } else {
-                (None, None)
-            };
-
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
@@ -561,8 +513,6 @@ impl ApiWorkerScheduler {
             worker_timeout_s,
             worker_registry,
             metrics: Arc::new(SchedulerMetrics::default()),
-            dir_index_resolver,
-            dispatch_journaler,
         })
     }
 
@@ -580,133 +530,6 @@ impl ApiWorkerScheduler {
         self.metrics
             .actions_dispatched
             .fetch_add(1, Ordering::Relaxed);
-
-        // Dir-index hook: before dispatching the action, walk the input
-        // tree via the Redis dir_index and publish any files the target
-        // worker is missing to its pending_outputs list. The worker drains
-        // this list before executing the action. Best-effort: Redis errors
-        // are logged and swallowed — the worker still falls back to the
-        // live download_to_directory walk.
-        if let (Some(resolver), Some(journaler)) =
-            (&self.dir_index_resolver, &self.dispatch_journaler)
-        {
-            // WorkerId is formatted as `{prefix}{uuid_v6_hyphenated}` on
-            // registration (see worker_api_server.rs). The prefix comes
-            // from the worker's `config.name`, and is the value the
-            // operator sets to identify the machine (e.g. its IP).
-            // We strip the 36-char hyphenated UUID suffix to get back
-            // the prefix, which must match the worker's `machine_id`
-            // config field so the Redis keys align on both sides.
-            let worker_id_str = worker_id.to_string();
-            let machine_id = if worker_id_str.len() > 36 {
-                worker_id_str[..worker_id_str.len() - 36].to_string()
-            } else {
-                worker_id_str.clone()
-            };
-            let resolver = resolver.clone();
-            let publish_journaler = journaler.clone();
-            let barrier_journaler = journaler.clone();
-            let root_digest = action_info.inner.input_root_digest;
-            let barrier_machine_id = machine_id.clone();
-            // Run the walk+publish on a blocking thread — both Redis calls
-            // are synchronous and we don't want to block the async runtime.
-            let join = tokio::task::spawn_blocking(move || -> i64 {
-                let walked = resolver.resolve_paths(&root_digest);
-                if walked.is_empty() {
-                    return 0;
-                }
-                match publish_journaler.publish_for_worker(&machine_id, &walked) {
-                    Ok((n, seqnum)) if n > 0 => {
-                        tracing::info!(
-                            machine_id = %machine_id,
-                            pushed = n,
-                            walked = walked.len(),
-                            seqnum,
-                            "dir_index: published pending_outputs for worker"
-                        );
-                        seqnum
-                    }
-                    Ok(_) => 0,
-                    Err(e) => {
-                        tracing::warn!(
-                            machine_id = %machine_id,
-                            ?e,
-                            "dir_index: failed to publish pending_outputs"
-                        );
-                        0
-                    }
-                }
-            });
-            let required_txid = match join.await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(?e, "dir_index: publish task panicked");
-                    0
-                }
-            };
-
-            // Pre-action barrier: block dispatch until the worker's
-            // drained_seqnum cursor reaches required_txid. This closes the
-            // publish-vs-drain race: without it, the worker could start the
-            // action before its background drain has materialized the files
-            // we just pushed. We poll every 10ms up to the max wait; on
-            // timeout we dispatch anyway (best-effort — the worker will
-            // still run its pre-action drain, just without ordering
-            // guarantees for this action).
-            if required_txid > 0 {
-                use crate::dir_index_resolver::{BarrierStep, barrier_decision};
-                // 5s (was 2s): worker's background drain polls at 100ms,
-                // so most barriers complete in well under 1s. 5s absorbs
-                // occasional CAS-fetch hiccups (large blobs, slow-store
-                // cold miss) without falsely giving up on the ACK.
-                const MAX_WAIT: Duration = Duration::from_millis(5_000);
-                const POLL_INTERVAL: Duration = Duration::from_millis(10);
-                let barrier_start = std::time::Instant::now();
-                loop {
-                    let drained = {
-                        let j = barrier_journaler.clone();
-                        let mid = barrier_machine_id.clone();
-                        match tokio::task::spawn_blocking(move || j.get_drained_seqnum(&mid)).await
-                        {
-                            Ok(Ok(n)) => n,
-                            _ => 0,
-                        }
-                    };
-                    let step = barrier_decision(
-                        drained,
-                        required_txid,
-                        barrier_start.elapsed(),
-                        MAX_WAIT,
-                    );
-                    match step {
-                        BarrierStep::Ready => {
-                            tracing::debug!(
-                                machine_id = %barrier_machine_id,
-                                required_txid,
-                                drained,
-                                elapsed_ms = barrier_start.elapsed().as_millis() as i64,
-                                "barrier: drained_seqnum caught up",
-                            );
-                            break;
-                        }
-                        BarrierStep::Timeout => {
-                            tracing::warn!(
-                                machine_id = %barrier_machine_id,
-                                required_txid,
-                                drained,
-                                elapsed_ms = barrier_start.elapsed().as_millis() as i64,
-                                "barrier: timeout waiting for drained_seqnum; \
-                                 dispatching anyway (best-effort)",
-                            );
-                            break;
-                        }
-                        BarrierStep::Wait => {
-                            tokio::time::sleep(POLL_INTERVAL).await;
-                        }
-                    }
-                }
-            }
-        }
 
         let mut inner = self.inner.lock().await;
         inner

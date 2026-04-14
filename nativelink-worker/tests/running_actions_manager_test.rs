@@ -22,6 +22,7 @@ mod tests {
     use core::task::Poll;
     use core::time::Duration;
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::env;
     use std::ffi::OsString;
     use std::io::{Cursor, Write};
@@ -66,7 +67,7 @@ mod tests {
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
-        drain_and_materialize_pending_outputs, materialize_pending_entry, prepare_action_inputs,
+        prepare_action_inputs,
     };
     use nativelink_worker::path_digest_cache::PathDigestCache;
     use pretty_assertions::assert_eq;
@@ -623,20 +624,28 @@ mod tests {
         Ok(())
     }
 
-    /// Test: when `skip_input_tree_walk` is true, `prepare_action_inputs` must
-    /// NOT walk the input tree or create any files. This is the fast path for
-    /// shared-tree (InputRootAbsolutePath) mode where the tree is pre-staged
-    /// via rsync + cross-machine output sync, so walking is unnecessary.
+    /// Architectural invariant (replaces the prior "skip when flagged"
+    /// test): `prepare_action_inputs` MUST always walk the input tree and
+    /// materialize every file. The old shared-tree-hint fast path allowed
+    /// skipping, which was correct only when a separate cross-machine
+    /// sync mechanism had already delivered all of the action's output
+    /// preconditions — a contract we spent many iterations failing to
+    /// uphold without races. The clean rule is: each action's inputs are
+    /// ensured by that action's preparation step, using dir_index-backed
+    /// fast walks. No separate publish/barrier/drain machinery.
+    ///
+    /// This test exercises the exact scenario that was silently broken
+    /// before: hint_root is set (shared-tree mode), yet the input tree
+    /// is only available in CAS. The walk must fetch and materialize it.
     #[nativelink_test]
-    async fn prepare_action_inputs_skips_walk_when_flagged(
+    async fn prepare_action_inputs_always_walks_even_in_shared_tree_mode(
     ) -> Result<(), Box<dyn core::error::Error>> {
-        const FILE_NAME: &str = "should_not_be_created.txt";
-        const FILE_CONTENT: &str = "if this appears, the walk ran";
+        const FILE_NAME: &str = "must_be_created.txt";
+        const FILE_CONTENT: &str = "walk must have run even with hint_root";
 
         let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
 
-        // Put a file in CAS that WOULD be created if the walk ran.
-        let file_digest = DigestInfo::new([77u8; 32], 32);
+        let file_digest = DigestInfo::new([77u8; 32], FILE_CONTENT.len() as u64);
         slow_store
             .as_ref()
             .update_oneshot(file_digest, FILE_CONTENT.into())
@@ -657,38 +666,37 @@ mod tests {
             .update_oneshot(root_digest, root_dir.encode_to_vec().into())
             .await?;
 
-        let work_dir = make_temp_path("skip_walk_test");
+        let work_dir = make_temp_path("always_walk_test");
         fs::create_dir_all(&work_dir)
             .await
             .err_tip(|| "create work_dir")?;
 
-        // Call prepare_action_inputs with skip_input_tree_walk=true.
+        // Shared-tree mode (hint_root=Some), no skip param in the new API.
         prepare_action_inputs(
-            &None, // no directory cache
+            &None,
             cas_store.as_ref(),
             fast_store.as_pin(),
             &root_digest,
             &work_dir,
-            None, // no hint_root
+            Some(PathBuf::from(&work_dir)),
             &PathDigestCache::new(),
-            true, // skip_input_tree_walk
         )
         .await?;
 
-        // The file must NOT exist — the walk was skipped.
         let file_path = format!("{work_dir}/{FILE_NAME}");
-        assert!(
-            tokio::fs::metadata(&file_path).await.is_err(),
-            "File must not be created when skip_input_tree_walk=true"
+        let on_disk = tokio::fs::read(&file_path).await?;
+        assert_eq!(
+            on_disk,
+            FILE_CONTENT.as_bytes(),
+            "input tree walk must materialize the file even in shared-tree mode"
         );
 
         Ok(())
     }
 
-    /// Test: when `skip_input_tree_walk` is false, `prepare_action_inputs`
-    /// walks the input tree as before.
+    /// Companion test for the no-hint_root case.
     #[nativelink_test]
-    async fn prepare_action_inputs_walks_when_not_flagged(
+    async fn prepare_action_inputs_walks_without_hint_root(
     ) -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "should_be_created.txt";
         const FILE_CONTENT: &str = "walk ran as expected";
@@ -729,7 +737,6 @@ mod tests {
             &work_dir,
             None,
             &PathDigestCache::new(),
-            false, // walk as usual
         )
         .await?;
 
@@ -812,95 +819,6 @@ mod tests {
         // Force the function to be monomorphized/referenced.
         let _ = _assert_field_exists
             as for<'a> fn(&'a RunningActionsManagerArgs<'_>) -> &'a Option<String>;
-    }
-
-    /// Bug H (from cas_journal_failure_report_10.md): when the drain finds a
-    /// dest path already on disk, it must not blindly certify it as
-    /// materialized. An rsync baseline file at the same path with older
-    /// content has the wrong size → drain must refetch from CAS so the
-    /// on-disk content actually matches the digest we'll publish to
-    /// `worker_state`. Otherwise future actions see the scheduler skip
-    /// pushing this file (HMGET hit on worker_state) and clang reads stale
-    /// bytes or errors on a sibling header the drain silently didn't heal.
-    #[nativelink_test]
-    async fn materialize_pending_entry_replaces_stale_sized_dest(
-    ) -> Result<(), Box<dyn core::error::Error>> {
-        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
-        let work_dir = make_temp_path("materialize_stale_dest");
-        fs::create_dir_all(&work_dir).await?;
-
-        // Seed CAS with the NEW content (what the drain should put on disk).
-        let new_content = Bytes::from_static(b"NEW_GENERATED_CONTENT_EXACTLY_32B");
-        let new_len = new_content.len() as u64;
-        let new_digest = DigestInfo::new([9u8; 32], new_len);
-        cas_store
-            .update_oneshot(new_digest, new_content.clone())
-            .await?;
-
-        // Pre-stage dest with OLD content (rsync baseline), different size.
-        let relative_path = "gen/foo.h";
-        let dest_abs = format!("{work_dir}/{relative_path}");
-        fs::create_dir_all(format!("{work_dir}/gen")).await?;
-        tokio::fs::write(&dest_abs, b"OLD_STALE_CONTENT").await?;
-        let old_size = tokio::fs::metadata(&dest_abs).await?.len();
-        assert_ne!(old_size, new_len, "precondition: sizes must differ");
-
-        let result = materialize_pending_entry(
-            cas_store.as_ref(),
-            fast_store.as_pin(),
-            work_dir.clone(),
-            relative_path.to_string(),
-            new_digest,
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            Some((relative_path.to_string(), new_digest)),
-            "materialize must report success for a size-mismatch refetch"
-        );
-        let on_disk = tokio::fs::read(&dest_abs).await?;
-        assert_eq!(
-            on_disk,
-            new_content.as_ref(),
-            "dest must contain NEW content after refetch, not stale bytes"
-        );
-        Ok(())
-    }
-
-    /// Slice 1 RED/GREEN: the extracted drain helper must be a silent no-op
-    /// when the PathDigestCache has no Redis output_sync configured.
-    #[nativelink_test]
-    async fn drain_and_materialize_no_op_without_output_sync(
-    ) -> Result<(), Box<dyn core::error::Error>> {
-        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
-
-        let work_dir = make_temp_path("drain_no_op_test");
-        fs::create_dir_all(&work_dir).await?;
-
-        // PathDigestCache::new() has no output_sync — drain returns empty.
-        // The helper must still not error.
-        drain_and_materialize_pending_outputs(
-            cas_store.as_ref(),
-            fast_store.as_pin(),
-            &PathDigestCache::new(),
-            &work_dir,
-            "unit-test",
-        )
-        .await;
-
-        // work_dir should still be empty (nothing to materialize).
-        let mut entries = tokio::fs::read_dir(&work_dir).await?;
-        let count = {
-            let mut n = 0;
-            while entries.next_entry().await?.is_some() {
-                n += 1;
-            }
-            n
-        };
-        assert_eq!(count, 0, "no files should be created when there's nothing to drain");
-
-        Ok(())
     }
 
     #[nativelink_test]
