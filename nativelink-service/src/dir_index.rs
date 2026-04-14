@@ -128,14 +128,20 @@ pub fn try_decode_directory(blob: &[u8]) -> Option<Vec<DirChild>> {
 /// silently dropped — the walk will fall back to decoding Directory
 /// protos from CAS directly.
 ///
-/// Connection reuse: holds a single persistent `redis::Connection` behind
-/// a `parking_lot::Mutex`. Opening a new TCP socket per call would
-/// exhaust macOS ephemeral ports (~16k) within seconds on a large build
-/// (~5k+ Directory protos + more).
+/// Connection reuse: holds a small pool of `redis::Connection`s behind a
+/// `parking_lot::Mutex<VecDeque<…>>`. The pool lock is released BEFORE
+/// doing any Redis I/O — that way concurrent CAS uploads can each grab a
+/// connection from the pool and run in parallel rather than serializing
+/// on a single shared connection.
 pub struct DirIndexWriter {
     redis_client: redis::Client,
-    conn: parking_lot::Mutex<Option<redis::Connection>>,
+    pool: parking_lot::Mutex<std::collections::VecDeque<redis::Connection>>,
 }
+
+/// Maximum pooled connections per `DirIndexWriter`. With ~20 concurrent
+/// CAS uploads at peak, 8 lets most of them proceed without serializing,
+/// while keeping macOS ephemeral-port pressure bounded.
+const POOL_SIZE: usize = 8;
 
 impl std::fmt::Debug for DirIndexWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -151,30 +157,30 @@ impl DirIndexWriter {
         let redis_client = redis::Client::open(url)?;
         Ok(Self {
             redis_client,
-            conn: parking_lot::Mutex::new(None),
+            pool: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(POOL_SIZE)),
         })
     }
 
-    /// Runs `op` with a cached Redis connection, lazily opening one on
-    /// first use and reconnecting on error. Keeps the connection alive
-    /// across many calls to avoid TCP ephemeral port exhaustion.
-    fn with_conn<T, F>(&self, op: F) -> Result<T, redis::RedisError>
+    /// Take a connection from the pool (or open one if empty), run `op`
+    /// WITHOUT holding the pool lock, then return the connection to the
+    /// pool on success. On error the connection is dropped so the next
+    /// call reconnects.
+    fn with_conn<T, F>(&self, op: F) -> Option<Result<T, redis::RedisError>>
     where
         F: FnOnce(&mut redis::Connection) -> Result<T, redis::RedisError>,
     {
-        let mut slot = self.conn.lock();
-        if slot.is_none() {
-            *slot = Some(self.redis_client.get_connection()?);
-        }
-        let conn = slot.as_mut().expect("just populated");
-        match op(conn) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                // Drop the connection so the next call reconnects.
-                *slot = None;
-                Err(e)
+        let mut conn = match self.pool.lock().pop_front() {
+            Some(c) => c,
+            None => self.redis_client.get_connection().ok()?,
+        };
+        let result = op(&mut conn);
+        if result.is_ok() {
+            let mut pool = self.pool.lock();
+            if pool.len() < POOL_SIZE {
+                pool.push_back(conn);
             }
         }
+        Some(result)
     }
 
     /// Build the Redis HASH key for a directory with the given digest hash

@@ -2,11 +2,81 @@
 //
 // Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use nativelink_util::common::DigestInfo;
 use parking_lot::Mutex;
+
+/// Maximum number of pooled Redis connections per client. With ~20
+/// concurrent actions per worker × multiple Redis ops per action,
+/// 8 pooled connections give us enough parallelism to avoid serializing
+/// async tasks on a single connection's I/O.
+const REDIS_POOL_SIZE: usize = 8;
+
+/// A small Redis connection pool. Borrow takes a connection from the
+/// front (creating one if pool is empty), do I/O without holding the
+/// pool lock, then return the connection (discarded if the pool is full
+/// or the connection errored).
+///
+/// Using a pool instead of a single cached connection prevents the
+/// `parking_lot::Mutex<Option<redis::Connection>>` pattern from
+/// serializing all in-flight tokio tasks during Redis I/O.
+struct RedisPool {
+    client: redis::Client,
+    pool: Mutex<VecDeque<redis::Connection>>,
+}
+
+impl RedisPool {
+    fn new(client: redis::Client) -> Self {
+        Self {
+            client,
+            pool: Mutex::new(VecDeque::with_capacity(REDIS_POOL_SIZE)),
+        }
+    }
+
+    /// Take a connection from the pool, opening a new one if the pool is
+    /// empty. Returns `None` if connection-open fails.
+    fn take(&self) -> Option<redis::Connection> {
+        if let Some(c) = self.pool.lock().pop_front() {
+            return Some(c);
+        }
+        self.client.get_connection().ok()
+    }
+
+    /// Return a connection to the pool. Drops the connection if the pool
+    /// is at capacity (limits TIME_WAIT pressure on macOS ephemeral ports).
+    fn put(&self, conn: redis::Connection) {
+        let mut pool = self.pool.lock();
+        if pool.len() < REDIS_POOL_SIZE {
+            pool.push_back(conn);
+        }
+    }
+
+    /// Convenience: take a conn, run `op` WITHOUT holding the pool lock,
+    /// then put it back on success. On error, the conn is dropped (forces
+    /// reconnect on next call). Returns `None` if no connection could be
+    /// obtained.
+    fn with_conn<T, F>(&self, op: F) -> Option<Result<T, redis::RedisError>>
+    where
+        F: FnOnce(&mut redis::Connection) -> Result<T, redis::RedisError>,
+    {
+        let mut conn = self.take()?;
+        let result = op(&mut conn);
+        if result.is_ok() {
+            self.put(conn);
+        }
+        Some(result)
+    }
+}
+
+impl std::fmt::Debug for RedisPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisPool")
+            .field("pool_size", &self.pool.lock().len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// Trait for the walked-dirs cache backend. The local implementation uses an
 /// in-memory HashSet (per-worker). The Redis implementation shares state across
@@ -69,8 +139,7 @@ impl WalkedDirsProvider for LocalWalkedDirs {
 ///      the worker still benefits from L1, just loses persistence).
 pub struct RedisWalkedDirs {
     l1: Mutex<HashSet<(String, DigestInfo)>>,
-    redis_client: redis::Client,
-    conn: Mutex<Option<redis::Connection>>,
+    pool: RedisPool,
     redis_key: String,
 }
 
@@ -83,7 +152,6 @@ impl std::fmt::Debug for RedisWalkedDirs {
 }
 
 impl RedisWalkedDirs {
-    /// Create a new Redis-backed walked-dirs provider.
     pub fn new(url: &str, machine_id: &str) -> Result<Self, nativelink_error::Error> {
         let redis_client = redis::Client::open(url).map_err(|e| {
             nativelink_error::make_err!(
@@ -94,8 +162,7 @@ impl RedisWalkedDirs {
         let redis_key = format!("nativelink:walked_dirs:{machine_id}");
         Ok(Self {
             l1: Mutex::new(HashSet::new()),
-            redis_client,
-            conn: Mutex::new(None),
+            pool: RedisPool::new(redis_client),
             redis_key,
         })
     }
@@ -113,26 +180,16 @@ impl WalkedDirsProvider for RedisWalkedDirs {
         }
 
         let member = format!("{}|{}", directory_path, Self::digest_to_member(digest));
-        let result: bool = {
-            let mut slot = self.conn.lock();
-            if slot.is_none() {
-                *slot = self.redis_client.get_connection().ok();
-            }
-            match slot.as_mut() {
-                Some(conn) => match redis::cmd("SISMEMBER")
+        let result: bool = self
+            .pool
+            .with_conn(|conn| {
+                redis::cmd("SISMEMBER")
                     .arg(&self.redis_key)
                     .arg(&member)
                     .query::<bool>(conn)
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        *slot = None;
-                        false
-                    }
-                },
-                None => false,
-            }
-        };
+            })
+            .and_then(Result::ok)
+            .unwrap_or(false);
 
         if result {
             self.l1.lock().insert(key);
@@ -144,24 +201,12 @@ impl WalkedDirsProvider for RedisWalkedDirs {
         self.l1.lock().insert((directory_path.to_string(), digest));
 
         let member = format!("{}|{}", directory_path, Self::digest_to_member(&digest));
-        let mut slot = self.conn.lock();
-        if slot.is_none() {
-            if let Ok(c) = self.redis_client.get_connection() {
-                *slot = Some(c);
-            } else {
-                return;
-            }
-        }
-        if let Some(conn) = slot.as_mut() {
-            if redis::cmd("SADD")
+        drop(self.pool.with_conn(|conn| {
+            redis::cmd("SADD")
                 .arg(&self.redis_key)
                 .arg(&member)
                 .query::<i64>(conn)
-                .is_err()
-            {
-                *slot = None;
-            }
-        }
+        }));
     }
 }
 
@@ -176,8 +221,7 @@ impl WalkedDirsProvider for RedisWalkedDirs {
 /// filesystem BEFORE machine B's next action — solving the split-filesystem
 /// problem in shared-tree (Plan J) mode.
 pub struct RedisOutputSync {
-    redis_client: redis::Client,
-    conn: Mutex<Option<redis::Connection>>,
+    pool: RedisPool,
     machine_id: String,
 }
 
@@ -198,12 +242,11 @@ impl RedisOutputSync {
             )
         })?;
         let this = Self {
-            redis_client,
-            conn: Mutex::new(None),
+            pool: RedisPool::new(redis_client),
             machine_id: machine_id.to_string(),
         };
         // Register this machine so others can discover it.
-        drop(this.with_conn(|conn| {
+        drop(this.pool.with_conn(|conn| {
             redis::cmd("SADD")
                 .arg("nativelink:machines")
                 .arg(&this.machine_id)
@@ -212,32 +255,13 @@ impl RedisOutputSync {
         Ok(this)
     }
 
-    /// Runs `op` with a cached Redis connection, reconnecting on error.
-    fn with_conn<T, F>(&self, op: F) -> Result<T, redis::RedisError>
-    where
-        F: FnOnce(&mut redis::Connection) -> Result<T, redis::RedisError>,
-    {
-        let mut slot = self.conn.lock();
-        if slot.is_none() {
-            *slot = Some(self.redis_client.get_connection()?);
-        }
-        let conn = slot.as_mut().expect("just populated");
-        match op(conn) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                *slot = None;
-                Err(e)
-            }
-        }
-    }
-
     /// Record outputs produced by this machine. Pushes entries to
     /// `nativelink:pending_outputs:{target}` for every OTHER registered machine.
     pub fn record_outputs(&self, outputs: &[(String, DigestInfo)]) {
         if outputs.is_empty() {
             return;
         }
-        drop(self.with_conn(|conn| {
+        drop(self.pool.with_conn(|conn| {
             // Discover other machines.
             let other_machines: Vec<String> = redis::cmd("SMEMBERS")
                 .arg("nativelink:machines")
@@ -286,6 +310,7 @@ impl RedisOutputSync {
     pub fn drain_pending_outputs(&self) -> Vec<(String, DigestInfo)> {
         let key = format!("nativelink:pending_outputs:{}", self.machine_id);
         let entries: Vec<String> = self
+            .pool
             .with_conn(|conn| -> Result<Vec<String>, redis::RedisError> {
                 // Diagnostic: log LLEN before LRANGE so we can see the server's
                 // view regardless of how LRANGE parses.
@@ -311,6 +336,7 @@ impl RedisOutputSync {
                 drop(redis::cmd("DEL").arg(&key).query::<i64>(conn));
                 Ok(lr)
             })
+            .and_then(Result::ok)
             .unwrap_or_default();
         let mut result = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -343,7 +369,7 @@ impl RedisOutputSync {
     pub fn update_worker_state(&self, path: &str, digest: &DigestInfo) {
         let key = format!("nativelink:worker_state:{}", self.machine_id);
         let value = Self::worker_state_value(digest);
-        drop(self.with_conn(|conn| {
+        drop(self.pool.with_conn(|conn| {
             redis::cmd("HSET")
                 .arg(&key)
                 .arg(path)
@@ -358,7 +384,7 @@ impl RedisOutputSync {
             return;
         }
         let key = format!("nativelink:worker_state:{}", self.machine_id);
-        drop(self.with_conn(|conn| {
+        drop(self.pool.with_conn(|conn| {
             let mut cmd = redis::cmd("HSET");
             cmd.arg(&key);
             for (path, digest) in entries {

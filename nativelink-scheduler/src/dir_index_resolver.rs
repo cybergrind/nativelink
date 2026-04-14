@@ -184,12 +184,18 @@ fn digest_info(hex: &str, size: i64) -> Option<DigestInfo> {
     Some(DigestInfo::new(bytes, size as u64))
 }
 
+/// Maximum pooled Redis connections per scheduler-side client. Sized
+/// generously since the scheduler dispatches concurrently across many
+/// workers and walks many Directory chains in parallel.
+const SCHEDULER_REDIS_POOL_SIZE: usize = 16;
+
 /// Redis-backed dir_index resolver. Walks a Directory subtree by reading
 /// `nativelink:dir_index:{digest_hex}-{size}` HASHes populated by the
-/// CAS-server upload hook.
+/// CAS-server upload hook. Uses a connection pool so concurrent walks
+/// don't serialize on a single Mutex-guarded connection.
 pub struct RedisDirIndexResolver {
     redis_client: redis::Client,
-    conn: parking_lot::Mutex<Option<redis::Connection>>,
+    pool: parking_lot::Mutex<std::collections::VecDeque<redis::Connection>>,
 }
 
 impl std::fmt::Debug for RedisDirIndexResolver {
@@ -205,7 +211,9 @@ impl RedisDirIndexResolver {
         let redis_client = redis::Client::open(url)?;
         Ok(Self {
             redis_client,
-            conn: parking_lot::Mutex::new(None),
+            pool: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                SCHEDULER_REDIS_POOL_SIZE,
+            )),
         })
     }
 
@@ -217,24 +225,32 @@ impl RedisDirIndexResolver {
         )
     }
 
+    fn take_conn(&self) -> Option<redis::Connection> {
+        if let Some(c) = self.pool.lock().pop_front() {
+            return Some(c);
+        }
+        self.redis_client.get_connection().ok()
+    }
+
+    fn return_conn(&self, conn: redis::Connection) {
+        let mut pool = self.pool.lock();
+        if pool.len() < SCHEDULER_REDIS_POOL_SIZE {
+            pool.push_back(conn);
+        }
+    }
+
     /// Fetch the dir_index HASH for a single Directory digest from Redis
     /// and parse its entries. Returns `None` if the key doesn't exist or
     /// Redis is unreachable.
     pub fn lookup(&self, digest: &DigestInfo) -> Option<Vec<DirEntry>> {
         let key = Self::key_for(digest);
-        let pairs: Vec<(String, String)> = {
-            let mut slot = self.conn.lock();
-            if slot.is_none() {
-                *slot = self.redis_client.get_connection().ok();
+        let mut conn = self.take_conn()?;
+        let pairs: Vec<(String, String)> = match redis::cmd("HGETALL").arg(&key).query(&mut conn) {
+            Ok(v) => {
+                self.return_conn(conn);
+                v
             }
-            let conn = slot.as_mut()?;
-            match redis::cmd("HGETALL").arg(&key).query(conn) {
-                Ok(v) => v,
-                Err(_) => {
-                    *slot = None;
-                    return None;
-                }
-            }
+            Err(_) => return None, // drop conn (don't return to pool)
         };
         if pairs.is_empty() {
             return None;
@@ -297,10 +313,12 @@ where
 
 /// Redis-backed journaler that publishes resolved paths to
 /// `nativelink:pending_outputs:{machine_id}` LISTs, deduplicating
-/// against `nativelink:worker_state:{machine_id}` HASHes.
+/// against `nativelink:worker_state:{machine_id}` HASHes. Uses a
+/// connection pool so concurrent dispatches don't serialize on a
+/// single Mutex-guarded connection.
 pub struct DispatchJournaler {
     redis_client: redis::Client,
-    conn: parking_lot::Mutex<Option<redis::Connection>>,
+    pool: parking_lot::Mutex<std::collections::VecDeque<redis::Connection>>,
 }
 
 impl std::fmt::Debug for DispatchJournaler {
@@ -316,8 +334,24 @@ impl DispatchJournaler {
         let redis_client = redis::Client::open(url)?;
         Ok(Self {
             redis_client,
-            conn: parking_lot::Mutex::new(None),
+            pool: parking_lot::Mutex::new(std::collections::VecDeque::with_capacity(
+                SCHEDULER_REDIS_POOL_SIZE,
+            )),
         })
+    }
+
+    fn take_conn(&self) -> Result<redis::Connection, redis::RedisError> {
+        if let Some(c) = self.pool.lock().pop_front() {
+            return Ok(c);
+        }
+        self.redis_client.get_connection()
+    }
+
+    fn return_conn(&self, conn: redis::Connection) {
+        let mut pool = self.pool.lock();
+        if pool.len() < SCHEDULER_REDIS_POOL_SIZE {
+            pool.push_back(conn);
+        }
     }
 
     /// Push pending_outputs entries for files the given worker doesn't
@@ -331,11 +365,7 @@ impl DispatchJournaler {
         if walked.is_empty() {
             return Ok(0);
         }
-        let mut slot = self.conn.lock();
-        if slot.is_none() {
-            *slot = Some(self.redis_client.get_connection()?);
-        }
-        let conn = slot.as_mut().expect("just populated");
+        let mut conn = self.take_conn()?;
         let worker_state_key = format!("nativelink:worker_state:{machine_id}");
 
         // Fetch all relevant paths from worker_state in one HMGET.
@@ -346,12 +376,11 @@ impl DispatchJournaler {
             match redis::cmd("HMGET")
                 .arg(&worker_state_key)
                 .arg(&paths)
-                .query(conn)
+                .query(&mut conn)
             {
                 Ok(v) => v,
                 Err(e) => {
-                    // Drop connection so next call reconnects.
-                    *slot = None;
+                    // Drop connection (don't return to pool) on error.
                     return Err(e);
                 }
             }
@@ -367,28 +396,23 @@ impl DispatchJournaler {
         }
 
         if to_push.is_empty() {
+            self.return_conn(conn);
             return Ok(0);
         }
-        let conn = slot.as_mut().expect("still populated");
         let pending_key = format!("nativelink:pending_outputs:{machine_id}");
         let mut cmd = redis::cmd("RPUSH");
         cmd.arg(&pending_key);
         for entry in &to_push {
             cmd.arg(entry);
         }
-        let rpush_result: i64 = match cmd.query::<i64>(conn) {
+        let rpush_result: i64 = match cmd.query::<i64>(&mut conn) {
             Ok(n) => n,
-            Err(e) => {
-                *slot = None;
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
-        // Diagnostic: verify the list actually contains what we pushed. If
-        // post_llen < rpush_result, something cleared the list between the
-        // RPUSH and this LLEN (likely a concurrent DEL from the worker).
+        // Diagnostic: verify the list actually contains what we pushed.
         let post_llen: i64 = redis::cmd("LLEN")
             .arg(&pending_key)
-            .query(conn)
+            .query(&mut conn)
             .unwrap_or(-1);
         tracing::info!(
             machine_id = %machine_id,
@@ -398,6 +422,7 @@ impl DispatchJournaler {
             post_llen,
             "publish: post-RPUSH Redis state"
         );
+        self.return_conn(conn);
         Ok(to_push.len())
     }
 }

@@ -524,31 +524,54 @@ pub async fn drain_and_materialize_pending_outputs(
     if pending.is_empty() {
         return;
     }
-    let mut materialized: Vec<(String, DigestInfo)> = Vec::with_capacity(pending.len());
-    for (relative_path, digest) in &pending {
-        let dest = format!("{work_directory}/{relative_path}");
-        if tokio::fs::metadata(&dest).await.is_ok() {
-            materialized.push((relative_path.clone(), *digest));
-            continue;
-        }
-        if let Some(parent) = Path::new(&dest).parent() {
-            if let Some(parent_str) = parent.to_str() {
-                drop(fs::create_dir_all(parent_str).await);
-            }
-        }
-        if cas_store.populate_fast_store((*digest).into()).await.is_ok() {
-            if let Ok(entry) = fs_store.get_file_entry_for_digest(digest).await {
-                if let Ok(src) = entry
-                    .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
-                    .await
-                {
-                    if fs::hard_link(&src, &dest).await.is_ok() {
-                        materialized.push((relative_path.clone(), *digest));
+
+    // Materialize all entries CONCURRENTLY rather than serially. CAS fetches
+    // dominate the per-action cost (each ~10-100ms gRPC round-trip), so a
+    // 14-entry pending list went from ~1.4s serial to ~0.1s parallel. This
+    // is the key fix for cross-action throughput on the cluster — without
+    // it, even though tokio spawns each action as a task, every task ends
+    // up serializing on the slow store's per-call latency inside its own
+    // drain loop.
+    let mut futures: FuturesUnordered<_> = pending
+        .iter()
+        .map(|(relative_path, digest)| {
+            let work_directory = work_directory.to_string();
+            let relative_path = relative_path.clone();
+            let digest = *digest;
+            async move {
+                let dest = format!("{work_directory}/{relative_path}");
+                if tokio::fs::metadata(&dest).await.is_ok() {
+                    return Some((relative_path, digest));
+                }
+                if let Some(parent) = Path::new(&dest).parent() {
+                    if let Some(parent_str) = parent.to_str() {
+                        drop(fs::create_dir_all(parent_str).await);
                     }
                 }
+                if cas_store.populate_fast_store(digest.into()).await.is_ok() {
+                    if let Ok(entry) = fs_store.get_file_entry_for_digest(&digest).await {
+                        if let Ok(src) = entry
+                            .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
+                            .await
+                        {
+                            if fs::hard_link(&src, &dest).await.is_ok() {
+                                return Some((relative_path, digest));
+                            }
+                        }
+                    }
+                }
+                None
             }
+        })
+        .collect();
+
+    let mut materialized: Vec<(String, DigestInfo)> = Vec::with_capacity(pending.len());
+    while let Some(opt) = futures.next().await {
+        if let Some(entry) = opt {
+            materialized.push(entry);
         }
     }
+
     path_digest_cache.update_worker_state_bulk(&materialized);
     info!(
         count = pending.len(),
