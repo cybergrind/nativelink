@@ -1,0 +1,445 @@
+// Copyright 2024 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License.
+
+//! Scheduler-side resolver that walks a Directory subtree via the
+//! Redis-backed dir_index produced by the CAS upload hook.
+//!
+//! The walk produces `(full_path, DigestInfo)` pairs for every file in
+//! the subtree. Missing dir_index entries (uncached Directory digests)
+//! cause the walk to skip that subtree — the scheduler falls back to
+//! the existing input-tree walk on the worker.
+
+use std::collections::VecDeque;
+
+use nativelink_util::common::DigestInfo;
+
+/// A single entry in a Directory protobuf, as parsed from the dir_index
+/// Redis HASH value format (`"file|{digest_hex}-{size}"`, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirEntry {
+    File {
+        name: String,
+        digest_hex: String,
+        size: i64,
+    },
+    Dir {
+        name: String,
+        digest_hex: String,
+        size: i64,
+    },
+    Symlink {
+        name: String,
+        target: String,
+    },
+}
+
+impl DirEntry {
+    /// Parse the Redis HASH value (which was produced by
+    /// `DirChild::to_redis_value` in nativelink-service).
+    pub fn parse(name: &str, value: &str) -> Option<Self> {
+        let (tag, rest) = value.split_once('|')?;
+        match tag {
+            "file" => {
+                let (hex, size) = rest.rsplit_once('-')?;
+                let size: i64 = size.parse().ok()?;
+                Some(Self::File {
+                    name: name.to_string(),
+                    digest_hex: hex.to_string(),
+                    size,
+                })
+            }
+            "dir" => {
+                let (hex, size) = rest.rsplit_once('-')?;
+                let size: i64 = size.parse().ok()?;
+                Some(Self::Dir {
+                    name: name.to_string(),
+                    digest_hex: hex.to_string(),
+                    size,
+                })
+            }
+            "symlink" => Some(Self::Symlink {
+                name: name.to_string(),
+                target: rest.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Pure path walker: given a root directory digest and a lookup closure
+/// that returns the children of a Directory by its digest, produce
+/// every `(full_path, file_digest)` pair in the subtree.
+///
+/// The closure returns `None` if the Directory is not in the dir_index
+/// (uncached). In that case the walk stops descending into that subtree
+/// — the caller is expected to fall back to a live Directory-proto fetch.
+///
+/// Paths are built relative to the root with `/` separators. Symlinks
+/// are not followed or emitted.
+pub fn walk_tree<F>(root_digest: &DigestInfo, mut lookup: F) -> Vec<(String, DigestInfo)>
+where
+    F: FnMut(&DigestInfo) -> Option<Vec<DirEntry>>,
+{
+    let mut out = Vec::new();
+    let mut stack: VecDeque<(String, DigestInfo)> = VecDeque::new();
+    stack.push_back((String::new(), *root_digest));
+
+    while let Some((prefix, dir_digest)) = stack.pop_front() {
+        let Some(children) = lookup(&dir_digest) else {
+            continue;
+        };
+        for entry in children {
+            match entry {
+                DirEntry::File {
+                    name,
+                    digest_hex,
+                    size,
+                } => {
+                    let full_path = if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    match digest_info(&digest_hex, size) {
+                        Some(d) => out.push((full_path, d)),
+                        None => continue,
+                    }
+                }
+                DirEntry::Dir {
+                    name,
+                    digest_hex,
+                    size,
+                } => {
+                    let new_prefix = if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{prefix}/{name}")
+                    };
+                    match digest_info(&digest_hex, size) {
+                        Some(d) => stack.push_back((new_prefix, d)),
+                        None => continue,
+                    }
+                }
+                DirEntry::Symlink { .. } => {
+                    // Symlinks are not emitted in the walk.
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn digest_info(hex: &str, size: i64) -> Option<DigestInfo> {
+    if hex.len() != 64 || size < 0 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(DigestInfo::new(bytes, size as u64))
+}
+
+/// Redis-backed dir_index resolver. Walks a Directory subtree by reading
+/// `nativelink:dir_index:{digest_hex}-{size}` HASHes populated by the
+/// CAS-server upload hook.
+#[derive(Debug)]
+pub struct RedisDirIndexResolver {
+    redis_client: redis::Client,
+}
+
+impl RedisDirIndexResolver {
+    pub fn new(url: &str) -> Result<Self, redis::RedisError> {
+        let redis_client = redis::Client::open(url)?;
+        Ok(Self { redis_client })
+    }
+
+    fn key_for(digest: &DigestInfo) -> String {
+        format!(
+            "nativelink:dir_index:{}-{}",
+            digest.packed_hash(),
+            digest.size_bytes()
+        )
+    }
+
+    /// Fetch the dir_index HASH for a single Directory digest from Redis
+    /// and parse its entries. Returns `None` if the key doesn't exist or
+    /// Redis is unreachable.
+    pub fn lookup(&self, digest: &DigestInfo) -> Option<Vec<DirEntry>> {
+        let mut conn = self.redis_client.get_connection().ok()?;
+        let pairs: Vec<(String, String)> = redis::cmd("HGETALL")
+            .arg(Self::key_for(digest))
+            .query(&mut conn)
+            .ok()?;
+        if pairs.is_empty() {
+            return None;
+        }
+        let entries: Vec<DirEntry> = pairs
+            .into_iter()
+            .filter_map(|(name, value)| DirEntry::parse(&name, &value))
+            .collect();
+        Some(entries)
+    }
+
+    /// Walk the subtree rooted at `root_digest`, producing every
+    /// `(full_path, digest)` pair. Subtrees whose Directory digest is not
+    /// cached in Redis are skipped silently — the caller is expected to
+    /// fall back to the live Directory-proto walk on the worker.
+    pub fn resolve_paths(&self, root_digest: &DigestInfo) -> Vec<(String, DigestInfo)> {
+        walk_tree(root_digest, |d| self.lookup(d))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn mk_digest(byte: u8, size: u64) -> DigestInfo {
+        DigestInfo::new([byte; 32], size)
+    }
+
+    fn hex_of(d: &DigestInfo) -> String {
+        format!("{}", d.packed_hash())
+    }
+
+    #[test]
+    fn parse_file_entry() {
+        let e = DirEntry::parse("cmath", "file|abc-42").unwrap();
+        assert_eq!(
+            e,
+            DirEntry::File {
+                name: "cmath".to_string(),
+                digest_hex: "abc".to_string(),
+                size: 42,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_dir_entry() {
+        let e = DirEntry::parse("subdir", "dir|def-100").unwrap();
+        assert_eq!(
+            e,
+            DirEntry::Dir {
+                name: "subdir".to_string(),
+                digest_hex: "def".to_string(),
+                size: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_symlink_entry() {
+        let e = DirEntry::parse("link", "symlink|target.h").unwrap();
+        assert_eq!(
+            e,
+            DirEntry::Symlink {
+                name: "link".to_string(),
+                target: "target.h".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_invalid_returns_none() {
+        assert!(DirEntry::parse("name", "no_separator").is_none());
+        assert!(DirEntry::parse("name", "unknown|data").is_none());
+        assert!(DirEntry::parse("name", "file|bad").is_none()); // no size
+        assert!(DirEntry::parse("name", "file|abc-bad").is_none()); // size not numeric
+    }
+
+    #[test]
+    fn walk_empty_tree_empty_output() {
+        let root = mk_digest(1, 10);
+        let out = walk_tree(&root, |_d| None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn walk_single_file_at_root() {
+        let root = mk_digest(1, 10);
+        let file_digest = mk_digest(2, 100);
+        let root_hex = hex_of(&root);
+        let file_hex = hex_of(&file_digest);
+
+        let mut index: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        index.insert(
+            format!("{root_hex}-{}", root.size_bytes()),
+            vec![DirEntry::File {
+                name: "foo.o".to_string(),
+                digest_hex: file_hex.clone(),
+                size: file_digest.size_bytes() as i64,
+            }],
+        );
+
+        let out = walk_tree(&root, |d| {
+            index
+                .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                .cloned()
+        });
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "foo.o");
+        assert_eq!(out[0].1, file_digest);
+    }
+
+    #[test]
+    fn walk_nested_directories() {
+        let root = mk_digest(1, 10);
+        let sub = mk_digest(2, 20);
+        let file = mk_digest(3, 100);
+
+        let mut index: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        index.insert(
+            format!("{}-{}", hex_of(&root), root.size_bytes()),
+            vec![DirEntry::Dir {
+                name: "include".to_string(),
+                digest_hex: hex_of(&sub),
+                size: sub.size_bytes() as i64,
+            }],
+        );
+        index.insert(
+            format!("{}-{}", hex_of(&sub), sub.size_bytes()),
+            vec![DirEntry::File {
+                name: "cmath".to_string(),
+                digest_hex: hex_of(&file),
+                size: file.size_bytes() as i64,
+            }],
+        );
+
+        let out = walk_tree(&root, |d| {
+            index
+                .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                .cloned()
+        });
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "include/cmath");
+        assert_eq!(out[0].1, file);
+    }
+
+    #[test]
+    fn walk_skips_uncached_subdirectory() {
+        // root → [cached_file, uncached_subdir]. The subdir lookup returns None,
+        // so the walk emits just the cached file and does not descend.
+        let root = mk_digest(1, 10);
+        let cached_sub = mk_digest(2, 20);
+        let uncached_sub = mk_digest(9, 99);
+        let file = mk_digest(3, 50);
+
+        let mut index: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        index.insert(
+            format!("{}-{}", hex_of(&root), root.size_bytes()),
+            vec![
+                DirEntry::Dir {
+                    name: "cached".to_string(),
+                    digest_hex: hex_of(&cached_sub),
+                    size: cached_sub.size_bytes() as i64,
+                },
+                DirEntry::Dir {
+                    name: "uncached".to_string(),
+                    digest_hex: hex_of(&uncached_sub),
+                    size: uncached_sub.size_bytes() as i64,
+                },
+            ],
+        );
+        index.insert(
+            format!("{}-{}", hex_of(&cached_sub), cached_sub.size_bytes()),
+            vec![DirEntry::File {
+                name: "foo.h".to_string(),
+                digest_hex: hex_of(&file),
+                size: file.size_bytes() as i64,
+            }],
+        );
+        // Note: no entry for uncached_sub — lookup will return None.
+
+        let out = walk_tree(&root, |d| {
+            index
+                .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                .cloned()
+        });
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "cached/foo.h");
+    }
+
+    #[test]
+    fn walk_multiple_files_same_dir() {
+        let root = mk_digest(1, 10);
+        let f1 = mk_digest(2, 100);
+        let f2 = mk_digest(3, 200);
+
+        let mut index: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        index.insert(
+            format!("{}-{}", hex_of(&root), root.size_bytes()),
+            vec![
+                DirEntry::File {
+                    name: "a.o".to_string(),
+                    digest_hex: hex_of(&f1),
+                    size: f1.size_bytes() as i64,
+                },
+                DirEntry::File {
+                    name: "b.o".to_string(),
+                    digest_hex: hex_of(&f2),
+                    size: f2.size_bytes() as i64,
+                },
+            ],
+        );
+
+        let out = walk_tree(&root, |d| {
+            index
+                .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                .cloned()
+        });
+
+        assert_eq!(out.len(), 2);
+        let paths: Vec<_> = out.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"a.o"));
+        assert!(paths.contains(&"b.o"));
+    }
+
+    #[test]
+    fn redis_resolver_key_format_matches_writer_format() {
+        // Must match DirIndexWriter::key_for in nativelink-service/src/dir_index.rs.
+        let d = mk_digest(0xAB, 42);
+        let key = RedisDirIndexResolver::key_for(&d);
+        // Key shape: nativelink:dir_index:<hex>-<size>
+        assert!(key.starts_with("nativelink:dir_index:"));
+        assert!(key.ends_with("-42"));
+    }
+
+    #[test]
+    fn redis_resolver_can_be_constructed() {
+        assert!(RedisDirIndexResolver::new("redis://127.0.0.1:6379").is_ok());
+    }
+
+    #[test]
+    fn redis_resolver_rejects_invalid_url() {
+        assert!(RedisDirIndexResolver::new("not-a-url").is_err());
+    }
+
+    #[test]
+    fn walk_does_not_emit_symlinks() {
+        let root = mk_digest(1, 10);
+        let mut index: HashMap<String, Vec<DirEntry>> = HashMap::new();
+        index.insert(
+            format!("{}-{}", hex_of(&root), root.size_bytes()),
+            vec![DirEntry::Symlink {
+                name: "link".to_string(),
+                target: "real".to_string(),
+            }],
+        );
+
+        let out = walk_tree(&root, |d| {
+            index
+                .get(&format!("{}-{}", d.packed_hash(), d.size_bytes()))
+                .cloned()
+        });
+
+        assert!(out.is_empty());
+    }
+}
