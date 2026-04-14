@@ -614,11 +614,12 @@ impl ApiWorkerScheduler {
                     return;
                 }
                 match journaler.publish_for_worker(&machine_id, &walked) {
-                    Ok(n) if n > 0 => {
+                    Ok((n, seqnum)) if n > 0 => {
                         tracing::info!(
                             machine_id = %machine_id,
                             pushed = n,
                             walked = walked.len(),
+                            seqnum,
                             "dir_index: published pending_outputs for worker"
                         );
                     }

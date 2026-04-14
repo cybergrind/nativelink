@@ -296,11 +296,18 @@ impl RedisDirIndexResolver {
     }
 }
 
-/// Render a (path, digest) pair into the "path|hash-size" format used
-/// in `nativelink:pending_outputs:{machine_id}` LIST entries. This must
-/// match the format consumed by the worker's drain path.
-pub fn pending_entry_string(path: &str, digest: &DigestInfo) -> String {
-    format!("{path}|{}-{}", digest.packed_hash(), digest.size_bytes())
+/// Render a `(path, digest, seqnum)` tuple into the
+/// `"path|hash-size|seqnum"` format used in
+/// `nativelink:pending_outputs:{machine_id}` LIST entries. The seqnum is
+/// the publisher's monotonic batch id; the worker drain reports it back
+/// via `nativelink:drained_seqnum:{machine_id}` so the scheduler's
+/// pre-action barrier can confirm materialization.
+pub fn pending_entry_string(path: &str, digest: &DigestInfo, seqnum: i64) -> String {
+    format!(
+        "{path}|{}-{}|{seqnum}",
+        digest.packed_hash(),
+        digest.size_bytes()
+    )
 }
 
 /// Pure diff function: given the resolved paths from a walk and a lookup
@@ -373,15 +380,17 @@ impl DispatchJournaler {
     }
 
     /// Push pending_outputs entries for files the given worker doesn't
-    /// already have on disk. Best-effort: Redis errors are logged at
-    /// `warn!` level and swallowed.
+    /// already have on disk. Returns `(pushed_count, batch_seqnum)`; the
+    /// seqnum is 0 when nothing was pushed (nothing to wait for).
+    /// Best-effort: Redis errors are logged at `warn!` level by the caller
+    /// and swallowed.
     pub fn publish_for_worker(
         &self,
         machine_id: &str,
         walked: &[(String, DigestInfo)],
-    ) -> Result<usize, redis::RedisError> {
+    ) -> Result<(usize, i64), redis::RedisError> {
         if walked.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let mut conn = self.take_conn()?;
         let worker_state_key = format!("nativelink:worker_state:{machine_id}");
@@ -404,19 +413,35 @@ impl DispatchJournaler {
             }
         };
 
-        let mut to_push = Vec::new();
+        let mut to_push_raw: Vec<(String, DigestInfo)> = Vec::new();
         for (idx, (path, digest)) in walked.iter().enumerate() {
             let expected = format!("{}-{}", digest.packed_hash(), digest.size_bytes());
             let current = current_values.get(idx).cloned().flatten();
             if current.as_deref() != Some(expected.as_str()) {
-                to_push.push(pending_entry_string(path, digest));
+                to_push_raw.push((path.clone(), *digest));
             }
         }
 
-        if to_push.is_empty() {
+        if to_push_raw.is_empty() {
             self.return_conn(conn);
-            return Ok(0);
+            return Ok((0, 0));
         }
+
+        // Allocate a monotonic batch seqnum. Every entry in this RPUSH
+        // carries the same seqnum; the worker's drain reports progress
+        // back to `drained_seqnum:{machine_id}` at batch granularity so
+        // the scheduler can implement a pre-action barrier by comparing
+        // `drained_seqnum >= required_txid`.
+        let seqnum_key = format!("nativelink:next_seqnum:{machine_id}");
+        let seqnum: i64 = match redis::cmd("INCR").arg(&seqnum_key).query(&mut conn) {
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        };
+
+        let to_push: Vec<String> = to_push_raw
+            .iter()
+            .map(|(path, digest)| pending_entry_string(path, digest, seqnum))
+            .collect();
         let pending_key = format!("nativelink:pending_outputs:{machine_id}");
         let mut cmd = redis::cmd("RPUSH");
         cmd.arg(&pending_key);
@@ -427,7 +452,6 @@ impl DispatchJournaler {
             Ok(n) => n,
             Err(e) => return Err(e),
         };
-        // Diagnostic: verify the list actually contains what we pushed.
         let post_llen: i64 = redis::cmd("LLEN")
             .arg(&pending_key)
             .query(&mut conn)
@@ -436,12 +460,13 @@ impl DispatchJournaler {
             machine_id = %machine_id,
             key = %pending_key,
             pushed_count = to_push.len(),
+            seqnum,
             rpush_result,
             post_llen,
             "publish: post-RPUSH Redis state"
         );
         self.return_conn(conn);
-        Ok(to_push.len())
+        Ok((to_push.len(), seqnum))
     }
 }
 
@@ -847,9 +872,25 @@ mod tests {
     #[test]
     fn pending_entry_string_format() {
         let d = mk_digest(0xAB, 42);
-        let s = pending_entry_string("foo/bar.o", &d);
-        assert!(s.starts_with("foo/bar.o|"));
-        assert!(s.ends_with("-42"));
+        let s = pending_entry_string("foo/bar.o", &d, 7);
+        assert!(s.starts_with("foo/bar.o|"), "got {s}");
+        assert!(s.contains("-42|"), "got {s}");
+        assert!(s.ends_with("|7"), "got {s}");
+    }
+
+    /// Slice A: every published entry must carry a monotonic seqnum so the
+    /// worker drain can report "materialized up to seqnum N" back to the
+    /// scheduler for the pre-action barrier.
+    #[test]
+    fn pending_entry_string_roundtrips_seqnum() {
+        let d = mk_digest(0xCD, 99);
+        let s = pending_entry_string("a/b.o", &d, 1234);
+        // Expected format: "path|<hex>-<size>|<seqnum>"
+        let parts: Vec<&str> = s.split('|').collect();
+        assert_eq!(parts.len(), 3, "expected 3 pipe-separated fields, got {s}");
+        assert_eq!(parts[0], "a/b.o");
+        assert!(parts[1].ends_with("-99"));
+        assert_eq!(parts[2], "1234");
     }
 
     #[test]
