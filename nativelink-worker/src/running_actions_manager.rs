@@ -433,6 +433,68 @@ fn is_executable(metadata: &std::fs::Metadata, _full_path: &impl AsRef<Path>) ->
 
 type DigestUploader = Arc<tokio::sync::OnceCell<()>>;
 
+/// Drain `nativelink:pending_outputs:{machine_id}` from Redis, fetch each
+/// entry's blob from CAS, hardlink it into the shared tree at
+/// `work_directory`, and record success in `worker_state:{machine_id}` so
+/// the scheduler dedups on its next dispatch.
+///
+/// Called both:
+/// - pre-action from `inner_prepare_action` (so any outputs produced by
+///   other workers since the last action are on disk before clang runs)
+/// - from a background timer task (so siso-local steps like SOLINK on the
+///   scheduler machine see fresh outputs without waiting for a worker
+///   action dispatch to this machine).
+///
+/// Silent no-op when the cache has no Redis output_sync configured.
+pub async fn drain_and_materialize_pending_outputs(
+    cas_store: &FastSlowStore,
+    fs_store: Pin<&FilesystemStore>,
+    path_digest_cache: &crate::path_digest_cache::PathDigestCache,
+    work_directory: &str,
+    reason: &'static str,
+) {
+    let pending = path_digest_cache.drain_pending_outputs();
+    info!(
+        pending_count = pending.len(),
+        work_directory, reason, "drain: pending_outputs snapshot"
+    );
+    if pending.is_empty() {
+        return;
+    }
+    let mut materialized: Vec<(String, DigestInfo)> = Vec::with_capacity(pending.len());
+    for (relative_path, digest) in &pending {
+        let dest = format!("{work_directory}/{relative_path}");
+        if tokio::fs::metadata(&dest).await.is_ok() {
+            materialized.push((relative_path.clone(), *digest));
+            continue;
+        }
+        if let Some(parent) = Path::new(&dest).parent() {
+            if let Some(parent_str) = parent.to_str() {
+                drop(fs::create_dir_all(parent_str).await);
+            }
+        }
+        if cas_store.populate_fast_store((*digest).into()).await.is_ok() {
+            if let Ok(entry) = fs_store.get_file_entry_for_digest(digest).await {
+                if let Ok(src) = entry
+                    .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
+                    .await
+                {
+                    if fs::hard_link(&src, &dest).await.is_ok() {
+                        materialized.push((relative_path.clone(), *digest));
+                    }
+                }
+            }
+        }
+    }
+    path_digest_cache.update_worker_state_bulk(&materialized);
+    info!(
+        count = pending.len(),
+        materialized = materialized.len(),
+        reason,
+        "synced pending outputs"
+    );
+}
+
 async fn upload_file(
     cas_store: Pin<&impl StoreLike>,
     full_path: impl AsRef<Path> + Debug + Send + Sync,
@@ -942,73 +1004,18 @@ impl RunningActionImpl {
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
 
-            // Pre-action output sync: drain pending outputs from other
-            // machines and fetch them from CAS into the local shared tree.
-            // This materializes .o/.d/etc files produced on other workers so
-            // that this worker (and siso on this machine) can find them on
-            // the local filesystem.
-            {
-                let pending = self
-                    .running_actions_manager
-                    .path_digest_cache
-                    .drain_pending_outputs();
-                // Always log the drain result, even if empty — lets us confirm
-                // the pre-action sync hook is actually running.
-                info!(
-                    pending_count = pending.len(),
-                    work_directory = %self.work_directory,
-                    "pre-action drain: pending_outputs snapshot"
-                );
-                if !pending.is_empty() {
-                    let cas = self.running_actions_manager.cas_store.as_ref();
-                    let fs_store =
-                        Pin::new(self.running_actions_manager.filesystem_store.as_ref());
-                    // Track successfully materialized entries so we can bulk-
-                    // update `worker_state:{machine_id}` in Redis. The
-                    // scheduler's next HMGET will see these and stop
-                    // re-publishing the same paths.
-                    let mut materialized: Vec<(String, DigestInfo)> =
-                        Vec::with_capacity(pending.len());
-                    for (relative_path, digest) in &pending {
-                        let dest = format!("{}/{}", self.work_directory, relative_path);
-                        // Skip if already on disk — but still record the
-                        // worker_state entry so the scheduler knows we have it.
-                        if tokio::fs::metadata(&dest).await.is_ok() {
-                            materialized.push((relative_path.clone(), *digest));
-                            continue;
-                        }
-                        // Ensure parent directory exists.
-                        if let Some(parent) = Path::new(&dest).parent() {
-                            if let Some(parent_str) = parent.to_str() {
-                                drop(fs::create_dir_all(parent_str).await);
-                            }
-                        }
-                        // Fetch from CAS and hardlink to shared tree.
-                        if cas.populate_fast_store((*digest).into()).await.is_ok() {
-                            if let Ok(entry) = fs_store.get_file_entry_for_digest(digest).await {
-                                if let Ok(src) = entry
-                                    .get_file_path_locked(|s| async move { Ok(PathBuf::from(s)) })
-                                    .await
-                                {
-                                    if fs::hard_link(&src, &dest).await.is_ok() {
-                                        materialized.push((relative_path.clone(), *digest));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Batch-update worker_state so the scheduler sees our
-                    // new disk contents.
-                    self.running_actions_manager
-                        .path_digest_cache
-                        .update_worker_state_bulk(&materialized);
-                    info!(
-                        count = pending.len(),
-                        materialized = materialized.len(),
-                        "synced pending outputs from other workers"
-                    );
-                }
-            }
+            // Pre-action output sync: drain pending_outputs from other
+            // machines and materialize them on local disk. Delegated to the
+            // standalone helper so the same logic is used by the background
+            // timer task at worker startup.
+            drain_and_materialize_pending_outputs(
+                self.running_actions_manager.cas_store.as_ref(),
+                Pin::new(self.running_actions_manager.filesystem_store.as_ref()),
+                &self.running_actions_manager.path_digest_cache,
+                &self.work_directory,
+                "pre-action",
+            )
+            .await;
 
             let (command, ()) = try_join(command_fut, async {
                 // Plan J: create_dir_all is idempotent. In shared-tree mode,
@@ -2160,6 +2167,14 @@ pub struct RunningActionsManagerArgs<'a> {
     pub shared_walked_dirs_redis_url: Option<String>,
     /// Machine identifier for Redis key namespacing (e.g. IP address).
     pub machine_id: String,
+    /// Optional shared-tree root (typically matches the
+    /// `InputRootAbsolutePath` platform property). When set together with
+    /// `shared_walked_dirs_redis_url`, the worker spawns a background task
+    /// that drains `pending_outputs` on a 1s timer and materializes files
+    /// into this directory. This ensures outputs from other workers land
+    /// on local disk even when no remote action is dispatched here —
+    /// required for siso-local link/SOLINK steps on the scheduler machine.
+    pub shared_tree_path: Option<String>,
 }
 
 struct CleanupGuard {
@@ -2234,7 +2249,7 @@ impl RunningActionsManagerImpl {
             .get_arc()
             .err_tip(|| "FilesystemStore's internal Arc was lost")?;
         let (action_done_tx, _) = watch::channel(());
-        Ok(Self {
+        let this = Self {
             root_action_directory: args.root_action_directory,
             execution_configuration: args.execution_configuration,
             cas_store: args.cas_store,
@@ -2275,7 +2290,39 @@ impl RunningActionsManagerImpl {
                     crate::path_digest_cache::PathDigestCache::new()
                 },
             ),
-        })
+        };
+
+        // Spawn a background drain task if Redis + shared-tree are configured.
+        // This materializes pending_outputs on disk even when no remote action
+        // is being dispatched to this worker (e.g. during siso-local link
+        // steps on the scheduler machine). 1-second cadence balances freshness
+        // against Redis traffic.
+        if args.shared_walked_dirs_redis_url.is_some() {
+            if let Some(shared_tree) = args.shared_tree_path {
+                let cas_store = this.cas_store.clone();
+                let fs_store = this.filesystem_store.clone();
+                let cache = this.path_digest_cache.clone();
+                tokio::spawn(async move {
+                    info!(
+                        shared_tree = %shared_tree,
+                        "background drain task started (interval: 1s)"
+                    );
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        drain_and_materialize_pending_outputs(
+                            cas_store.as_ref(),
+                            Pin::new(fs_store.as_ref()),
+                            &cache,
+                            &shared_tree,
+                            "background",
+                        )
+                        .await;
+                    }
+                });
+            }
+        }
+
+        Ok(this)
     }
 
     pub fn new(args: RunningActionsManagerArgs<'_>) -> Result<Self, Error> {

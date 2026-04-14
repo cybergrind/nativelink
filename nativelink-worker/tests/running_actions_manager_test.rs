@@ -66,7 +66,7 @@ mod tests {
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
-        prepare_action_inputs,
+        drain_and_materialize_pending_outputs, prepare_action_inputs,
     };
     use nativelink_worker::path_digest_cache::PathDigestCache;
     use pretty_assertions::assert_eq;
@@ -740,6 +740,57 @@ mod tests {
         Ok(())
     }
 
+    /// Slice 3: RunningActionsManagerArgs must carry a `shared_tree_path`
+    /// option so the worker can spawn a background drain task for it.
+    /// Compile-only: the field access alone proves the struct carries it.
+    #[test]
+    fn running_actions_manager_args_has_shared_tree_path_field() {
+        use nativelink_worker::running_actions_manager::RunningActionsManagerArgs;
+        fn _assert_field_exists<'a>(
+            args: &'a RunningActionsManagerArgs<'_>,
+        ) -> &'a Option<String> {
+            &args.shared_tree_path
+        }
+        // Force the function to be monomorphized/referenced.
+        let _ = _assert_field_exists
+            as for<'a> fn(&'a RunningActionsManagerArgs<'_>) -> &'a Option<String>;
+    }
+
+    /// Slice 1 RED/GREEN: the extracted drain helper must be a silent no-op
+    /// when the PathDigestCache has no Redis output_sync configured.
+    #[nativelink_test]
+    async fn drain_and_materialize_no_op_without_output_sync(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        let work_dir = make_temp_path("drain_no_op_test");
+        fs::create_dir_all(&work_dir).await?;
+
+        // PathDigestCache::new() has no output_sync — drain returns empty.
+        // The helper must still not error.
+        drain_and_materialize_pending_outputs(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &PathDigestCache::new(),
+            &work_dir,
+            "unit-test",
+        )
+        .await;
+
+        // work_dir should still be empty (nothing to materialize).
+        let mut entries = tokio::fs::read_dir(&work_dir).await?;
+        let count = {
+            let mut n = 0;
+            while entries.next_entry().await?.is_some() {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(count, 0, "no files should be created when there's nothing to drain");
+
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn ensure_output_files_full_directories_are_created_no_working_directory_test()
     -> Result<(), Box<dyn core::error::Error>> {
@@ -773,6 +824,7 @@ mod tests {
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -899,6 +951,7 @@ mod tests {
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1027,6 +1080,7 @@ mod tests {
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1211,6 +1265,7 @@ mod tests {
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1396,6 +1451,7 @@ mod tests {
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1607,6 +1663,7 @@ mod tests {
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1745,6 +1802,7 @@ mod tests {
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -1951,6 +2009,7 @@ exit 0
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2130,6 +2189,7 @@ exit 0
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2303,6 +2363,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2390,6 +2451,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2468,6 +2530,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2552,6 +2615,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2657,6 +2721,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2706,6 +2771,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2777,6 +2843,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2899,6 +2966,7 @@ exit 1
                     directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2989,6 +3057,7 @@ exit 1
                     directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3079,6 +3148,7 @@ exit 1
                     directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3166,6 +3236,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3321,6 +3392,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3493,6 +3565,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3596,6 +3669,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3713,6 +3787,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3896,6 +3971,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4019,6 +4095,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         // Create a simple action
@@ -4163,6 +4240,7 @@ exit 1
                 directory_cache: None,
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
+                shared_tree_path: None,
             })?);
 
         // Create a simple action

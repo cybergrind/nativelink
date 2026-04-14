@@ -612,6 +612,15 @@ pub async fn new_local_worker(
             directory_cache,
             shared_walked_dirs_redis_url: config.shared_walked_dirs_redis_url.clone(),
             machine_id: config.machine_id.clone(),
+            shared_tree_path: config
+                .platform_properties
+                .get("InputRootAbsolutePath")
+                .and_then(|p| match p {
+                    nativelink_config::cas_server::WorkerProperty::Values(v) => {
+                        v.first().filter(|s| !s.is_empty()).cloned()
+                    }
+                    _ => None,
+                }),
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),
