@@ -351,8 +351,6 @@ impl RedisOutputSync {
         let entries: Vec<String> = self
             .pool
             .with_conn(|conn| -> Result<Vec<String>, redis::RedisError> {
-                // Diagnostic: log LLEN before LRANGE so we can see the server's
-                // view regardless of how LRANGE parses.
                 let pre_llen: i64 = redis::cmd("LLEN")
                     .arg(&key)
                     .query(conn)
@@ -362,17 +360,29 @@ impl RedisOutputSync {
                     pre_llen,
                     "drain: LLEN before LRANGE"
                 );
-                let lr: Vec<String> = redis::cmd("LRANGE")
+                if pre_llen <= 0 {
+                    return Ok(Vec::new());
+                }
+                // Atomically take the first `pre_llen` entries: LRANGE +
+                // LTRIM inside a MULTI/EXEC so concurrent RPUSH-after-LRANGE
+                // doesn't get clobbered by a DEL. This preserves any entries
+                // a publisher adds between our LRANGE and our trim.
+                let (lr, _): (Vec<String>, i64) = redis::pipe()
+                    .atomic()
+                    .cmd("LRANGE")
                     .arg(&key)
                     .arg(0i64)
+                    .arg(pre_llen - 1)
+                    .cmd("LTRIM")
+                    .arg(&key)
+                    .arg(pre_llen)
                     .arg(-1i64)
                     .query(conn)?;
                 tracing::info!(
                     key = %key,
                     lrange_count = lr.len(),
-                    "drain: LRANGE result"
+                    "drain: LRANGE+LTRIM result"
                 );
-                drop(redis::cmd("DEL").arg(&key).query::<i64>(conn));
                 Ok(lr)
             })
             .and_then(Result::ok)
