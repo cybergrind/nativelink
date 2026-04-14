@@ -30,6 +30,10 @@ prost = { version = "0.13.5", default-features = false }
 prost-types = { version = "0.13.5", default-features = false, features = [
   "std",
 ] }
+redis = { version = "1.0.0", default-features = false, features = [
+  "connection-manager",
+  "tokio-comp",
+] }
 rand = { version = "0.9.0", default-features = false, features = [
   "thread_rng",
 ] }

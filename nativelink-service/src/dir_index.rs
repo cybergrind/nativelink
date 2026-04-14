@@ -116,6 +116,63 @@ pub fn try_decode_directory(blob: &[u8]) -> Option<Vec<DirChild>> {
     Some(children)
 }
 
+/// Redis-backed writer that records Directory proto children so the
+/// scheduler can walk dir chains without re-decoding blobs from CAS.
+///
+/// The writer is best-effort: if Redis is unavailable, the record is
+/// silently dropped — the walk will fall back to decoding Directory
+/// protos from CAS directly.
+#[derive(Debug)]
+pub struct DirIndexWriter {
+    redis_client: redis::Client,
+}
+
+impl DirIndexWriter {
+    /// `url` is a Redis connection string (e.g. `redis://127.0.0.1:6379`).
+    pub fn new(url: &str) -> Result<Self, redis::RedisError> {
+        let redis_client = redis::Client::open(url)?;
+        Ok(Self { redis_client })
+    }
+
+    /// Build the Redis HASH key for a directory with the given digest hash
+    /// and size. Keys are namespaced `nativelink:dir_index:` so they don't
+    /// collide with other uses.
+    pub fn key_for(digest_hex: &str, size: i64) -> String {
+        format!("nativelink:dir_index:{digest_hex}-{size}")
+    }
+
+    /// Build the (field, value) pairs to write for a given set of
+    /// children. Pure function — no I/O — used both for real writes and
+    /// for testing the encoding.
+    pub fn build_field_values(children: &[DirChild]) -> Vec<(String, String)> {
+        children
+            .iter()
+            .map(|c| (c.name().to_string(), c.to_redis_value()))
+            .collect()
+    }
+
+    /// Record a directory's children in Redis. Best-effort: on any Redis
+    /// error we return `Ok(())` after logging, so a transient Redis
+    /// outage does not break the CAS upload path.
+    pub fn record_directory(&self, digest_hex: &str, size: i64, children: &[DirChild]) {
+        if children.is_empty() {
+            return;
+        }
+        let key = Self::key_for(digest_hex, size);
+        let pairs = Self::build_field_values(children);
+
+        let Ok(mut conn) = self.redis_client.get_connection() else {
+            return;
+        };
+        let mut cmd = redis::cmd("HSET");
+        cmd.arg(&key);
+        for (field, value) in &pairs {
+            cmd.arg(field).arg(value);
+        }
+        drop(cmd.query::<i64>(&mut conn));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +333,54 @@ mod tests {
             target: "A".to_string(),
         };
         assert_eq!(c.to_redis_value(), "symlink|A");
+    }
+
+    #[test]
+    fn dir_index_writer_key_format() {
+        assert_eq!(
+            DirIndexWriter::key_for("abc123", 42),
+            "nativelink:dir_index:abc123-42"
+        );
+    }
+
+    #[test]
+    fn dir_index_writer_build_field_values_mixed() {
+        let children = vec![
+            DirChild::File {
+                name: "cmath".to_string(),
+                digest_hex: "aaa".to_string(),
+                size: 10,
+            },
+            DirChild::Dir {
+                name: "subdir".to_string(),
+                digest_hex: "bbb".to_string(),
+                size: 20,
+            },
+            DirChild::Symlink {
+                name: "link".to_string(),
+                target: "cmath".to_string(),
+            },
+        ];
+        let pairs = DirIndexWriter::build_field_values(&children);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], ("cmath".to_string(), "file|aaa-10".to_string()));
+        assert_eq!(pairs[1], ("subdir".to_string(), "dir|bbb-20".to_string()));
+        assert_eq!(pairs[2], ("link".to_string(), "symlink|cmath".to_string()));
+    }
+
+    #[test]
+    fn dir_index_writer_build_empty() {
+        let pairs = DirIndexWriter::build_field_values(&[]);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn dir_index_writer_can_be_created_with_valid_url() {
+        assert!(DirIndexWriter::new("redis://127.0.0.1:6379").is_ok());
+    }
+
+    #[test]
+    fn dir_index_writer_rejects_invalid_url() {
+        assert!(DirIndexWriter::new("not-a-url").is_err());
     }
 }
