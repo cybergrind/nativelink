@@ -324,7 +324,7 @@ impl SimpleScheduler {
             .err_tip(|| "Failed to get queued operations in do_try_match")?;
 
         let query_elapsed = start.elapsed();
-        if query_elapsed > Duration::from_secs(1) {
+        if query_elapsed > SLOW_QUERY_WARN_THRESHOLD {
             warn!(
                 elapsed_ms = query_elapsed.as_millis(),
                 "Slow get_queued_operations query"
@@ -375,7 +375,7 @@ impl SimpleScheduler {
         }
 
         let total_elapsed = start.elapsed();
-        if total_elapsed > Duration::from_secs(5) {
+        if total_elapsed > SLOW_CYCLE_WARN_THRESHOLD {
             warn!(
                 total_ms = total_elapsed.as_millis(),
                 query_ms = query_elapsed.as_millis(),
@@ -384,6 +384,39 @@ impl SimpleScheduler {
         }
 
         result
+    }
+}
+
+/// Tail-latency early-warning thresholds for the scheduler match path.
+/// 100ms catches the dispatch-imbalance regression documented in report
+/// #07: a healthy run stays under 20ms for the cycle; reports #06/#07
+/// showed spikes climbing 3ms → 300ms → 1047ms when the bug fires.
+/// Emitting a `warn!` as soon as any sample crosses 100ms surfaces the
+/// regression within one cycle instead of requiring a bisection campaign.
+const SLOW_QUERY_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+const SLOW_CYCLE_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+mod slow_threshold_tests {
+    use super::*;
+
+    /// Pins the early-warning thresholds to 100ms so future edits don't
+    /// silently relax them back to the old 1s/5s values that masked the
+    /// dispatch-imbalance bug for weeks. If the scheduler genuinely
+    /// needs higher tolerance in production, change these deliberately
+    /// and update this test.
+    #[test]
+    fn slow_thresholds_are_at_100ms() {
+        assert_eq!(
+            SLOW_QUERY_WARN_THRESHOLD,
+            Duration::from_millis(100),
+            "slow get_queued_operations warn must fire at 100ms"
+        );
+        assert_eq!(
+            SLOW_CYCLE_WARN_THRESHOLD,
+            Duration::from_millis(100),
+            "slow do_try_match cycle warn must fire at 100ms"
+        );
     }
 }
 
