@@ -27,6 +27,17 @@ struct RedisPool {
     pool: Mutex<VecDeque<redis::Connection>>,
 }
 
+// Redis pool instrumentation: pool_hit means we reused an existing
+// connection (cheap). pool_miss_new_conn means we opened a new TCP
+// connection (syscall heavy: socket() + connect() + 3-way handshake,
+// plus pressure on macOS ephemeral port range). If new_conn count is
+// large, the pool capacity is undersized or contention is draining it
+// faster than callers return them.
+static REDIS_POOL_HIT: StageStats =
+    StageStats::new("worker.redis_pool.hit");
+static REDIS_POOL_NEW_CONN: StageStats =
+    StageStats::new("worker.redis_pool.new_conn");
+
 impl RedisPool {
     fn new(client: redis::Client) -> Self {
         Self {
@@ -39,8 +50,10 @@ impl RedisPool {
     /// empty. Returns `None` if connection-open fails.
     fn take(&self) -> Option<redis::Connection> {
         if let Some(c) = self.pool.lock().pop_front() {
+            REDIS_POOL_HIT.incr();
             return Some(c);
         }
+        REDIS_POOL_NEW_CONN.incr();
         self.client.get_connection().ok()
     }
 
@@ -172,24 +185,50 @@ impl RedisWalkedDirs {
     }
 }
 
+// Timing harness: instrument every Redis round-trip so the dump reveals
+// whether Plan L is the sys-CPU hotspot under a busy build. Splits:
+//   walked_dirs.l1_hit   — L1 HashSet hit (no syscalls).
+//   walked_dirs.l1_miss  — L1 miss, fell through to Redis.
+//   walked_dirs.redis_sismember — wall time of SISMEMBER (Redis RTT +
+//                                 pool lock + sync I/O).
+//   walked_dirs.redis_sadd      — wall time of SADD.
+// A scheduler-host seeing high sys CPU while `walked_dirs.redis_*` count
+// is high → Plan L's Redis round-trips dominate. If `l1_hit` hugely
+// outnumbers `l1_miss` but the sums are still large, the L1 check is
+// still worth it but Redis is an unavoidable cost.
+use nativelink_util::timing::StageStats;
+
+static WALKED_DIRS_L1_HIT: StageStats =
+    StageStats::new("worker.walked_dirs.l1_hit");
+static WALKED_DIRS_L1_MISS: StageStats =
+    StageStats::new("worker.walked_dirs.l1_miss");
+static WALKED_DIRS_REDIS_SISMEMBER: StageStats =
+    StageStats::new("worker.walked_dirs.redis_sismember");
+static WALKED_DIRS_REDIS_SADD: StageStats =
+    StageStats::new("worker.walked_dirs.redis_sadd");
+
 impl WalkedDirsProvider for RedisWalkedDirs {
     fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool {
         let key = (directory_path.to_string(), *digest);
         if self.l1.lock().contains(&key) {
+            WALKED_DIRS_L1_HIT.incr();
             return true;
         }
+        WALKED_DIRS_L1_MISS.incr();
 
         let member = format!("{}|{}", directory_path, Self::digest_to_member(digest));
-        let result: bool = self
-            .pool
-            .with_conn(|conn| {
-                redis::cmd("SISMEMBER")
-                    .arg(&self.redis_key)
-                    .arg(&member)
-                    .query::<bool>(conn)
-            })
-            .and_then(Result::ok)
-            .unwrap_or(false);
+        let result: bool = {
+            let _t = WALKED_DIRS_REDIS_SISMEMBER.timer();
+            self.pool
+                .with_conn(|conn| {
+                    redis::cmd("SISMEMBER")
+                        .arg(&self.redis_key)
+                        .arg(&member)
+                        .query::<bool>(conn)
+                })
+                .and_then(Result::ok)
+                .unwrap_or(false)
+        };
 
         if result {
             self.l1.lock().insert(key);
@@ -201,6 +240,7 @@ impl WalkedDirsProvider for RedisWalkedDirs {
         self.l1.lock().insert((directory_path.to_string(), digest));
 
         let member = format!("{}|{}", directory_path, Self::digest_to_member(&digest));
+        let _t = WALKED_DIRS_REDIS_SADD.timer();
         drop(self.pool.with_conn(|conn| {
             redis::cmd("SADD")
                 .arg(&self.redis_key)

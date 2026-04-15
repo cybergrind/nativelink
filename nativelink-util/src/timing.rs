@@ -168,9 +168,48 @@ pub fn snapshot_all() -> Vec<StageSnapshot> {
     v.iter().map(|s| s.snapshot()).collect()
 }
 
+/// Process-level user/sys CPU time (Unix only, reads `getrusage`).
+/// On non-Unix (Windows), returns zeros — the CPU-split diagnostic is
+/// Unix-targeted. Used by [`dump_to_tracing`] to emit a `timing:cpu`
+/// line each period showing `user_ms` and `sys_ms` deltas. A high
+/// `sys_ms` share relative to `user_ms` points at syscall-heavy work
+/// (Redis RTTs, process fork/exec, mutex contention) rather than
+/// CPU-bound user code.
+#[must_use]
+pub fn process_cpu_times() -> (Duration, Duration) {
+    #[cfg(unix)]
+    {
+        // SAFETY: getrusage with RUSAGE_SELF and a valid rusage pointer
+        // is always safe on Unix; failure is indicated via return value.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
+        if rc != 0 {
+            return (Duration::ZERO, Duration::ZERO);
+        }
+        let user = Duration::from_secs(ru.ru_utime.tv_sec as u64)
+            + Duration::from_micros(ru.ru_utime.tv_usec as u64);
+        let sys = Duration::from_secs(ru.ru_stime.tv_sec as u64)
+            + Duration::from_micros(ru.ru_stime.tv_usec as u64);
+        (user, sys)
+    }
+    #[cfg(not(unix))]
+    {
+        (Duration::ZERO, Duration::ZERO)
+    }
+}
+
+static LAST_CPU_SAMPLE: Mutex<Option<(Duration, Duration, Instant)>> =
+    Mutex::new(None);
+
 /// Log a sorted dump of every registered stage's cumulative stats at INFO
 /// level. Sorted by `total_ns` descending so the biggest time sinks come
 /// first. Counter-only stages (`total_ns == 0`) appear at the bottom.
+///
+/// Also emits a `timing:cpu` line with the `user_ms` / `sys_ms` delta
+/// since the last dump plus the derived `sys_pct` — the single clearest
+/// signal of whether the process is syscall-bound. If `sys_pct > 50`,
+/// the stages with the highest `total_ms` are probably doing blocking
+/// I/O / locking / fork-exec rather than CPU-bound work.
 pub fn dump_to_tracing() {
     let mut snaps = snapshot_all();
     snaps.sort_by_key(|s| std::cmp::Reverse(s.total_ns));
@@ -191,6 +230,30 @@ pub fn dump_to_tracing() {
                 "timing:counter"
             );
         }
+    }
+
+    let (user, sys) = process_cpu_times();
+    let now = Instant::now();
+    if let Ok(mut slot) = LAST_CPU_SAMPLE.lock() {
+        if let Some((prev_user, prev_sys, prev_t)) = *slot {
+            let user_delta = user.saturating_sub(prev_user);
+            let sys_delta = sys.saturating_sub(prev_sys);
+            let wall_delta = now.saturating_duration_since(prev_t);
+            let total_ms = (user_delta + sys_delta).as_millis() as u64;
+            let sys_pct = if total_ms > 0 {
+                (sys_delta.as_millis() as u64 * 100) / total_ms
+            } else {
+                0
+            };
+            tracing::info!(
+                user_ms = user_delta.as_millis() as u64,
+                sys_ms = sys_delta.as_millis() as u64,
+                wall_ms = wall_delta.as_millis() as u64,
+                sys_pct,
+                "timing:cpu"
+            );
+        }
+        *slot = Some((user, sys, now));
     }
 }
 
@@ -242,6 +305,28 @@ mod tests {
         assert_eq!(s.total_ns, 0);
         assert_eq!(s.max_ns, 0);
         assert_eq!(s.mean_ns, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_cpu_times_increases_after_busy_work() {
+        let (u0, s0) = process_cpu_times();
+        // Burn user CPU in a tight loop.
+        let mut acc: u64 = 0;
+        for i in 0..5_000_000u64 {
+            acc = acc.wrapping_add(i.wrapping_mul(0x9E3779B97F4A7C15));
+        }
+        std::hint::black_box(acc);
+        let (u1, s1) = process_cpu_times();
+        assert!(
+            u1 >= u0,
+            "user time must not decrease; u0={u0:?} u1={u1:?}"
+        );
+        assert!(s1 >= s0, "sys time must not decrease");
+        assert!(
+            u1 > u0,
+            "busy loop must produce measurable user-time delta; u0={u0:?} u1={u1:?}"
+        );
     }
 
     static TEST_REGISTRY_A: StageStats = StageStats::new("test.registry.a");
