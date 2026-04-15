@@ -32,7 +32,7 @@ use nativelink_util::platform_properties::PlatformProperties;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use tokio::sync::Notify;
 use tonic::async_trait;
-use nativelink_util::timing::StageStats;
+use nativelink_util::timing::{StageStats, dyn_counter_incr};
 use tracing::{error, info, trace, warn};
 
 static FIND_WORKER: StageStats = StageStats::new("scheduler.find_worker_for_action");
@@ -535,6 +535,23 @@ impl ApiWorkerScheduler {
         self.metrics
             .actions_dispatched
             .fetch_add(1, Ordering::Relaxed);
+
+        // Per-machine dispatch counter: surface routing imbalance without
+        // needing to grep logs. `WorkerId` is formatted as
+        // `{machine_id}{uuid_v6_hyphenated}` (36-char suffix); strip it
+        // to recover the machine_id the operator chose (e.g. an IP).
+        let worker_id_str = worker_id.to_string();
+        let machine_id = if worker_id_str.len() > 36 {
+            &worker_id_str[..worker_id_str.len() - 36]
+        } else {
+            worker_id_str.as_str()
+        };
+        dyn_counter_incr(&format!("scheduler.dispatch.to.{machine_id}"));
+        tracing::info!(
+            %machine_id,
+            %operation_id,
+            "scheduler: dispatching action to worker"
+        );
 
         let mut inner = self.inner.lock().await;
         inner

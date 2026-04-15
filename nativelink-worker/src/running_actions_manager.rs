@@ -2272,13 +2272,26 @@ impl RunningActionsManagerImpl {
             ),
         };
 
-        // Periodic timing dump: every 30s, log a sorted summary of every
-        // registered stage's cumulative stats (count / total_ms / mean_us /
-        // max_ms). Sorted by total_ms descending so the biggest time sinks
-        // are immediately visible. Grep for "timing:stage" / "timing:counter"
-        // in the worker log. Lives for the whole process lifetime.
-        tokio::spawn(async {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+        // Periodic timing dump: log a sorted summary of every registered
+        // stage's cumulative stats (count / total_ms / mean_us / max_ms),
+        // a process user/sys CPU split, and per-dispatch counters. Sorted
+        // by total_ms descending so the biggest time sinks are immediately
+        // visible. Grep for "timing:stage" / "timing:counter" / "timing:cpu"
+        // in the worker log. Interval defaults to 5s so that short
+        // benchmark runs (e.g. a 30s hot rebuild) produce multiple
+        // samples; override via `NATIVELINK_TIMING_DUMP_INTERVAL_SECS`
+        // (clamped to [1, 3600]). Lives for the whole process lifetime.
+        let dump_secs = std::env::var("NATIVELINK_TIMING_DUMP_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.clamp(1, 3600))
+            .unwrap_or(5);
+        info!(
+            dump_interval_secs = dump_secs,
+            "timing harness: periodic dump scheduled"
+        );
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(dump_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the first immediate tick so the first dump isn't empty.
             interval.tick().await;

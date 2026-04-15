@@ -159,6 +159,41 @@ pub struct StageSnapshot {
 
 static REGISTRY: Mutex<Vec<&'static StageStats>> = Mutex::new(Vec::new());
 
+/// Dynamic-name counter registry. Used when the stage name is only known
+/// at runtime (e.g. per-worker dispatch counters like
+/// `scheduler.dispatch.to.192.168.88.133`). Names leak into a static slab
+/// via `Box::leak` so they satisfy the `&'static str` requirement of
+/// `StageStats`. Leak is bounded — stages are cardinality-controlled by
+/// the caller (one entry per worker machine, typically ≤ 10).
+static DYN_COUNTERS: Mutex<Vec<&'static StageStats>> = Mutex::new(Vec::new());
+
+/// Look up or lazily create a `StageStats` for `name` and increment it.
+/// First call for a given name leaks the name and an allocated
+/// `StageStats` (one-time per distinct name); subsequent calls reuse the
+/// leaked static. Intended for per-worker / per-target counters whose
+/// names come from runtime data.
+pub fn dyn_counter_incr(name: &str) {
+    // Fast path: scan the dynamic registry for an existing match.
+    if let Ok(list) = DYN_COUNTERS.lock() {
+        if let Some(stats) = list.iter().find(|s| s.name() == name) {
+            stats.incr();
+            return;
+        }
+    }
+    // Slow path: allocate + leak a fresh stage, insert, increment.
+    let leaked_name: &'static str = Box::leak(name.to_string().into_boxed_str());
+    let leaked: &'static StageStats = Box::leak(Box::new(StageStats::new(leaked_name)));
+    if let Ok(mut list) = DYN_COUNTERS.lock() {
+        // Recheck in case another caller raced us.
+        if let Some(existing) = list.iter().find(|s| s.name() == name) {
+            existing.incr();
+            return;
+        }
+        list.push(leaked);
+    }
+    leaked.incr();
+}
+
 /// Collect a snapshot of every stage that has been touched at least once.
 #[must_use]
 pub fn snapshot_all() -> Vec<StageSnapshot> {
@@ -327,6 +362,24 @@ mod tests {
             u1 > u0,
             "busy loop must produce measurable user-time delta; u0={u0:?} u1={u1:?}"
         );
+    }
+
+    #[test]
+    fn dyn_counter_registers_and_accumulates() {
+        dyn_counter_incr("test.dyn.alpha");
+        dyn_counter_incr("test.dyn.alpha");
+        dyn_counter_incr("test.dyn.beta");
+        let snaps = snapshot_all();
+        let alpha = snaps
+            .iter()
+            .find(|s| s.name == "test.dyn.alpha")
+            .expect("alpha not registered");
+        let beta = snaps
+            .iter()
+            .find(|s| s.name == "test.dyn.beta")
+            .expect("beta not registered");
+        assert_eq!(alpha.count, 2, "alpha count");
+        assert_eq!(beta.count, 1, "beta count");
     }
 
     static TEST_REGISTRY_A: StageStats = StageStats::new("test.registry.a");
