@@ -33,6 +33,13 @@ use nativelink_util::operation_state_manager::{
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::spawn;
+use nativelink_util::timing::StageStats;
+
+static DO_TRY_MATCH_CYCLE: StageStats = StageStats::new("scheduler.do_try_match.cycle");
+static MATCH_ACTION_TO_WORKER: StageStats =
+    StageStats::new("scheduler.match_action_to_worker");
+static GET_QUEUED_OPERATIONS: StageStats =
+    StageStats::new("scheduler.get_queued_operations");
 use nativelink_util::task::JoinHandleDropGuard;
 use opentelemetry::KeyValue;
 use opentelemetry::baggage::BaggageExt;
@@ -198,6 +205,7 @@ impl SimpleScheduler {
     }
 
     async fn get_queued_operations(&self) -> Result<ActionStateResultStream<'_>, Error> {
+        let _t = GET_QUEUED_OPERATIONS.timer();
         let filter = OperationFilter {
             stages: OperationStageFlags::Queued,
             order_by_priority_direction: Some(OrderDirection::Desc),
@@ -217,6 +225,7 @@ impl SimpleScheduler {
     // can create a map of capabilities of each worker and then try and match
     // the actions to the worker using the map lookup (ie. map reduce).
     async fn do_try_match(&self, full_worker_logging: bool) -> Result<(), Error> {
+        let _cycle_timer = DO_TRY_MATCH_CYCLE.timer();
         async fn match_action_to_worker(
             action_state_result: &dyn ActionStateResult,
             workers: &ApiWorkerScheduler,
@@ -224,6 +233,7 @@ impl SimpleScheduler {
             platform_property_manager: &PlatformPropertyManager,
             full_worker_logging: bool,
         ) -> Result<(), Error> {
+            let _t = MATCH_ACTION_TO_WORKER.timer();
             let (action_info, maybe_origin_metadata) =
                 action_state_result
                     .as_action_info()

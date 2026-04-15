@@ -32,7 +32,11 @@ use nativelink_util::platform_properties::PlatformProperties;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use tokio::sync::Notify;
 use tonic::async_trait;
+use nativelink_util::timing::StageStats;
 use tracing::{error, info, trace, warn};
+
+static FIND_WORKER: StageStats = StageStats::new("scheduler.find_worker_for_action");
+static WORKER_NOTIFY_RUN: StageStats = StageStats::new("scheduler.worker_notify_run_action");
 
 /// Metrics for tracking scheduler performance.
 #[derive(Debug, Default)]
@@ -527,6 +531,7 @@ impl ApiWorkerScheduler {
         operation_id: OperationId,
         action_info: ActionInfoWithProps,
     ) -> Result<(), Error> {
+        let _t = WORKER_NOTIFY_RUN.timer();
         self.metrics
             .actions_dispatched
             .fetch_add(1, Ordering::Relaxed);
@@ -552,6 +557,7 @@ impl ApiWorkerScheduler {
         platform_properties: &PlatformProperties,
         full_worker_logging: bool,
     ) -> Option<WorkerId> {
+        let _t = FIND_WORKER.timer();
         let start = Instant::now();
         self.metrics
             .find_worker_calls

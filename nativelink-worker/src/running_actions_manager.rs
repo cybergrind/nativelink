@@ -67,7 +67,26 @@ use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
+use nativelink_util::timing::StageStats;
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
+
+// Timing harness: stages exposed via `nativelink_util::timing::dump_to_tracing()`.
+// Instrumented from the hottest paths in `prepare_action_inputs` →
+// `download_to_directory` so the dump surfaces which part of input
+// materialization dominates per-action latency (Directory proto fetch
+// vs. CAS content fetch vs. hardlink vs. cache lookup).
+static PREPARE_INPUTS: StageStats = StageStats::new("worker.prepare_action_inputs");
+static DIR_WALK: StageStats = StageStats::new("worker.download_to_directory.subtree");
+static DIR_PROTO_FETCH: StageStats =
+    StageStats::new("worker.download_to_directory.directory_proto_fetch");
+static CAS_POPULATE: StageStats = StageStats::new("worker.cas.populate_fast_store");
+static HARD_LINK: StageStats = StageStats::new("worker.fs.hard_link");
+static PLAN_K_HIT: StageStats = StageStats::new("worker.plan_k.hit");
+static PLAN_K_MISS: StageStats = StageStats::new("worker.plan_k.miss");
+static PLAN_L_HIT: StageStats = StageStats::new("worker.plan_l.hit");
+static PLAN_L_MISS: StageStats = StageStats::new("worker.plan_l.miss");
+static ACTION_EXECUTE: StageStats = StageStats::new("worker.action_execute");
+static UPLOAD_RESULTS: StageStats = StageStats::new("worker.upload_results");
 use parking_lot::Mutex;
 use prost::Message;
 use relative_path::RelativePath;
@@ -130,11 +149,13 @@ pub fn download_to_directory<'a>(
     path_digest_cache: &'a crate::path_digest_cache::PathDigestCache,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
+        let _walk_timer = DIR_WALK.timer();
         // Plan L (path-aware): if this Directory subtree has been fully walked
         // into THIS specific target path before, skip the walk. The path is
         // part of the cache key so walking digest D into path A does not imply
         // D was walked into path B (fixes cross-machine false positives).
         if path_digest_cache.dir_walked(current_directory, digest) {
+            PLAN_L_HIT.incr();
             trace!(
                 ?digest,
                 current_directory,
@@ -142,10 +163,14 @@ pub fn download_to_directory<'a>(
             );
             return Ok(());
         }
+        PLAN_L_MISS.incr();
 
-        let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
-            .await
-            .err_tip(|| "Converting digest to Directory")?;
+        let directory = {
+            let _t = DIR_PROTO_FETCH.timer();
+            get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
+                .await
+                .err_tip(|| "Converting digest to Directory")?
+        };
         let mut futures = FuturesUnordered::new();
 
         for file in directory.files {
@@ -169,10 +194,10 @@ pub fn download_to_directory<'a>(
                     // Plan K: cache-first. If this (path, digest) pair is already
                     // known, skip all filesystem work.
                     if path_digest_cache.contains(&dest_path_for_cache, &digest) {
+                        PLAN_K_HIT.incr();
                         return Ok::<(), Error>(());
                     }
-                    // Diagnostic: log every file that is NOT in Plan K cache.
-                    // This means we're actually checking/fetching it.
+                    PLAN_K_MISS.incr();
                     trace!(
                         dest = %dest,
                         ?digest,
@@ -189,11 +214,13 @@ pub fn download_to_directory<'a>(
                     // On Plan K miss, always go to CAS.
                     {
                         info!(dest = %dest, ?digest, "CAS fetch — Plan K miss, downloading from CAS");
-                        // Original CAS path.
-                        cas_store
-                            .populate_fast_store(digest.into())
-                            .await
-                            .map_err(|e| e.append(format!("populate_fast_store for digest {digest}")))?;
+                        {
+                            let _t = CAS_POPULATE.timer();
+                            cas_store
+                                .populate_fast_store(digest.into())
+                                .await
+                                .map_err(|e| e.append(format!("populate_fast_store for digest {digest}")))?;
+                        }
                         if is_zero_digest(digest) {
                             let mut file_slot = fs::create_file(&dest).await?;
                             file_slot.write_all(&[]).await?;
@@ -205,6 +232,7 @@ pub fn download_to_directory<'a>(
                             let src_path = file_entry
                                 .get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) })
                                 .await?;
+                            let _t = HARD_LINK.timer();
                             match fs::hard_link(&src_path, &dest).await {
                                 Ok(()) => {}
                                 Err(e)
@@ -366,6 +394,7 @@ pub async fn prepare_action_inputs(
     hint_root: Option<PathBuf>,
     path_digest_cache: &crate::path_digest_cache::PathDigestCache,
 ) -> Result<(), Error> {
+    let _t = PREPARE_INPUTS.timer();
     // Architectural contract: every call walks the input tree. Missing
     // files are fetched from CAS; Plan K (path_digest_cache) and Plan L
     // (walked_dirs) handle the fast path so the walk is cheap on rebuilds.
@@ -1073,6 +1102,7 @@ impl RunningActionImpl {
     }
 
     async fn inner_execute(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+        let _t = ACTION_EXECUTE.timer();
         let (command_proto, mut kill_channel_rx) = {
             let mut state = self.state.lock();
             state.execution_metadata.execution_start_timestamp =
@@ -1360,6 +1390,7 @@ impl RunningActionImpl {
     }
 
     async fn inner_upload_results(self: Arc<Self>) -> Result<Arc<Self>, Error> {
+        let _t = UPLOAD_RESULTS.timer();
         enum OutputType {
             None,
             File(FileInfo),
@@ -2240,6 +2271,22 @@ impl RunningActionsManagerImpl {
                 },
             ),
         };
+
+        // Periodic timing dump: every 30s, log a sorted summary of every
+        // registered stage's cumulative stats (count / total_ms / mean_us /
+        // max_ms). Sorted by total_ms descending so the biggest time sinks
+        // are immediately visible. Grep for "timing:stage" / "timing:counter"
+        // in the worker log. Lives for the whole process lifetime.
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the first immediate tick so the first dump isn't empty.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                nativelink_util::timing::dump_to_tracing();
+            }
+        });
 
         Ok(this)
     }
