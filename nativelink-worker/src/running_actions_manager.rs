@@ -80,7 +80,10 @@ static DIR_WALK: StageStats = StageStats::new("worker.download_to_directory.subt
 static DIR_PROTO_FETCH: StageStats =
     StageStats::new("worker.download_to_directory.directory_proto_fetch");
 static CAS_POPULATE: StageStats = StageStats::new("worker.cas.populate_fast_store");
-static HARD_LINK: StageStats = StageStats::new("worker.fs.hard_link");
+// Despite the name: on macOS this is APFS clonefile() via
+// nativelink_util::fs::hard_link, which tries clonefile first and only
+// falls back to hard_link on cross-volume / unsupported errors.
+static HARD_LINK: StageStats = StageStats::new("worker.fs.clonefile_or_link");
 static PLAN_K_HIT: StageStats = StageStats::new("worker.plan_k.hit");
 static PLAN_K_MISS: StageStats = StageStats::new("worker.plan_k.miss");
 static PLAN_L_HIT: StageStats = StageStats::new("worker.plan_l.hit");

@@ -19,6 +19,7 @@ pub mod chunked_stream;
 pub mod common;
 pub mod connection_manager;
 pub mod digest_hasher;
+pub mod digest_lru;
 pub mod evicting_map;
 pub mod fastcdc;
 pub mod fs;
