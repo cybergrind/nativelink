@@ -65,9 +65,9 @@ mod tests {
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
     use nativelink_util::store_trait::{Store, StoreLike};
     use nativelink_worker::running_actions_manager::{
-        Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
-        RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
-        prepare_action_inputs,
+        Callbacks, ExecutionConfiguration, ProjectRoot, RunningAction, RunningActionImpl,
+        RunningActionsManager, RunningActionsManagerArgs, RunningActionsManagerImpl,
+        download_to_directory, prepare_action_inputs,
     };
     use nativelink_worker::path_digest_cache::PathDigestCache;
     use pretty_assertions::assert_eq;
@@ -855,6 +855,7 @@ mod tests {
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -982,6 +983,7 @@ mod tests {
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1111,6 +1113,7 @@ mod tests {
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1296,6 +1299,7 @@ mod tests {
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1482,6 +1486,7 @@ mod tests {
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1694,6 +1699,7 @@ mod tests {
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1833,6 +1839,7 @@ mod tests {
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2040,6 +2047,7 @@ exit 0
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2220,6 +2228,7 @@ exit 0
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2394,6 +2403,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2482,6 +2492,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2561,6 +2572,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2646,6 +2658,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2752,6 +2765,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2802,6 +2816,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2874,6 +2889,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2997,6 +3013,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3088,6 +3105,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3179,6 +3197,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3267,6 +3286,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3423,6 +3443,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3596,6 +3617,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3700,6 +3722,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3818,6 +3841,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4002,6 +4026,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4126,6 +4151,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         // Create a simple action
@@ -4271,6 +4297,7 @@ exit 1
                 shared_walked_dirs_redis_url: None,
                 machine_id: String::new(),
                 shared_tree_path: None,
+                project_root: None,
             })?);
 
         // Create a simple action
@@ -4354,6 +4381,339 @@ exit 1
         if let Ok(action2) = result {
             action2.cleanup().await?;
         }
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    // ---- project_root integration tests (Plan J: work_directory) ----
+    //
+    // These assert on the `work_directory` computed by `RunningActionImpl`
+    // at `create_and_add_action` time — no `prepare_action` is called, so
+    // the tests don't need the translated absolute path to actually exist
+    // on disk. They pin the translation at the Plan J call site; Plan I
+    // (hint_root) is covered by a separate test below.
+
+    // Helper: build + upload an Action whose platform properties carry
+    // the given entries, and return the StartExecute that references it.
+    async fn build_start_execute_with_platform(
+        cas_store: &Arc<FastSlowStore>,
+        platform_properties: Vec<(&str, &str)>,
+    ) -> Result<(StartExecute, Option<Platform>), Error> {
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let platform = if platform_properties.is_empty() {
+            None
+        } else {
+            Some(Platform {
+                properties: platform_properties
+                    .into_iter()
+                    .map(|(n, v)| Property {
+                        name: n.into(),
+                        value: v.into(),
+                    })
+                    .collect(),
+            })
+        };
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            platform: platform.clone(),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+        Ok((
+            StartExecute {
+                execute_request: Some(execute_request),
+                operation_id,
+                queued_timestamp: Some(make_system_time(0).into()),
+                platform: platform.clone(),
+                worker_id: "test-worker".to_string(),
+            },
+            platform,
+        ))
+    }
+
+    // Plan J call site at running_actions_manager.rs:~969. With
+    // `project_root` set and an action carrying an in_action-prefixed
+    // InputRootAbsolutePath, the worker must rewrite it onto on_disk.
+    #[nativelink_test]
+    async fn project_root_rewrites_work_directory() -> Result<(), Box<dyn core::error::Error>> {
+        let (_, _, cas_store, _ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let project_root = ProjectRoot {
+            in_action: "/Users/octo/devel/proj".to_string(),
+            on_disk: "/Users/general/devel/proj".to_string(),
+        };
+        let mgr = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory: root_action_directory.clone(),
+            execution_configuration: ExecutionConfiguration::default(),
+            cas_store: cas_store.clone(),
+            ac_store: None,
+            historical_store: Store::new(cas_store.clone()),
+            upload_action_result_config:
+                &nativelink_config::cas_server::UploadActionResultConfig {
+                    upload_ac_results_strategy:
+                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+            timeout_handled_externally: false,
+            directory_cache: None,
+            shared_walked_dirs_redis_url: None,
+            machine_id: String::new(),
+            shared_tree_path: None,
+            project_root: Some(project_root),
+        })?);
+
+        let (start_execute, _) = build_start_execute_with_platform(
+            &cas_store,
+            vec![(
+                "InputRootAbsolutePath",
+                "/Users/octo/devel/proj/src/out/Mac",
+            )],
+        )
+        .await?;
+        let action = mgr
+            .clone()
+            .create_and_add_action("worker".to_string(), start_execute)
+            .await?;
+
+        assert_eq!(
+            action.get_work_directory(),
+            "/Users/general/devel/proj/src/out/Mac",
+        );
+        // We never called prepare_action, so no `/Users/general/...`
+        // directory was created. Clean up just the root_action_directory.
+        action.cleanup().await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    // With `project_root = None`, the raw InputRootAbsolutePath must be
+    // used verbatim (legacy / `.132`-`.133` behavior).
+    #[nativelink_test]
+    async fn project_root_unset_preserves_work_directory()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, _, cas_store, _ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let mgr = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory: root_action_directory.clone(),
+            execution_configuration: ExecutionConfiguration::default(),
+            cas_store: cas_store.clone(),
+            ac_store: None,
+            historical_store: Store::new(cas_store.clone()),
+            upload_action_result_config:
+                &nativelink_config::cas_server::UploadActionResultConfig {
+                    upload_ac_results_strategy:
+                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+            timeout_handled_externally: false,
+            directory_cache: None,
+            shared_walked_dirs_redis_url: None,
+            machine_id: String::new(),
+            shared_tree_path: None,
+            project_root: None,
+        })?);
+
+        let (start_execute, _) = build_start_execute_with_platform(
+            &cas_store,
+            vec![("InputRootAbsolutePath", "/Users/octo/devel/proj/src")],
+        )
+        .await?;
+        let action = mgr
+            .clone()
+            .create_and_add_action("worker".to_string(), start_execute)
+            .await?;
+
+        assert_eq!(action.get_work_directory(), "/Users/octo/devel/proj/src");
+        action.cleanup().await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    // Plan I call site at running_actions_manager.rs:~1038. Same
+    // translation as Plan J, but consumed as the hardlink-hint root
+    // passed into `prepare_action_inputs`. Observed via
+    // `RunningActionImpl::hint_root()`.
+    #[nativelink_test]
+    async fn project_root_rewrites_hint_root() -> Result<(), Box<dyn core::error::Error>> {
+        use std::path::Path;
+
+        let (_, _, cas_store, _ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let project_root = ProjectRoot {
+            in_action: "/Users/octo/devel/proj".to_string(),
+            on_disk: "/Users/general/devel/proj".to_string(),
+        };
+        let mgr = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory: root_action_directory.clone(),
+            execution_configuration: ExecutionConfiguration::default(),
+            cas_store: cas_store.clone(),
+            ac_store: None,
+            historical_store: Store::new(cas_store.clone()),
+            upload_action_result_config:
+                &nativelink_config::cas_server::UploadActionResultConfig {
+                    upload_ac_results_strategy:
+                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+            timeout_handled_externally: false,
+            directory_cache: None,
+            shared_walked_dirs_redis_url: None,
+            machine_id: String::new(),
+            shared_tree_path: None,
+            project_root: Some(project_root),
+        })?);
+
+        let (start_execute, _) = build_start_execute_with_platform(
+            &cas_store,
+            vec![(
+                "InputRootAbsolutePath",
+                "/Users/octo/devel/proj/src/out/Mac",
+            )],
+        )
+        .await?;
+        let action = mgr
+            .clone()
+            .create_and_add_action("worker".to_string(), start_execute)
+            .await?;
+
+        assert_eq!(
+            action.hint_root(),
+            Some(Path::new("/Users/general/devel/proj/src/out/Mac")),
+        );
+        action.cleanup().await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    // hint_root must be None when InputRootAbsolutePath is absent,
+    // regardless of project_root config. Otherwise Plan I would try to
+    // hardlink-check against a bogus path.
+    #[nativelink_test]
+    async fn hint_root_is_none_without_platform_property()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, _, cas_store, _ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let project_root = ProjectRoot {
+            in_action: "/Users/octo/devel/proj".to_string(),
+            on_disk: "/Users/general/devel/proj".to_string(),
+        };
+        let mgr = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory: root_action_directory.clone(),
+            execution_configuration: ExecutionConfiguration::default(),
+            cas_store: cas_store.clone(),
+            ac_store: None,
+            historical_store: Store::new(cas_store.clone()),
+            upload_action_result_config:
+                &nativelink_config::cas_server::UploadActionResultConfig {
+                    upload_ac_results_strategy:
+                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+            timeout_handled_externally: false,
+            directory_cache: None,
+            shared_walked_dirs_redis_url: None,
+            machine_id: String::new(),
+            shared_tree_path: None,
+            project_root: Some(project_root),
+        })?);
+
+        let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;
+        let action = mgr
+            .clone()
+            .create_and_add_action("worker".to_string(), start_execute)
+            .await?;
+        assert_eq!(action.hint_root(), None);
+        action.cleanup().await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    // Without the InputRootAbsolutePath platform property at all, the
+    // Plan J fallback (`{action_directory}/work`) must remain intact
+    // even when `project_root` is set. This is the path any action
+    // without siso's input-root hint follows.
+    #[nativelink_test]
+    async fn no_platform_property_falls_back_to_action_directory_work()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, _, cas_store, _ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let project_root = ProjectRoot {
+            in_action: "/Users/octo/devel/proj".to_string(),
+            on_disk: "/Users/general/devel/proj".to_string(),
+        };
+        let mgr = Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory: root_action_directory.clone(),
+            execution_configuration: ExecutionConfiguration::default(),
+            cas_store: cas_store.clone(),
+            ac_store: None,
+            historical_store: Store::new(cas_store.clone()),
+            upload_action_result_config:
+                &nativelink_config::cas_server::UploadActionResultConfig {
+                    upload_ac_results_strategy:
+                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                    ..Default::default()
+                },
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+            timeout_handled_externally: false,
+            directory_cache: None,
+            shared_walked_dirs_redis_url: None,
+            machine_id: String::new(),
+            shared_tree_path: None,
+            project_root: Some(project_root),
+        })?);
+
+        let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;
+        let operation_id = start_execute.operation_id.clone();
+        let action = mgr
+            .clone()
+            .create_and_add_action("worker".to_string(), start_execute)
+            .await?;
+
+        let expected = format!("{root_action_directory}/{operation_id}/work");
+        assert_eq!(action.get_work_directory(), &expected);
+        action.cleanup().await?;
         fs::remove_dir_all(&root_action_directory).await?;
         Ok(())
     }

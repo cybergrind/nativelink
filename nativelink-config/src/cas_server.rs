@@ -901,6 +901,47 @@ pub struct LocalWorkerConfig {
     /// The Redis key becomes `nativelink:walked_dirs:{machine_id}`.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub machine_id: String,
+
+    /// Optional per-worker remap of the action-borne
+    /// `InputRootAbsolutePath` platform property onto this worker's
+    /// local filesystem. When an action arrives tagged with an absolute
+    /// path under `in_action`, the worker substitutes `on_disk` for
+    /// that prefix before using the result as `work_directory` and as
+    /// the Plan I hardlink-hint root.
+    ///
+    /// Use case: off-tree workers (e.g. a Mac running under a user
+    /// account whose home directory differs from the scheduler host's),
+    /// which need their own on-disk layout without disturbing actions
+    /// generated elsewhere in the cluster.
+    ///
+    /// When unset (the default), the raw path from the platform
+    /// property is used directly — identical to pre-remap behavior, so
+    /// workers that share the origin's layout need no config change.
+    ///
+    /// The remap is purely a worker-local on-disk substitution; it
+    /// never flows into the action digest, Redis keys, or output-sync
+    /// broadcasts.
+    #[serde(default)]
+    pub project_root: Option<ProjectRoot>,
+}
+
+/// Per-worker path remap for the action-borne `InputRootAbsolutePath`.
+/// When both fields are equal (or the struct is absent), rewrite is a
+/// no-op. See `LocalWorkerConfig::project_root`.
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct ProjectRoot {
+    /// Absolute path prefix as it appears on actions arriving from the
+    /// scheduler — typically the siso / action-origin host's local
+    /// path. Matched at a path boundary.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub in_action: String,
+
+    /// Absolute path prefix on this worker's local filesystem. The
+    /// worker substitutes this for `in_action` before using the path.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub on_disk: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

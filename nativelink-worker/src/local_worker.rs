@@ -621,6 +621,7 @@ pub async fn new_local_worker(
                     }
                     _ => None,
                 }),
+            project_root: config.project_root.clone(),
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),

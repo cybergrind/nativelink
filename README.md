@@ -85,7 +85,10 @@ Client (siso) uploads blob via ByteStream.Write
 
 - **Shared-tree execution**: `work_directory` is set to `InputRootAbsolutePath`
   from the action's platform properties. All actions share one filesystem view.
-  Hermetic isolation is traded for throughput.
+  Hermetic isolation is traded for throughput. A per-worker `project_root`
+  remap is available for workers whose local on-disk layout differs from the
+  path advertised by the action origin (e.g. off-tree Macs running under a
+  different user account) — see the config reference below.
 
 - **APFS clonefile**: `fs::hard_link` calls `clonefile(2)` first on macOS,
   eliminating shared-inode lock contention that serialized parallel
@@ -180,6 +183,7 @@ new config field:
 | `workers[].local.shared_walked_dirs_redis_url` | Worker | For CAS journal | Redis URL for drain + worker_state updates |
 | `workers[].local.machine_id` | Worker | With Redis | Machine identifier — **must equal `name`** and must match the value used across Redis keys for this worker |
 | `workers[].local.name` | Worker | With Redis | Worker name prefix — **must equal `machine_id`** (scheduler strips a 36-char UUID suffix to recover `machine_id`) |
+| `workers[].local.project_root` | Worker | Optional | `{ in_action, on_disk }` path remap for workers whose local tree path differs from the action-borne `InputRootAbsolutePath`. Unset → identity (same path on worker and in action). |
 
 **All three `*_redis_url` values must point to the same Redis instance.**
 
@@ -191,8 +195,8 @@ speed up repeated actions within a single worker process.
 
 ### Pre-staging the source tree
 
-Each worker must have the source tree at the exact path specified in
-`InputRootAbsolutePath`:
+Each worker must have the source tree on disk. By default the on-disk path
+must match `InputRootAbsolutePath` exactly:
 
 ```bash
 rsync -av --delete \
@@ -201,6 +205,22 @@ rsync -av --delete \
 ```
 
 Re-sync after any `gclient sync` or source change on the controller.
+
+Workers that can't use the advertised path (e.g. a worker running under a
+different user whose home directory differs) set `project_root` in their
+worker config to remap the prefix — the tree on disk can live anywhere,
+as long as `on_disk` points at it:
+
+```json5
+project_root: {
+  in_action: "/Users/octo/devel/chromium-distributed-compile",
+  on_disk:   "/Users/general/devel/chromium-distributed-compile",
+},
+```
+
+The remap is applied at action entry; the action's digest and any Redis
+keys are unaffected, so workers with different `project_root` values can
+safely share a cluster.
 
 ### macOS-specific setup
 

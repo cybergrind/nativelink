@@ -186,12 +186,57 @@ RPUSHes missing `(path, digest)` entries to `pending_outputs:{machine_id}`.
 }
 ```
 
+### Step 6a (optional) — Off-tree worker with `project_root` remap
+
+If a worker runs under a different user account or otherwise cannot place
+the source tree at the exact path siso advertises on actions, set
+`project_root` to remap the prefix. The on-disk tree can then live
+anywhere, and the worker itself does the translation at action entry.
+
+```json5
+{
+  workers: [{
+    local: {
+      name: "192.168.88.166",
+      worker_api_endpoint: { uri: "grpc://127.0.0.1:50061" },    // tunneled
+      max_action_timeout: 7200,
+      cas_fast_slow_store: "CAS_STORE",
+      work_directory: "/Users/general/devel/chromium-distributed-compile/remote/mac-data/work",
+      platform_properties: {
+        OSFamily: { values: ["darwin"] },
+        ISA: { values: ["aarch64"] },
+        // Advertise "" to keep the worker assignable regardless of the
+        // action's InputRootAbsolutePath value; the remap below handles
+        // the path translation on the worker side.
+        InputRootAbsolutePath: { values: [""] },
+      },
+
+      shared_walked_dirs_redis_url: "redis://127.0.0.1:6379",   // tunneled
+      machine_id: "192.168.88.166",
+
+      // Off-tree remap: actions advertise /Users/octo/... paths; this
+      // worker lives under /Users/general/... instead.
+      project_root: {
+        in_action: "/Users/octo/devel/chromium-distributed-compile",
+        on_disk:   "/Users/general/devel/chromium-distributed-compile",
+      },
+    }
+  }]
+}
+```
+
+The remap applies only to this worker's `work_directory` and Plan I
+hardlink-hint root. The action digest, Redis keys, and output-sync
+broadcasts are unaffected, so `.132`/`.133` (which leave `project_root`
+unset) do not need to be restarted or reconfigured.
+
 ---
 
 ## Step 7 — Pre-stage the source tree on each worker
 
 Before any build, every worker must have a byte-identical copy of the source
-tree at `InputRootAbsolutePath`:
+tree at `InputRootAbsolutePath` — or at `project_root.on_disk` if the
+worker sets a remap (see Step 6a):
 
 ```bash
 # From the controller (.132):

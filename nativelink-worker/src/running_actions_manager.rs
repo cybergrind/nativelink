@@ -946,6 +946,12 @@ pub struct RunningActionImpl {
     operation_id: OperationId,
     action_directory: String,
     work_directory: String,
+    // Derived once at construction from the action's
+    // `InputRootAbsolutePath` platform property (if any), run through
+    // the worker's `project_root` remap. Consumed by Plan I inside
+    // `inner_prepare_action` — stored here so tests can observe it and
+    // so `::new` owns the sole call to `translate_input_root_path`.
+    hint_root: Option<PathBuf>,
     action_info: ActionInfo,
     timeout: Duration,
     running_actions_manager: Arc<RunningActionsManagerImpl>,
@@ -964,19 +970,31 @@ impl RunningActionImpl {
         running_actions_manager: Arc<RunningActionsManagerImpl>,
     ) -> Self {
         // Plan J: if the action carries an InputRootAbsolutePath platform
-        // property, use that path as the work directory directly. All actions
-        // share one filesystem view — like local `ninja -j20`.
-        let work_directory = action_info
+        // property, translate it through the worker's `project_root` (if
+        // configured) and use that as the work directory. Plan I reuses
+        // the same translated path as its hardlink-hint root. When the
+        // property is absent or empty the Plan J fallback of
+        // `action_directory/work` kicks in.
+        let translated_input_root: Option<String> = action_info
             .platform_properties
             .get("InputRootAbsolutePath")
             .filter(|v| !v.is_empty())
-            .cloned()
+            .map(|v| {
+                translate_input_root_path(
+                    v,
+                    running_actions_manager.project_root.as_ref(),
+                )
+            });
+        let work_directory = translated_input_root
+            .clone()
             .unwrap_or_else(|| format!("{}/{}", action_directory, "work"));
+        let hint_root: Option<PathBuf> = translated_input_root.map(PathBuf::from);
         let (kill_channel_tx, kill_channel_rx) = oneshot::channel();
         Self {
             operation_id,
             action_directory,
             work_directory,
+            hint_root,
             action_info,
             timeout,
             running_actions_manager,
@@ -994,6 +1012,16 @@ impl RunningActionImpl {
             // Only needs to be cleaned up after a prepare_action call, set there.
             did_cleanup: AtomicBool::new(true),
         }
+    }
+
+    /// The Plan I hardlink-hint root, as derived from the action's
+    /// `InputRootAbsolutePath` platform property and rewritten through
+    /// the worker's `project_root` remap. `None` when the property is
+    /// absent or empty. Exposed so tests can assert that Plan I's path
+    /// derivation went through the remap; production code reads
+    /// `self.hint_root` directly.
+    pub fn hint_root(&self) -> Option<&Path> {
+        self.hint_root.as_deref()
     }
 
     #[allow(
@@ -1035,12 +1063,6 @@ impl RunningActionImpl {
                     .await
                     .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
                 self.did_cleanup.store(false, Ordering::Release);
-                let hint_root: Option<PathBuf> = self
-                    .action_info
-                    .platform_properties
-                    .get("InputRootAbsolutePath")
-                    .filter(|v| !v.is_empty())
-                    .map(PathBuf::from);
                 self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -1049,7 +1071,7 @@ impl RunningActionImpl {
                         filesystem_store_pin,
                         &self.action_info.input_root_digest,
                         &self.work_directory,
-                        hint_root,
+                        self.hint_root.clone(),
                         &self.running_actions_manager.path_digest_cache,
                     ))
                     .await
@@ -2137,6 +2159,53 @@ impl UploadActionResults {
     }
 }
 
+pub use nativelink_config::cas_server::ProjectRoot;
+
+/// Translate an absolute path carried by an action's
+/// `InputRootAbsolutePath` platform property onto the local filesystem,
+/// according to `project_root`. Returns the path to be used by the
+/// worker for `work_directory` / `hint_root`.
+///
+/// Contract (documented exhaustively by unit tests in this module):
+///
+/// * `project_root = None` → identity (legacy behavior).
+/// * `raw.is_empty()` → identity (preserves the Plan J
+///   `action_directory/work` fallback at the call site).
+/// * `raw.starts_with(in_action)` **at a path boundary** → returns
+///   `on_disk + raw[in_action.len()..]`. "At a path boundary" means
+///   `raw == in_action` or `raw[in_action.len()] == '/'`; it prevents
+///   false-matches like `/Users/octoOther` matching `/Users/octo`.
+/// * `in_action` equal to `on_disk` → identity (symmetric config for
+///   workers that share the origin's filesystem layout, e.g. `.132`).
+/// * `raw` does not start with `in_action` (after trailing-slash
+///   normalization) → identity; unrelated paths are left untouched.
+///
+/// The helper is a pure string operation; it performs no I/O and does
+/// not canonicalize (the inputs are expected to be already-absolute
+/// paths as advertised by siso).
+#[must_use]
+pub fn translate_input_root_path(raw: &str, project_root: Option<&ProjectRoot>) -> String {
+    let Some(pr) = project_root else {
+        return raw.to_string();
+    };
+    if raw.is_empty() {
+        return raw.to_string();
+    }
+    // Normalize trailing slash on `in_action` so operators can enter
+    // the path in either form. `on_disk` keeps its form — whatever
+    // trailing shape it has will appear at the start of the result.
+    let in_action = pr.in_action.strip_suffix('/').unwrap_or(&pr.in_action);
+    // Match at a path boundary: `raw == in_action`, or `raw[len] == '/'`.
+    // This rejects `/Users/octoOther` matching `/Users/octo`.
+    if let Some(suffix) = raw.strip_prefix(in_action) {
+        if suffix.is_empty() || suffix.starts_with('/') {
+            let on_disk = pr.on_disk.strip_suffix('/').unwrap_or(&pr.on_disk);
+            return format!("{on_disk}{suffix}");
+        }
+    }
+    raw.to_string()
+}
+
 #[derive(Debug)]
 pub struct RunningActionsManagerArgs<'a> {
     pub root_action_directory: String,
@@ -2161,6 +2230,11 @@ pub struct RunningActionsManagerArgs<'a> {
     /// on local disk even when no remote action is dispatched here —
     /// required for siso-local link/SOLINK steps on the scheduler machine.
     pub shared_tree_path: Option<String>,
+    /// Per-worker remap of action-borne `InputRootAbsolutePath` onto the
+    /// local filesystem. `None` (the default) preserves legacy behavior
+    /// — the raw absolute path from the platform property is used
+    /// directly for `work_directory` and `hint_root`.
+    pub project_root: Option<ProjectRoot>,
 }
 
 struct CleanupGuard {
@@ -2212,6 +2286,10 @@ pub struct RunningActionsManagerImpl {
     /// that verified (path, digest) pairs and walked Directory subtrees are
     /// remembered for subsequent actions.
     path_digest_cache: Arc<crate::path_digest_cache::PathDigestCache>,
+    /// Optional remap of action-borne `InputRootAbsolutePath` onto the
+    /// local filesystem. Consulted at `work_directory` / `hint_root`
+    /// derivation sites (Plan J / Plan I). `None` → identity.
+    project_root: Option<ProjectRoot>,
 }
 
 impl RunningActionsManagerImpl {
@@ -2256,6 +2334,7 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
+            project_root: args.project_root,
             path_digest_cache: Arc::new(
                 if let Some(ref redis_url) = args.shared_walked_dirs_redis_url {
                     let machine_id = if args.machine_id.is_empty() {
@@ -2690,4 +2769,90 @@ pub struct Metrics {
     upload_stderr: AsyncCounterWrapper,
     #[metric(help = "Total number of task timeouts.")]
     task_timeouts: CounterWithTime,
+}
+
+// Unit tests for `translate_input_root_path`. These nail the contract
+// down before the helper does anything — they run against the identity
+// stub and most will fail until the green-phase rewrite lands.
+#[cfg(test)]
+mod translate_input_root_tests {
+    use super::{ProjectRoot, translate_input_root_path};
+
+    fn pr(in_action: &str, on_disk: &str) -> ProjectRoot {
+        ProjectRoot {
+            in_action: in_action.to_string(),
+            on_disk: on_disk.to_string(),
+        }
+    }
+
+    #[test]
+    fn project_root_none_is_identity() {
+        let got = translate_input_root_path("/Users/octo/devel/proj/src", None);
+        assert_eq!(got, "/Users/octo/devel/proj/src");
+    }
+
+    // Plan J's call site treats an empty platform-property value as
+    // "no hint" and falls back to `action_directory/work`. The helper
+    // must preserve that by returning empty unchanged.
+    #[test]
+    fn empty_raw_is_identity() {
+        let pr = pr("/Users/octo/devel/proj", "/Users/general/devel/proj");
+        assert_eq!(translate_input_root_path("", Some(&pr)), "");
+    }
+
+    #[test]
+    fn matching_prefix_is_rewritten() {
+        let pr = pr("/Users/octo/devel/proj", "/Users/general/devel/proj");
+        let got = translate_input_root_path("/Users/octo/devel/proj/src/out/Mac", Some(&pr));
+        assert_eq!(got, "/Users/general/devel/proj/src/out/Mac");
+    }
+
+    // `.132`/`.133` case: worker declares in_action == on_disk.
+    // Rewrite must be observationally identity.
+    #[test]
+    fn identity_config_is_noop() {
+        let pr = pr("/Users/octo/devel/proj", "/Users/octo/devel/proj");
+        let got = translate_input_root_path("/Users/octo/devel/proj/src", Some(&pr));
+        assert_eq!(got, "/Users/octo/devel/proj/src");
+    }
+
+    #[test]
+    fn non_matching_path_is_identity() {
+        let pr = pr("/Users/octo/devel/proj", "/Users/general/devel/proj");
+        let got = translate_input_root_path("/tmp/unrelated/path", Some(&pr));
+        assert_eq!(got, "/tmp/unrelated/path");
+    }
+
+    #[test]
+    fn exact_prefix_match_yields_on_disk() {
+        let pr = pr("/Users/octo/devel/proj", "/Users/general/devel/proj");
+        let got = translate_input_root_path("/Users/octo/devel/proj", Some(&pr));
+        assert_eq!(got, "/Users/general/devel/proj");
+    }
+
+    // Prefix must match at a path boundary — `/Users/octo` must NOT
+    // match a path starting with `/Users/octoOther/...`.
+    #[test]
+    fn prefix_boundary_prevents_false_match() {
+        let pr = pr("/Users/octo", "/Users/general");
+        let got = translate_input_root_path("/Users/octoOther/file", Some(&pr));
+        assert_eq!(got, "/Users/octoOther/file");
+    }
+
+    // Config fields may be entered with or without a trailing slash;
+    // normalize so both forms produce the same translation.
+    #[test]
+    fn trailing_slash_in_in_action_is_normalized() {
+        let pr_slash = pr("/Users/octo/devel/proj/", "/Users/general/devel/proj");
+        let pr_noslash = pr("/Users/octo/devel/proj", "/Users/general/devel/proj");
+        let raw = "/Users/octo/devel/proj/src";
+        assert_eq!(
+            translate_input_root_path(raw, Some(&pr_slash)),
+            translate_input_root_path(raw, Some(&pr_noslash)),
+        );
+        assert_eq!(
+            translate_input_root_path(raw, Some(&pr_slash)),
+            "/Users/general/devel/proj/src",
+        );
+    }
 }
