@@ -1,3 +1,17 @@
+---
+name: Local Remote Execution (disabled)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "lre.yaml is intentionally disabled; original content preserved below as comments."'
+
+# Original workflow content (disabled upstream in 7c02e589):
+
 # ---
 # name: Local Remote Execution
 
