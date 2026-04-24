@@ -19,19 +19,12 @@ concurrency:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14
-            target: aarch64-apple-darwin
-          - runner: macos-13
-            target: x86_64-apple-darwin
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    name: aarch64-apple-darwin
+    runs-on: macos-14
     timeout-minutes: 60
     env:
       PROFILE: ${{ github.event.inputs.profile || 'release' }}
+      TARGET: aarch64-apple-darwin
     steps:
       - name: Checkout
         uses: >- # v4.2.2
@@ -41,43 +34,43 @@ jobs:
         run: |
           rustup update stable
           rustup default stable
-          rustup target add ${{ matrix.target }}
+          rustup target add "$TARGET"
         shell: bash
 
       - name: Rust cache
         # https://github.com/Swatinem/rust-cache/releases/tag/v2.8.1
         uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
         with:
-          key: ${{ matrix.target }}-${{ env.PROFILE }}
+          key: ${{ env.TARGET }}-${{ env.PROFILE }}
 
       - name: Build nativelink
-        run: cargo build --bin nativelink --profile "$PROFILE" --target ${{ matrix.target }}
+        run: cargo build --bin nativelink --profile "$PROFILE" --target "$TARGET"
 
       - name: Stage artifact
         id: stage
         run: |
           set -euo pipefail
           case "$PROFILE" in
-            release) out_dir="target/${{ matrix.target }}/release" ;;
-            smol)    out_dir="target/${{ matrix.target }}/smol" ;;
-            *)       out_dir="target/${{ matrix.target }}/$PROFILE" ;;
+            release) out_dir="target/$TARGET/release" ;;
+            smol)    out_dir="target/$TARGET/smol" ;;
+            *)       out_dir="target/$TARGET/$PROFILE" ;;
           esac
           bin="$out_dir/nativelink"
           test -x "$bin"
           codesign -s - -f "$bin"
-          stage="stage/nativelink-${{ matrix.target }}"
+          stage="stage/nativelink-$TARGET"
           mkdir -p "$stage"
           cp "$bin" "$stage/"
-          ( cd stage && tar -czf "nativelink-${{ matrix.target }}.tar.gz" "nativelink-${{ matrix.target }}" )
-          shasum -a 256 "stage/nativelink-${{ matrix.target }}.tar.gz" > "stage/nativelink-${{ matrix.target }}.tar.gz.sha256"
-          echo "archive=stage/nativelink-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=stage/nativelink-${{ matrix.target }}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          ( cd stage && tar -czf "nativelink-$TARGET.tar.gz" "nativelink-$TARGET" )
+          shasum -a 256 "stage/nativelink-$TARGET.tar.gz" > "stage/nativelink-$TARGET.tar.gz.sha256"
+          echo "archive=stage/nativelink-$TARGET.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=stage/nativelink-$TARGET.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         # https://github.com/actions/upload-artifact/releases/tag/v4.4.3
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
         with:
-          name: nativelink-${{ matrix.target }}
+          name: nativelink-aarch64-apple-darwin
           path: |
             ${{ steps.stage.outputs.archive }}
             ${{ steps.stage.outputs.checksum }}
