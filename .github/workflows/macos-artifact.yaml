@@ -1,0 +1,85 @@
+---
+name: macOS Artifact
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Cargo profile (release | smol)'
+        required: false
+        default: 'release'
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      PROFILE: ${{ github.event.inputs.profile || 'release' }}
+    steps:
+      - name: Checkout
+        uses: >- # v4.2.2
+          actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+        shell: bash
+
+      - name: Rust cache
+        # https://github.com/Swatinem/rust-cache/releases/tag/v2.8.1
+        uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          key: ${{ matrix.target }}-${{ env.PROFILE }}
+
+      - name: Build nativelink
+        run: cargo build --bin nativelink --profile "$PROFILE" --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        id: stage
+        run: |
+          set -euo pipefail
+          case "$PROFILE" in
+            release) out_dir="target/${{ matrix.target }}/release" ;;
+            smol)    out_dir="target/${{ matrix.target }}/smol" ;;
+            *)       out_dir="target/${{ matrix.target }}/$PROFILE" ;;
+          esac
+          bin="$out_dir/nativelink"
+          test -x "$bin"
+          codesign -s - -f "$bin"
+          stage="stage/nativelink-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "$bin" "$stage/"
+          ( cd stage && tar -czf "nativelink-${{ matrix.target }}.tar.gz" "nativelink-${{ matrix.target }}" )
+          shasum -a 256 "stage/nativelink-${{ matrix.target }}.tar.gz" > "stage/nativelink-${{ matrix.target }}.tar.gz.sha256"
+          echo "archive=stage/nativelink-${{ matrix.target }}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=stage/nativelink-${{ matrix.target }}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        # https://github.com/actions/upload-artifact/releases/tag/v4.4.3
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: nativelink-${{ matrix.target }}
+          path: |
+            ${{ steps.stage.outputs.archive }}
+            ${{ steps.stage.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 14
