@@ -107,6 +107,15 @@ Client (siso) uploads blob via ByteStream.Write
   Combined with the scheduler-side dedup, this means the journal only lists
   files the worker actually needs to fetch.
 
+- **Plan I (digest-checked hint link, opt-in)**: legacy Plan I was disabled
+  because it size-matched only and silently substituted same-size/different-
+  content files. The opt-in `experimental_digest_checked_hint_link`
+  re-enables the hardlink-from-pre-staged-tree fast path with a streaming
+  hash check against the action's digest function. Correctness-preserving:
+  any miss (size, content, missing, I/O) falls through to the existing CAS
+  path. Primary win is for off-LAN / tunnel-bound workers where local
+  hashing is orders of magnitude cheaper than a CAS round-trip.
+
 ## Target use case
 
 - Chromium (or similar large C++ project) builds on macOS via
@@ -184,6 +193,7 @@ new config field:
 | `workers[].local.machine_id` | Worker | With Redis | Machine identifier — **must equal `name`** and must match the value used across Redis keys for this worker |
 | `workers[].local.name` | Worker | With Redis | Worker name prefix — **must equal `machine_id`** (scheduler strips a 36-char UUID suffix to recover `machine_id`) |
 | `workers[].local.project_root` | Worker | Optional | `{ in_action, on_disk }` path remap for workers whose local tree path differs from the action-borne `InputRootAbsolutePath`. Unset → identity (same path on worker and in action). |
+| `workers[].local.experimental_digest_checked_hint_link` | Worker | Optional | Re-enable Plan I (hardlink-from-pre-staged-tree) with per-file digest verification. On Plan K miss the worker stream-hashes the on-disk file at `hint_root/<name>` with the action's digest function and only short-circuits CAS on a full `(path, digest)` match. Misses (size, content, missing, I/O) fall through to CAS unchanged. Default `false`. Off-LAN workers where CAS is tunnel-bound are the primary use case — local hashing is orders of magnitude cheaper than the network round-trip. |
 
 **All three `*_redis_url` values must point to the same Redis instance.**
 

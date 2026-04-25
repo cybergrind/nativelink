@@ -235,6 +235,7 @@ mod tests {
                 &download_dir,
                 None,
                 &PathDigestCache::new(),
+                false,
             )
             .await?;
             download_dir
@@ -342,6 +343,7 @@ mod tests {
                 &download_dir,
                 None,
                 &PathDigestCache::new(),
+                false,
             )
             .await?;
             download_dir
@@ -418,6 +420,7 @@ mod tests {
                 &download_dir,
                 None,
                 &PathDigestCache::new(),
+                false,
             )
             .await?;
             download_dir
@@ -493,6 +496,7 @@ mod tests {
             &dir_a,
             None,
             &cache,
+            false,
         )
         .await?;
         assert_eq!(
@@ -514,6 +518,7 @@ mod tests {
             &dir_b,
             None,
             &cache,
+            false,
         )
         .await?;
 
@@ -606,6 +611,7 @@ mod tests {
             &download_dir,
             None,
             &PathDigestCache::new(),
+            false,
         )
         .await?;
 
@@ -621,6 +627,242 @@ mod tests {
             "EEXIST on file1 must not prevent file2 from being downloaded"
         );
 
+        Ok(())
+    }
+
+    /// Helper for the digest-checked Plan I tests: compute the SHA-256
+    /// `DigestInfo` for a chunk of bytes so the on-disk file's hash matches
+    /// what's stored in the Directory proto (and slow store).
+    fn sha256_digest(content: &[u8]) -> DigestInfo {
+        let mut hasher = DigestHasherFunc::Sha256.hasher();
+        DigestHasher::update(&mut hasher, content);
+        DigestHasher::finalize_digest(&mut hasher)
+    }
+
+    /// Plan I — flag ON, hint file matches digest: download_to_directory
+    /// must short-circuit the CAS fetch and hardlink from `hint_root`.
+    /// Proven by leaving slow_store empty for the digest: the only way the
+    /// action can succeed is if the hint path is consulted.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn download_to_directory_plan_i_hint_hit_short_circuits_cas(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "header.h";
+        const CONTENT: &[u8] = b"// pre-staged on disk; CAS does not have this digest";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        let file_digest = sha256_digest(CONTENT);
+        // Slow store has the Directory proto but NOT the file digest.
+        let root_digest = DigestInfo::new([0xA1u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        // Pre-stage the file at hint_root. dest is a separate dir to make
+        // the hardlink observable as a separate operation from the on-disk
+        // setup.
+        let hint_dir = make_temp_path("plan_i_hint");
+        let dest_dir = make_temp_path("plan_i_dest");
+        fs::create_dir_all(&hint_dir).await?;
+        fs::create_dir_all(&dest_dir).await?;
+        tokio::fs::write(format!("{hint_dir}/{FILE_NAME}"), CONTENT).await?;
+
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &dest_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &PathDigestCache::new(),
+            true, // digest_checked_hint_link
+        )
+        .await?;
+
+        let dest_content = fs::read(format!("{dest_dir}/{FILE_NAME}")).await?;
+        assert_eq!(
+            dest_content, CONTENT,
+            "Plan I hint hit must place matching content at dest without CAS"
+        );
+        Ok(())
+    }
+
+    /// Plan I — flag OFF: hint must be ignored entirely. Same setup as
+    /// the hit test above (slow_store missing the digest), but with the
+    /// flag off the action MUST fail because nothing else can resolve the
+    /// digest. Locks in that the flag actually gates the new behavior.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn download_to_directory_plan_i_flag_off_ignores_hint(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "header.h";
+        const CONTENT: &[u8] = b"// pre-staged on disk; CAS does not have this digest";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let file_digest = sha256_digest(CONTENT);
+        let root_digest = DigestInfo::new([0xA2u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        let hint_dir = make_temp_path("plan_i_off_hint");
+        let dest_dir = make_temp_path("plan_i_off_dest");
+        fs::create_dir_all(&hint_dir).await?;
+        fs::create_dir_all(&dest_dir).await?;
+        tokio::fs::write(format!("{hint_dir}/{FILE_NAME}"), CONTENT).await?;
+
+        let res = download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &dest_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &PathDigestCache::new(),
+            false, // digest_checked_hint_link disabled
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "with flag off, hint must be ignored — CAS lookup must fail"
+        );
+        Ok(())
+    }
+
+    /// Plan I — same-size/different-content collision: this is the bug
+    /// that got the original Plan I disabled. With digest-checked Plan I,
+    /// the wrong on-disk file MUST be rejected and the CAS path MUST take
+    /// over, delivering the correct content to dest.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn download_to_directory_plan_i_content_mismatch_falls_through_to_cas(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "header.h";
+        const STALE: &[u8] = b"// stale: previous tag's content"; // 32 bytes
+        const FRESH: &[u8] = b"// fresh: this tag's content!!!!"; // 32 bytes — same length
+        assert_eq!(STALE.len(), FRESH.len());
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+        // CAS holds the FRESH content under its real digest.
+        let fresh_digest = sha256_digest(FRESH);
+        slow_store
+            .as_ref()
+            .update_oneshot(fresh_digest, FRESH.into())
+            .await?;
+        let root_digest = DigestInfo::new([0xA3u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(fresh_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        let hint_dir = make_temp_path("plan_i_collision_hint");
+        let dest_dir = make_temp_path("plan_i_collision_dest");
+        fs::create_dir_all(&hint_dir).await?;
+        fs::create_dir_all(&dest_dir).await?;
+        // Plant the STALE content at hint_root — same size as FRESH, but
+        // different bytes.
+        tokio::fs::write(format!("{hint_dir}/{FILE_NAME}"), STALE).await?;
+
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &dest_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &PathDigestCache::new(),
+            true,
+        )
+        .await?;
+
+        let dest_content = fs::read(format!("{dest_dir}/{FILE_NAME}")).await?;
+        assert_eq!(
+            dest_content, FRESH,
+            "Plan I MUST reject same-size/different-content stale file and CAS-fetch the fresh one"
+        );
+        Ok(())
+    }
+
+    /// Plan I — hint absent: with no pre-staged file at hint, falls through
+    /// to CAS unchanged. Same outcome as flag-off, except the digest IS in
+    /// CAS so the action succeeds.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn download_to_directory_plan_i_hint_absent_falls_through_to_cas(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "header.h";
+        const CONTENT: &[u8] = b"// only in CAS, hint dir is empty";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let file_digest = sha256_digest(CONTENT);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, CONTENT.into())
+            .await?;
+        let root_digest = DigestInfo::new([0xA4u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        let hint_dir = make_temp_path("plan_i_absent_hint");
+        let dest_dir = make_temp_path("plan_i_absent_dest");
+        fs::create_dir_all(&hint_dir).await?;
+        fs::create_dir_all(&dest_dir).await?;
+        // hint_dir is empty — no file at hint_dir/FILE_NAME.
+
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &dest_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &PathDigestCache::new(),
+            true,
+        )
+        .await?;
+
+        let dest_content = fs::read(format!("{dest_dir}/{FILE_NAME}")).await?;
+        assert_eq!(
+            dest_content, CONTENT,
+            "absent hint must fall through to CAS"
+        );
         Ok(())
     }
 
@@ -680,6 +922,7 @@ mod tests {
             &work_dir,
             Some(PathBuf::from(&work_dir)),
             &PathDigestCache::new(),
+            false,
         )
         .await?;
 
@@ -737,6 +980,7 @@ mod tests {
             &work_dir,
             None,
             &PathDigestCache::new(),
+            false,
         )
         .await?;
 
@@ -856,6 +1100,7 @@ mod tests {
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -984,6 +1229,7 @@ mod tests {
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1114,6 +1360,7 @@ mod tests {
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1300,6 +1547,7 @@ mod tests {
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1487,6 +1735,7 @@ mod tests {
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1700,6 +1949,7 @@ mod tests {
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1840,6 +2090,7 @@ mod tests {
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2048,6 +2299,7 @@ exit 0
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2229,6 +2481,7 @@ exit 0
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2404,6 +2657,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2493,6 +2747,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2573,6 +2828,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2659,6 +2915,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2766,6 +3023,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2817,6 +3075,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2890,6 +3149,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3014,6 +3274,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3106,6 +3367,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3198,6 +3460,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3287,6 +3550,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3444,6 +3708,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3618,6 +3883,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3723,6 +3989,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3842,6 +4109,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4027,6 +4295,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4152,6 +4421,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         // Create a simple action
@@ -4298,6 +4568,7 @@ exit 1
                 machine_id: String::new(),
                 shared_tree_path: None,
                 project_root: None,
+                digest_checked_hint_link: false,
             })?);
 
         // Create a simple action
@@ -4490,6 +4761,7 @@ exit 1
             machine_id: String::new(),
             shared_tree_path: None,
             project_root: Some(project_root),
+            digest_checked_hint_link: false,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -4544,6 +4816,7 @@ exit 1
             machine_id: String::new(),
             shared_tree_path: None,
             project_root: None,
+            digest_checked_hint_link: false,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -4598,6 +4871,7 @@ exit 1
             machine_id: String::new(),
             shared_tree_path: None,
             project_root: Some(project_root),
+            digest_checked_hint_link: false,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -4655,6 +4929,7 @@ exit 1
             machine_id: String::new(),
             shared_tree_path: None,
             project_root: Some(project_root),
+            digest_checked_hint_link: false,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;
@@ -4702,6 +4977,7 @@ exit 1
             machine_id: String::new(),
             shared_tree_path: None,
             project_root: Some(project_root),
+            digest_checked_hint_link: false,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;

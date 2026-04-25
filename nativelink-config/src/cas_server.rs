@@ -923,6 +923,24 @@ pub struct LocalWorkerConfig {
     /// broadcasts.
     #[serde(default)]
     pub project_root: Option<ProjectRoot>,
+
+    /// Experimental: re-enable Plan I (hint-path short-circuit) with a
+    /// per-file digest verification before hardlinking from the
+    /// pre-staged on-disk tree at `InputRootAbsolutePath`. The legacy
+    /// Plan I was disabled because it size-matched only and silently
+    /// substituted same-size/different-content files. This variant
+    /// stream-hashes the on-disk file with the action's digest function
+    /// and only short-circuits on a full `(path, digest)` match. Misses
+    /// fall through to the existing CAS path unchanged.
+    ///
+    /// Off by default. Turn on per-worker; primarily useful for off-LAN
+    /// workers where a CAS fetch is tunnel-bound and a local hash is
+    /// orders of magnitude cheaper than the network round-trip.
+    ///
+    /// Default: false (Plan I stays disabled, only Plan K's
+    /// `path_digest_cache` short-circuits)
+    #[serde(default)]
+    pub experimental_digest_checked_hint_link: bool,
 }
 
 /// Per-worker path remap for the action-borne `InputRootAbsolutePath`.

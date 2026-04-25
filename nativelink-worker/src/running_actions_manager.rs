@@ -88,6 +88,8 @@ static PLAN_K_HIT: StageStats = StageStats::new("worker.plan_k.hit");
 static PLAN_K_MISS: StageStats = StageStats::new("worker.plan_k.miss");
 static PLAN_L_HIT: StageStats = StageStats::new("worker.plan_l.hit");
 static PLAN_L_MISS: StageStats = StageStats::new("worker.plan_l.miss");
+static PLAN_I_HIT: StageStats = StageStats::new("worker.plan_i.hit");
+static PLAN_I_MISS: StageStats = StageStats::new("worker.plan_i.miss");
 static ACTION_EXECUTE: StageStats = StageStats::new("worker.action_execute");
 static UPLOAD_RESULTS: StageStats = StageStats::new("worker.upload_results");
 use parking_lot::Mutex;
@@ -150,6 +152,7 @@ pub fn download_to_directory<'a>(
     current_directory: &'a str,
     hint_root: Option<PathBuf>,
     path_digest_cache: &'a crate::path_digest_cache::PathDigestCache,
+    digest_checked_hint_link: bool,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
         let _walk_timer = DIR_WALK.timer();
@@ -192,6 +195,11 @@ pub fn download_to_directory<'a>(
                 unix_mode = Some(unix_mode.unwrap_or(0o444) | 0o111);
             }
             let dest_path_for_cache = PathBuf::from(&dest);
+            let plan_i_hint_path: Option<PathBuf> = if digest_checked_hint_link {
+                hint_root.as_ref().map(|root| root.join(&file.name))
+            } else {
+                None
+            };
             futures.push(
                 async move {
                     // Plan K: cache-first. If this (path, digest) pair is already
@@ -207,14 +215,120 @@ pub fn download_to_directory<'a>(
                         "Plan K miss — checking disk / fetching from CAS"
                     );
 
-                    // Plan J stat-hit and Plan I hint-link are DISABLED.
-                    // They checked only file size, not content hash. Same-size
-                    // different-content files (common for generated headers
-                    // that change between builds) were silently accepted,
-                    // causing build failures. Plan K is the only trusted
-                    // fast path — it checks full (path, digest).
+                    // Plan I (digest-checked hint link, opt-in): if a
+                    // pre-staged file lives at hint_root and its content
+                    // hashes to the expected digest, hardlink it to dest
+                    // and skip CAS. The legacy Plan I checked only size,
+                    // which silently accepted same-size/different-content
+                    // collisions; this variant uses the action's digest
+                    // function and is correctness-preserving — any miss
+                    // (size mismatch, content mismatch, missing file, I/O
+                    // error) falls through to the existing CAS path below.
+                    let plan_i_hit = if let Some(ref hint_path) = plan_i_hint_path {
+                        let hasher_func = opentelemetry::Context::current()
+                            .get::<DigestHasherFunc>()
+                            .map_or_else(
+                                nativelink_util::digest_hasher::default_digest_hasher_func,
+                                |v| *v,
+                            );
+                        if crate::file_digest_check::file_matches_digest(
+                            hint_path,
+                            &digest,
+                            hasher_func,
+                        )
+                        .await
+                        {
+                            // Hint matches. If hint_path == dest the file is
+                            // already where the action needs it; otherwise
+                            // hardlink hint → dest.
+                            let dest_pb = PathBuf::from(&dest);
+                            let link_ok = if hint_path == &dest_pb {
+                                true
+                            } else {
+                                let _t = HARD_LINK.timer();
+                                match fs::hard_link(hint_path, &dest).await {
+                                    Ok(()) => true,
+                                    Err(e)
+                                        if e.code == Code::AlreadyExists
+                                            || format!("{e:?}").contains("os error 17") =>
+                                    {
+                                        // Same digest already at dest — trust it.
+                                        true
+                                    }
+                                    Err(_) => {
+                                        // Cross-device / perms / etc. Never
+                                        // let Plan I block the action; fall
+                                        // through to CAS below.
+                                        false
+                                    }
+                                }
+                            };
+                            if link_ok {
+                                PLAN_I_HIT.incr();
+                                trace!(
+                                    dest = %dest,
+                                    hint = %hint_path.display(),
+                                    ?digest,
+                                    "Plan I: hint hit, hardlink-from-disk"
+                                );
+                                true
+                            } else {
+                                PLAN_I_MISS.incr();
+                                false
+                            }
+                        } else {
+                            PLAN_I_MISS.incr();
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if plan_i_hit {
+                        // Apply perms/mtime same as the CAS path so the
+                        // file presented to the action is identical either
+                        // way, then record in Plan K and return.
+                        #[cfg(target_family = "unix")]
+                        if let Some(unix_mode) = unix_mode {
+                            fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
+                                .await
+                                .err_tip(|| {
+                                    format!(
+                                        "Could not set unix mode in Plan I {dest}"
+                                    )
+                                })?;
+                        }
+                        if let Some(mtime) = mtime {
+                            let dest_for_mtime = dest.clone();
+                            spawn_blocking!("plan_i_set_mtime", move || {
+                                set_file_mtime(
+                                    &dest_for_mtime,
+                                    FileTime::from_unix_time(
+                                        mtime.seconds,
+                                        mtime.nanos as u32,
+                                    ),
+                                )
+                                .err_tip(|| {
+                                    format!(
+                                        "Failed to set mtime in Plan I {dest_for_mtime}"
+                                    )
+                                })
+                            })
+                            .await
+                            .err_tip(|| "Failed to launch spawn_blocking in Plan I")??;
+                        }
+                        path_digest_cache.insert(dest_path_for_cache, digest);
+                        return Ok::<(), Error>(());
+                    }
+
+                    // Plan J stat-hit is DISABLED. It checked only file
+                    // size, not content hash. Same-size/different-content
+                    // files (common for generated headers that change
+                    // between builds) were silently accepted, causing
+                    // build failures. Plan K is the only trusted fast
+                    // path — it checks full (path, digest).
                     //
-                    // On Plan K miss, always go to CAS.
+                    // On Plan K miss without a Plan I hit, always go to CAS.
                     {
                         info!(dest = %dest, ?digest, "CAS fetch — Plan K miss, downloading from CAS");
                         {
@@ -341,6 +455,7 @@ pub fn download_to_directory<'a>(
                         &new_directory_path,
                         child_hint,
                         path_digest_cache,
+                        digest_checked_hint_link,
                     )
                     .await
                     .err_tip(|| format!("in download_to_directory : {new_directory_path}"))?;
@@ -396,6 +511,7 @@ pub async fn prepare_action_inputs(
     work_directory: &str,
     hint_root: Option<PathBuf>,
     path_digest_cache: &crate::path_digest_cache::PathDigestCache,
+    digest_checked_hint_link: bool,
 ) -> Result<(), Error> {
     let _t = PREPARE_INPUTS.timer();
     // Architectural contract: every call walks the input tree. Missing
@@ -439,6 +555,7 @@ pub async fn prepare_action_inputs(
         work_directory,
         hint_root,
         path_digest_cache,
+        digest_checked_hint_link,
     )
     .await
 }
@@ -1073,6 +1190,7 @@ impl RunningActionImpl {
                         &self.work_directory,
                         self.hint_root.clone(),
                         &self.running_actions_manager.path_digest_cache,
+                        self.running_actions_manager.digest_checked_hint_link,
                     ))
                     .await
             })
@@ -2235,6 +2353,11 @@ pub struct RunningActionsManagerArgs<'a> {
     /// — the raw absolute path from the platform property is used
     /// directly for `work_directory` and `hint_root`.
     pub project_root: Option<ProjectRoot>,
+    /// Experimental: when true, `download_to_directory` checks the
+    /// pre-staged on-disk file at `hint_root/<name>` against the
+    /// expected digest before hitting CAS. On match → hardlink-from-disk
+    /// (Plan I). On miss → falls through to CAS unchanged.
+    pub digest_checked_hint_link: bool,
 }
 
 struct CleanupGuard {
@@ -2290,6 +2413,9 @@ pub struct RunningActionsManagerImpl {
     /// local filesystem. Consulted at `work_directory` / `hint_root`
     /// derivation sites (Plan J / Plan I). `None` → identity.
     project_root: Option<ProjectRoot>,
+    /// Experimental: gate for Plan I (digest-checked hint-path
+    /// short-circuit). See `LocalWorkerConfig::experimental_digest_checked_hint_link`.
+    pub(crate) digest_checked_hint_link: bool,
 }
 
 impl RunningActionsManagerImpl {
@@ -2335,6 +2461,7 @@ impl RunningActionsManagerImpl {
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
             project_root: args.project_root,
+            digest_checked_hint_link: args.digest_checked_hint_link,
             path_digest_cache: Arc::new(
                 if let Some(ref redis_url) = args.shared_walked_dirs_redis_url {
                     let machine_id = if args.machine_id.is_empty() {
