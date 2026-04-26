@@ -90,26 +90,10 @@ static PLAN_L_HIT: StageStats = StageStats::new("worker.plan_l.hit");
 static PLAN_L_MISS: StageStats = StageStats::new("worker.plan_l.miss");
 static PLAN_I_HIT: StageStats = StageStats::new("worker.plan_i.hit");
 static PLAN_I_MISS: StageStats = StageStats::new("worker.plan_i.miss");
-/// Plan I skipped a redundant `file_matches_digest` re-hash because the
-/// file's hint path was already verified during a Plan M synthesis pass
-/// at the top of this action's input materialization. If this stays at
-/// zero while `worker.plan_m.hit` is high, the bundle threading is
-/// broken — synthesis is being run but its work is being thrown away.
-static PLAN_I_VERIFIED_REUSE: StageStats =
-    StageStats::new("worker.plan_i.verified_reuse");
-static PLAN_M_HIT: StageStats = StageStats::new("worker.plan_m.hit");
-static PLAN_M_MISS_DIGEST: StageStats =
-    StageStats::new("worker.plan_m.miss_digest_mismatch");
-static PLAN_M_MISS_IO: StageStats = StageStats::new("worker.plan_m.miss_io_error");
-static PLAN_M_PROTO_REUSE: StageStats =
-    StageStats::new("worker.plan_m.proto_reuse");
-/// Wall-clock cost of one top-level Plan M synthesis call (the
-/// recursive walk + per-file streaming hash + per-dir proto encode).
-/// This is the *cost* side of Plan M — paired with `plan_m.hit` it
-/// tells you whether synthesis is net-positive vs. the CAS
-/// round-trips it replaces. If `count` is high but `hit` is zero,
-/// every synthesis is being thrown away (mtime/mode drift).
-static PLAN_M_SYNTH: StageStats = StageStats::new("worker.plan_m.synth");
+// Plan M counters retired in 1.3.4: the upper-level whole-tree synth
+// they instrumented was removed entirely. Plan M's synth function
+// stays in the tree as a primitive (see `local_dir_synthesis`) but
+// it's no longer invoked from the action path.
 /// Wall-clock cost of one Plan I `file_matches_digest` call (one
 /// per-file streaming SHA-256/Blake3 of an on-disk hint file). On a
 /// cold Plan K cache with many concurrent actions sharing the same
@@ -196,7 +180,6 @@ pub fn download_to_directory<'a>(
     hint_root: Option<PathBuf>,
     path_digest_cache: &'a crate::path_digest_cache::PathDigestCache,
     digest_checked_hint_link: bool,
-    synth_bundle: Option<Arc<crate::local_dir_synthesis::SynthBundle>>,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
         let _walk_timer = DIR_WALK.timer();
@@ -266,19 +249,7 @@ pub fn download_to_directory<'a>(
             }
         };
 
-        // Plan M: if a synthesis bundle from the top-level walk already
-        // contains a Directory proto for this digest, skip the CAS round
-        // trip entirely. The bundle's bytes already hashed to the
-        // top-level expected digest, which means every recursive child
-        // digest in the proto tree is content-verified — using the
-        // synthesized proto here is byte-equivalent to fetching it.
-        let directory = if let Some(proto) = synth_bundle
-            .as_ref()
-            .and_then(|b| b.protos.get(digest))
-        {
-            PLAN_M_PROTO_REUSE.incr();
-            proto.clone()
-        } else {
+        let directory = {
             let _t = DIR_PROTO_FETCH.timer();
             get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
                 .await
@@ -307,11 +278,6 @@ pub fn download_to_directory<'a>(
             } else {
                 None
             };
-            // If Plan M already verified this hint file during the
-            // top-level synthesis pass, we can hardlink without paying a
-            // second `file_matches_digest` stream-hash. The synthesis
-            // bundle is per-action; cloning the Arc is cheap.
-            let synth_bundle_for_file = synth_bundle.clone();
             futures.push(
                 async move {
                     // Plan K: cache-first. If this (path, digest) pair is already
@@ -337,37 +303,24 @@ pub fn download_to_directory<'a>(
                     // (size mismatch, content mismatch, missing file, I/O
                     // error) falls through to the existing CAS path below.
                     let plan_i_hit = if let Some(ref hint_path) = plan_i_hint_path {
-                        // Plan M short-circuit: if the synthesis bundle
-                        // already verified this hint file's contents
-                        // hash to `digest`, skip the redundant
-                        // `file_matches_digest` re-hash.
-                        let already_verified = synth_bundle_for_file
-                            .as_ref()
-                            .and_then(|b| b.verified_files.get(hint_path))
-                            .is_some_and(|d| d == &digest);
-                        let verified = if already_verified {
-                            PLAN_I_VERIFIED_REUSE.incr();
-                            true
-                        } else {
-                            let hasher_func = opentelemetry::Context::current()
-                                .get::<DigestHasherFunc>()
-                                .map_or_else(
-                                    nativelink_util::digest_hasher::default_digest_hasher_func,
-                                    |v| *v,
-                                );
-                            // Timer-wrap so the Plan I storm is visible
-                            // in the periodic timing dump. Without this
-                            // worker.plan_i.file_hash stat, a worker
-                            // hashing thousands of files across many
-                            // concurrent actions looks idle in metrics.
-                            let _t = PLAN_I_FILE_HASH.timer();
-                            crate::file_digest_check::file_matches_digest(
-                                hint_path,
-                                &digest,
-                                hasher_func,
-                            )
-                            .await
-                        };
+                        let hasher_func = opentelemetry::Context::current()
+                            .get::<DigestHasherFunc>()
+                            .map_or_else(
+                                nativelink_util::digest_hasher::default_digest_hasher_func,
+                                |v| *v,
+                            );
+                        // Timer-wrap so the Plan I storm is visible
+                        // in the periodic timing dump. Without this
+                        // worker.plan_i.file_hash stat, a worker
+                        // hashing thousands of files across many
+                        // concurrent actions looks idle in metrics.
+                        let _t = PLAN_I_FILE_HASH.timer();
+                        let verified = crate::file_digest_check::file_matches_digest(
+                            hint_path,
+                            &digest,
+                            hasher_func,
+                        )
+                        .await;
                         if verified {
                             // Hint matches. If hint_path == dest the file is
                             // already where the action needs it; otherwise
@@ -572,7 +525,6 @@ pub fn download_to_directory<'a>(
             let new_directory_path = format!("{}/{}", current_directory, directory.name);
             let child_hint: Option<PathBuf> =
                 hint_root.as_ref().map(|root| root.join(&directory.name));
-            let synth_bundle_for_child = synth_bundle.clone();
             futures.push(
                 async move {
                     // Plan J: create_dir_all is idempotent — shared-tree subdirs
@@ -588,7 +540,6 @@ pub fn download_to_directory<'a>(
                         child_hint,
                         path_digest_cache,
                         digest_checked_hint_link,
-                        synth_bundle_for_child,
                     )
                     .await
                     .err_tip(|| format!("in download_to_directory : {new_directory_path}"))?;
@@ -631,10 +582,13 @@ pub fn download_to_directory<'a>(
     .boxed()
 }
 
-/// Operator escape hatch for the 1.3.0 default-on Plan M behavior.
-/// Set `NATIVELINK_PLAN_M_DISABLE=1` (or `true` / `yes` / `on`) to
-/// skip the per-action top-level synthesis pass without rebuilding or
-/// editing config. Plan I and Plan K continue working unchanged.
+/// Back-compat no-op (1.3.4): the env var still parses so workers
+/// started with `NATIVELINK_PLAN_M_DISABLE=1` don't error out, but
+/// Plan M's full-tree synth is unconditionally removed in this
+/// version — the function the variable used to disable no longer
+/// exists in the action path. Kept so operators upgrading from 1.3.x
+/// don't have to rip the env var out of their launch scripts.
+#[allow(dead_code)]
 fn plan_m_disabled_via_env() -> bool {
     std::env::var("NATIVELINK_PLAN_M_DISABLE")
         .ok()
@@ -691,139 +645,33 @@ pub async fn prepare_action_inputs(
         }
     }
 
-    // Plan M: try a top-level local directory-proto synthesis when
-    // `digest_checked_hint_link` is enabled and a hint root exists.
-    // On hit, every recursive `download_to_directory` call (and every
-    // per-file Plan I check) reuses the bundle to skip both the CAS
-    // Directory-proto fetch and the Plan I re-hash. On any miss
-    // variant the walk falls back to its existing CAS path unchanged.
-    // Operator escape hatch for the 1.3.0 default-on Plan M behavior:
-    // NATIVELINK_PLAN_M_DISABLE=1 forces synthesis off without a
-    // rebuild, even when `digest_checked_hint_link` is true. Use this
-    // when synthesis cost is dominating wall time on workloads
-    // synthesis was not designed for (e.g. 100k-file hint tree
-    // re-walked per action with no per-file memoization yet).
+    // 1.3.4: Plan M's top-level whole-hint-tree synthesis is REMOVED.
     //
-    // Skip synthesis entirely if Plan L already has the root subtree
-    // marked walked at this work_directory. The downstream
-    // `download_to_directory` would Plan-L-hit on the first call and
-    // return immediately, so the synth walk would be pure overhead —
-    // hashing every file in `hint_root` only to throw the bundle away
-    // at the first Plan L check. After action 1 warms Plan L, every
-    // subsequent action with the same root_digest at the same
-    // work_directory takes this fast path.
-    let plan_l_already_warm = path_digest_cache.dir_walked(work_directory, digest);
-    let synth_bundle = if digest_checked_hint_link
-        && !plan_m_disabled_via_env()
-        && !plan_l_already_warm
-    {
-        match hint_root.as_ref() {
-            Some(hint) => {
-                // Coalesce concurrent Plan M synth on the same
-                // (hint_root, root_digest). Without this, N actions
-                // arriving on a cold cache each independently walk +
-                // hash the entire hint tree before any of them mark
-                // Plan L — the cold-start herd we hit in production
-                // (1.3.0 / 1.3.1 / 1.3.2). With coalescing the first
-                // caller leads, the rest wait. On leader Hit we
-                // bulk-mark Plan L for every visited subtree so
-                // followers (and every subsequent action) Plan-L-hit
-                // at the root and skip the walk entirely.
-                let outcome = path_digest_cache
-                    .coalescer()
-                    .try_lead_or_follow(hint, *digest);
-                match outcome {
-                    crate::dir_walk_coalescer::CoalesceOutcome::Follow(slot) => {
-                        // Wait for the leader. After wake re-check
-                        // Plan L; on leader-success this hits and we
-                        // skip synth entirely.
-                        slot.wait().await;
-                        if path_digest_cache.dir_walked(work_directory, digest) {
-                            None
-                        } else {
-                            // Leader didn't mark Plan L (synth missed
-                            // or errored). Don't do our own synth —
-                            // fall through to the CAS path below
-                            // unchanged.
-                            None
-                        }
-                    }
-                    crate::dir_walk_coalescer::CoalesceOutcome::Lead(_guard) => {
-                        let hasher_func = opentelemetry::Context::current()
-                            .get::<DigestHasherFunc>()
-                            .map_or_else(
-                                nativelink_util::digest_hasher::default_digest_hasher_func,
-                                |v| *v,
-                            );
-                        let _synth_timer = PLAN_M_SYNTH.timer();
-                        match crate::local_dir_synthesis::synthesize_directory_tree(
-                            hint, digest, hasher_func,
-                        )
-                        .await
-                        {
-                            crate::local_dir_synthesis::SynthResult::Hit(bundle) => {
-                                PLAN_M_HIT.incr();
-                                // Bulk-mark Plan L for every visited
-                                // subtree. In shared-tree mode the
-                                // bundle's `dir_paths` are the same
-                                // absolute paths `download_to_directory`
-                                // will look up on subsequent actions.
-                                // Marking now means the very next
-                                // Plan L check at the root hits → no
-                                // recursion, no walk. This is what
-                                // collapses the steady-state to a
-                                // one-time cost.
-                                for (path, dir_digest) in &bundle.dir_paths {
-                                    if let Some(path_str) = path.to_str() {
-                                        path_digest_cache
-                                            .mark_dir_walked(path_str, *dir_digest);
-                                    }
-                                }
-                                trace!(
-                                    ?digest,
-                                    hint = %hint.display(),
-                                    protos = bundle.protos.len(),
-                                    verified_files = bundle.verified_files.len(),
-                                    dir_paths = bundle.dir_paths.len(),
-                                    "Plan M: local synthesis hit, bulk-marked Plan L, skipping CAS dir-proto fetches",
-                                );
-                                // Guard drops at end of match arm,
-                                // signalling waiting followers.
-                                Some(Arc::new(bundle))
-                            }
-                            crate::local_dir_synthesis::SynthResult::MissDigestMismatch {
-                                computed,
-                            } => {
-                                PLAN_M_MISS_DIGEST.incr();
-                                trace!(
-                                    ?digest,
-                                    ?computed,
-                                    hint = %hint.display(),
-                                    "Plan M miss: local tree digest != expected",
-                                );
-                                None
-                            }
-                            crate::local_dir_synthesis::SynthResult::MissIoError(e) => {
-                                PLAN_M_MISS_IO.incr();
-                                trace!(
-                                    ?digest,
-                                    hint = %hint.display(),
-                                    ?e,
-                                    "Plan M miss: I/O error walking hint tree",
-                                );
-                                None
-                            }
-                        }
-                    }
-                }
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
+    // Why: in the production shared-tree topology (Chromium with
+    // `InputRootAbsolutePath` set to `src/out/Mac`), the local hint
+    // tree is much larger than what any single action's input root
+    // references. Synthesizing the WHOLE local tree's Directory
+    // proto and comparing to the action's expected `digest` produced
+    // a guaranteed Miss while still paying minutes-to-hours of file
+    // hashing — pure waste storming sys CPU. Coalescing N concurrent
+    // synth walks to 1 (1.3.3) only delayed the inevitable; the one
+    // walk that did run was still a full-tree walk for nothing.
+    //
+    // The right shape is `download_to_directory`'s natural recursion:
+    // it only walks subtrees the action's Directory proto references,
+    // it only hashes (via Plan I) files the action declares, and it
+    // marks Plan L bottom-up so subsequent actions hit the cache.
+    // That IS "only what we need." Plan M's upper-level synth was
+    // adding a wasteful pre-walk on top.
+    //
+    // The synthesis function itself stays in
+    // `nativelink_worker::local_dir_synthesis` as a primitive — it
+    // may be useful later for explicit operator-triggered prewarm or
+    // a per-subtree variant — but the action path no longer invokes
+    // it. `NATIVELINK_PLAN_M_DISABLE` env var is now a no-op (the
+    // feature it disabled is gone) but kept for back-compat: a
+    // worker started with the flag set still works.
 
-    // Traditional path (cache disabled or failed)
     download_to_directory(
         cas_store,
         filesystem_store,
@@ -832,7 +680,6 @@ pub async fn prepare_action_inputs(
         hint_root,
         path_digest_cache,
         digest_checked_hint_link,
-        synth_bundle,
     )
     .await
 }

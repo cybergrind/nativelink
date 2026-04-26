@@ -236,7 +236,6 @@ mod tests {
                 None,
                 &PathDigestCache::new(),
                 false,
-                None,
             )
             .await?;
             download_dir
@@ -345,7 +344,6 @@ mod tests {
                 None,
                 &PathDigestCache::new(),
                 false,
-                None,
             )
             .await?;
             download_dir
@@ -423,7 +421,6 @@ mod tests {
                 None,
                 &PathDigestCache::new(),
                 false,
-                None,
             )
             .await?;
             download_dir
@@ -500,7 +497,6 @@ mod tests {
             None,
             &cache,
             false,
-            None,
         )
         .await?;
         assert_eq!(
@@ -523,7 +519,6 @@ mod tests {
             None,
             &cache,
             false,
-            None,
         )
         .await?;
 
@@ -613,7 +608,6 @@ mod tests {
             None,
             &PathDigestCache::new(),
             false,
-            None,
         )
         .await?;
 
@@ -688,7 +682,6 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             true, // digest_checked_hint_link
-            None,
         )
         .await?;
 
@@ -742,7 +735,6 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             false, // digest_checked_hint_link disabled
-            None,
         )
         .await;
         assert!(
@@ -803,7 +795,6 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             true,
-            None,
         )
         .await?;
 
@@ -860,7 +851,6 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             true,
-            None,
         )
         .await?;
 
@@ -1191,23 +1181,26 @@ mod tests {
         Ok(())
     }
 
-    /// 1.3.3 slice (Plan M synth coalescing): N concurrent
-    /// `prepare_action_inputs` calls with the same `(hint_root,
-    /// root_digest)` on a cold cache must collapse to ONE Plan M
-    /// synth walk. Without coalescing, all N actions independently
-    /// hash the entire hint tree before any of them mark Plan L
-    /// (the production "synth herd" the user hit). With coalescing
-    /// the leader walks; followers wait + Plan-L-hit on wake.
+    /// 1.3.4 (Plan M full-tree walk REMOVED): `prepare_action_inputs`
+    /// must NOT call `synthesize_directory_tree` — that function
+    /// walks the entire `hint_root`, which in production
+    /// configurations (Chromium's `src/out/Mac` is hundreds of
+    /// thousands of files; action's input root is a small subset of
+    /// that local tree) burns minutes-to-hours per action for a
+    /// guaranteed digest mismatch. The action's natural recursion
+    /// through `download_to_directory` only touches subtrees the
+    /// Directory proto references — that's "only what we need."
     ///
-    /// We assert by checking `worker.plan_m.synth.count` before vs.
-    /// after the concurrent burst — it must increment by exactly 1.
+    /// We assert by checking `worker.plan_m.synth.count` does NOT
+    /// increment across an action that has hint_root set and Plan M
+    /// not env-disabled — the only possible knob through which synth
+    /// could be triggered.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn concurrent_prepare_action_inputs_coalesce_plan_m_synth()
+    async fn prepare_action_inputs_does_not_trigger_full_tree_synth_walk()
     -> Result<(), Box<dyn core::error::Error>> {
-        use nativelink_util::digest_hasher::DigestHasherFunc;
+        use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
         use nativelink_util::timing::snapshot_all;
-        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
         use nativelink_worker::running_actions_manager::prepare_action_inputs;
 
         fn plan_m_synth_count() -> u64 {
@@ -1218,236 +1211,64 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        let hint_dir = make_temp_path("plan_m_coalesce_hint");
+        // Build a real action that can succeed without synth: upload
+        // file blob + Directory proto to CAS, point hint_root at a
+        // local tree containing the same file. download_to_directory
+        // fetches the proto from CAS, then Plan I hardlinks from
+        // hint. Synth never needs to run.
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let hint_dir = make_temp_path("plan_m_removed_hint");
         fs::create_dir_all(&hint_dir).await?;
-        // A few files so synth has actual work to do (otherwise the
-        // walk could finish before any followers register).
-        for i in 0..6 {
-            tokio::fs::write(format!("{hint_dir}/f{i}.txt"), format!("content-{i}").as_bytes())
-                .await?;
-        }
-
-        let probe = synthesize_directory_tree(
-            std::path::Path::new(&hint_dir),
-            &DigestInfo::new([0u8; 32], 0),
-            DigestHasherFunc::Sha256,
-        )
-        .await;
-        let root_digest = match probe {
-            SynthResult::MissDigestMismatch { computed } => computed,
-            other => panic!("probe should mismatch zero digest, got {other:?}"),
+        const FILE_NAME: &str = "input.txt";
+        const CONTENT: &[u8] = b"plan-m-removed input contents";
+        tokio::fs::write(format!("{hint_dir}/{FILE_NAME}"), CONTENT).await?;
+        let file_digest = sha256_digest(CONTENT);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, CONTENT.into())
+            .await?;
+        let root = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
         };
+        let root_bytes = root.encode_to_vec();
+        let mut hasher = DigestHasherFunc::Sha256.hasher();
+        DigestHasher::update(&mut hasher, &root_bytes);
+        let root_digest = DigestHasher::finalize_digest(&mut hasher);
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_bytes.into())
+            .await?;
 
-        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
         let cache = Arc::new(PathDigestCache::new());
-
         let synth_count_before = plan_m_synth_count();
 
-        // Fire N concurrent prepare_action_inputs calls with the
-        // same root_digest at the same work_directory. Without
-        // coalescing each one runs its own synth walk (count
-        // increments by N). With coalescing only one runs.
-        const N: usize = 20;
-        let mut joins = Vec::with_capacity(N);
-        for _ in 0..N {
-            let cas = cas_store.clone();
-            let fast = fast_store.clone();
-            let cache = cache.clone();
-            let hint = hint_dir.clone();
-            joins.push(tokio::spawn(async move {
-                prepare_action_inputs(
-                    &None,
-                    cas.as_ref(),
-                    fast.as_pin(),
-                    &root_digest,
-                    &hint,
-                    Some(PathBuf::from(&hint)),
-                    &cache,
-                    true, // digest_checked_hint_link
-                )
-                .await
-            }));
-        }
-        for j in joins {
-            j.await.unwrap()?;
-        }
+        prepare_action_inputs(
+            &None,
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &hint_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &cache,
+            true, // digest_checked_hint_link ON — this is the ONLY knob that could trigger synth
+        )
+        .await?;
 
         let synth_count_after = plan_m_synth_count();
-        let synth_runs = synth_count_after - synth_count_before;
-        assert!(
-            synth_runs <= 1,
-            "Plan M synth must coalesce: expected at most 1 walk for {N} concurrent \
-             actions on the same (hint_root, root_digest), got {synth_runs}",
-        );
-        Ok(())
-    }
-
-    /// 1.3.2 slice (skip Plan M synth when Plan L already hits at
-    /// root): once action 1 has marked Plan L for the root subtree,
-    /// action 2 must not pay for another full hint-tree walk via Plan
-    /// M synthesis. We assert this indirectly by checking the
-    /// cumulative Plan M synth call count before and after action 2 —
-    /// it MUST NOT increment.
-    #[cfg(not(target_family = "windows"))]
-    #[nativelink_test]
-    async fn second_action_with_warm_plan_l_does_not_run_plan_m_synthesis()
-    -> Result<(), Box<dyn core::error::Error>> {
-        use nativelink_util::digest_hasher::DigestHasherFunc;
-        use nativelink_util::timing::snapshot_all;
-        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
-        use nativelink_worker::running_actions_manager::prepare_action_inputs;
-
-        fn plan_m_synth_count() -> u64 {
-            snapshot_all()
-                .into_iter()
-                .find(|s| s.name == "worker.plan_m.synth")
-                .map(|s| s.count)
-                .unwrap_or(0)
-        }
-
-        let hint_dir = make_temp_path("plan_m_skip_hint");
-        fs::create_dir_all(&hint_dir).await?;
-        tokio::fs::write(format!("{hint_dir}/q.txt"), b"q-content").await?;
-
-        let probe = synthesize_directory_tree(
-            std::path::Path::new(&hint_dir),
-            &DigestInfo::new([0u8; 32], 0),
-            DigestHasherFunc::Sha256,
-        )
-        .await;
-        let root_digest = match probe {
-            SynthResult::MissDigestMismatch { computed } => computed,
-            other => panic!("probe failed: {other:?}"),
-        };
-
-        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
-        let cache = Arc::new(PathDigestCache::new());
-
-        // Action 1: warms Plan L.
-        prepare_action_inputs(
-            &None,
-            cas_store.as_ref(),
-            fast_store.as_pin(),
-            &root_digest,
-            &hint_dir,
-            Some(PathBuf::from(&hint_dir)),
-            &cache,
-            true,
-        )
-        .await?;
-        assert!(
-            cache.dir_walked(&hint_dir, &root_digest),
-            "action 1 must mark Plan L at the root",
-        );
-
-        let synth_count_after_action_1 = plan_m_synth_count();
-
-        // Action 2: same root_digest, same work_directory. Must NOT
-        // trigger Plan M synthesis because Plan L already hits.
-        prepare_action_inputs(
-            &None,
-            cas_store.as_ref(),
-            fast_store.as_pin(),
-            &root_digest,
-            &hint_dir,
-            Some(PathBuf::from(&hint_dir)),
-            &cache,
-            true,
-        )
-        .await?;
-
-        let synth_count_after_action_2 = plan_m_synth_count();
         assert_eq!(
-            synth_count_after_action_2,
-            synth_count_after_action_1,
-            "action 2 must skip Plan M synthesis once Plan L hits at the root",
+            synth_count_after, synth_count_before,
+            "Plan M full-tree synth must NOT run from prepare_action_inputs in 1.3.4 — \
+             the only legitimate place to walk the hint tree is download_to_directory's natural \
+             recursion (which only touches subtrees the action references).",
         );
         Ok(())
     }
-
-    /// 1.3.2 slice (Plan L bulk-mark on synth Hit): when
-    /// `prepare_action_inputs` runs Plan M synthesis and gets a Hit,
-    /// it must mark Plan L for every visited subtree path AND Plan K
-    /// for every verified file path. This makes a SECOND action that
-    /// arrives with the same root_digest at the same work_directory
-    /// hit Plan L at the top of `download_to_directory` and
-    /// short-circuit out without re-walking, re-hashing, or running
-    /// Plan M synthesis again.
-    #[cfg(not(target_family = "windows"))]
-    #[nativelink_test]
-    async fn plan_m_synth_hit_bulk_marks_plan_l_so_next_action_skips_walk()
-    -> Result<(), Box<dyn core::error::Error>> {
-        use nativelink_util::digest_hasher::DigestHasherFunc;
-        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
-        use nativelink_worker::running_actions_manager::prepare_action_inputs;
-
-        // Pre-stage a small tree at hint_root.
-        let hint_dir = make_temp_path("plan_l_bulk_hint");
-        fs::create_dir_all(&hint_dir).await?;
-        tokio::fs::write(format!("{hint_dir}/x.txt"), b"x-content").await?;
-        tokio::fs::create_dir_all(format!("{hint_dir}/sub")).await?;
-        tokio::fs::write(format!("{hint_dir}/sub/y.txt"), b"y-content").await?;
-
-        // Compute the action's root digest.
-        let probe = synthesize_directory_tree(
-            std::path::Path::new(&hint_dir),
-            &DigestInfo::new([0u8; 32], 0),
-            DigestHasherFunc::Sha256,
-        )
-        .await;
-        let root_digest = match probe {
-            SynthResult::MissDigestMismatch { computed } => computed,
-            other => panic!("probe should mismatch zero digest, got {other:?}"),
-        };
-
-        // Empty CAS — if Plan L marking + the bundle short-circuit
-        // both work, neither action ever needs to read from CAS.
-        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
-        let cache = Arc::new(PathDigestCache::new());
-
-        // Action 1: pays for the synth walk; on Hit, must bulk-mark
-        // Plan L for every visited subtree (root + sub).
-        prepare_action_inputs(
-            &None,
-            cas_store.as_ref(),
-            fast_store.as_pin(),
-            &root_digest,
-            &hint_dir,
-            Some(PathBuf::from(&hint_dir)),
-            &cache,
-            true, // digest_checked_hint_link
-        )
-        .await?;
-
-        // After action 1, Plan L MUST be marked for the root path
-        // with the action's root digest. This is the property that
-        // lets action 2 skip the walk entirely.
-        assert!(
-            cache.dir_walked(&hint_dir, &root_digest),
-            "Plan M Hit must bulk-mark Plan L for the root subtree",
-        );
-        // And for the subdirectory.
-        let sub_path = format!("{hint_dir}/sub");
-        let sub_digest = {
-            // Compute the subdir digest the same way synthesis would.
-            let probe2 = synthesize_directory_tree(
-                std::path::Path::new(&sub_path),
-                &DigestInfo::new([0u8; 32], 0),
-                DigestHasherFunc::Sha256,
-            )
-            .await;
-            match probe2 {
-                SynthResult::MissDigestMismatch { computed } => computed,
-                other => panic!("subdir probe failed: {other:?}"),
-            }
-        };
-        assert!(
-            cache.dir_walked(&sub_path, &sub_digest),
-            "Plan M Hit must bulk-mark Plan L for every visited subdirectory, not just the root",
-        );
-        Ok(())
-    }
-
     /// Slice 1 of 1.3.2 (single-flight): N concurrent
     /// `download_to_directory` calls for the same `(path, digest)`
     /// must collapse to one underlying CAS-fetch. We assert this by
@@ -1513,7 +1334,6 @@ mod tests {
                     None,
                     &cache,
                     false,
-                    None,
                 )
                 .await
             }));
@@ -1534,71 +1354,6 @@ mod tests {
         assert_eq!(on_disk, CONTENT);
         Ok(())
     }
-
-    /// Slice 2 (Plan M) end-to-end: with `digest_checked_hint_link`
-    /// on and a hint tree on disk that hashes to the action's root
-    /// digest, `prepare_action_inputs` must succeed even when the
-    /// CAS has neither the Directory proto nor any file blobs.
-    /// Synthesis builds the proto locally; Plan I hardlinks files
-    /// from hint. This is the cold-start "no CAS at all" property.
-    #[cfg(not(target_family = "windows"))]
-    #[nativelink_test]
-    async fn plan_m_synthesis_avoids_all_cas_when_hint_tree_is_complete()
-    -> Result<(), Box<dyn core::error::Error>> {
-        use nativelink_util::digest_hasher::DigestHasherFunc;
-        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
-        use nativelink_worker::running_actions_manager::prepare_action_inputs;
-
-        // Pre-stage a small tree at hint_root.
-        let hint_dir = make_temp_path("plan_m_hint");
-        fs::create_dir_all(&hint_dir).await?;
-        tokio::fs::write(format!("{hint_dir}/a.txt"), b"alpha").await?;
-        tokio::fs::write(format!("{hint_dir}/b.txt"), b"bravo").await?;
-        let sub = format!("{hint_dir}/sub");
-        fs::create_dir_all(&sub).await?;
-        tokio::fs::write(format!("{sub}/c.txt"), b"charlie").await?;
-
-        // Compute the root digest the synthesis will produce. First
-        // call probes against a deliberately-wrong expected to
-        // extract the actual computed digest, then we hand that to
-        // prepare_action_inputs as the action's root.
-        let probe = synthesize_directory_tree(
-            std::path::Path::new(&hint_dir),
-            &DigestInfo::new([0u8; 32], 0),
-            DigestHasherFunc::Sha256,
-        )
-        .await;
-        let root_digest = match probe {
-            SynthResult::MissDigestMismatch { computed } => computed,
-            other => panic!("probe should mismatch zero digest, got {other:?}"),
-        };
-
-        // Empty CAS: the action's root proto is NOT uploaded. If
-        // Plan M synthesis fails (or its protos aren't reused),
-        // download_to_directory will fail get_and_decode_digest.
-        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
-        let dest_dir = make_temp_path("plan_m_dest");
-        fs::create_dir_all(&dest_dir).await?;
-
-        prepare_action_inputs(
-            &None,
-            cas_store.as_ref(),
-            fast_store.as_pin(),
-            &root_digest,
-            &dest_dir,
-            Some(PathBuf::from(&hint_dir)),
-            &PathDigestCache::new(),
-            true, // digest_checked_hint_link
-        )
-        .await?;
-
-        // All files materialized at dest, content-equal to hint.
-        assert_eq!(fs::read(format!("{dest_dir}/a.txt")).await?, b"alpha");
-        assert_eq!(fs::read(format!("{dest_dir}/b.txt")).await?, b"bravo");
-        assert_eq!(fs::read(format!("{dest_dir}/sub/c.txt")).await?, b"charlie");
-        Ok(())
-    }
-
     /// Slice 1 regression test (Plan M): when a `SharedPathDigestMap`
     /// is injected AND `shared_walked_dirs_redis_url` is set, the
     /// manager must build a Redis-backed walked-dirs provider —
