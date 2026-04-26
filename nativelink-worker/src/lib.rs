@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod dir_walk_coalescer;
 pub mod directory_cache;
 pub mod file_digest_check;
 pub mod local_dir_synthesis;
 pub mod local_worker;
 pub mod path_digest_cache;
+pub mod plan_l_prewarm;
 pub mod running_actions_manager;
 pub mod worker_api_client_wrapper;
 pub mod worker_utils;

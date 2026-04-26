@@ -636,6 +636,15 @@ async fn inner_main(
         // intact.
         let shared_path_digest_map =
             nativelink_worker::path_digest_cache::new_shared_path_digest_map();
+        // Process-shared single-flight registry for download_to_directory.
+        // Concurrent walks for the same (path, digest) — the typical
+        // shared-tree shape where every worker uses the same
+        // InputRootAbsolutePath — collapse to one underlying walk
+        // instead of N redundant ones. Without this, on a cold cache
+        // 20 in-flight actions × 30k input files explodes into
+        // 600k file ops contending on disk and the page cache.
+        let shared_dir_walk_coalescer =
+            nativelink_worker::path_digest_cache::new_shared_dir_walk_coalescer();
         for (i, worker_cfg) in worker_cfgs.into_iter().enumerate() {
             let spawn_fut = match worker_cfg {
                 WorkerConfig::Local(local_worker_cfg) => {
@@ -677,6 +686,7 @@ async fn inner_main(
                         maybe_ac_store,
                         historical_store,
                         Some(shared_path_digest_map.clone()),
+                        Some(shared_dir_walk_coalescer.clone()),
                     )
                     .await
                     .err_tip(|| "Could not make LocalWorker")?;

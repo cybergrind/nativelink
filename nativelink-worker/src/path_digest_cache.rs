@@ -18,11 +18,25 @@ use parking_lot::{Mutex, RwLock};
 /// `machine_id` configuration.
 pub type SharedPathDigestMap = Arc<RwLock<HashMap<PathBuf, DigestInfo>>>;
 
+/// Process-shared single-flight registry for `download_to_directory`.
+/// One `Arc` lives across every `PathDigestCache` in the process so
+/// concurrent walks for the same `(path, digest)` collapse into one
+/// underlying walk regardless of which manager started them.
+pub type SharedDirWalkCoalescer =
+    Arc<crate::dir_walk_coalescer::DirWalkCoalescer>;
+
 /// Build a fresh `SharedPathDigestMap`. Exposed so callers (e.g.
 /// `src/bin/nativelink.rs`) can construct one without depending on the
 /// concrete `parking_lot::RwLock` / `HashMap` types directly.
 pub fn new_shared_path_digest_map() -> SharedPathDigestMap {
     Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Build a fresh `SharedDirWalkCoalescer`. Exposed so callers can
+/// construct one process-wide handle to thread through every
+/// `RunningActionsManagerImpl`.
+pub fn new_shared_dir_walk_coalescer() -> SharedDirWalkCoalescer {
+    Arc::new(crate::dir_walk_coalescer::DirWalkCoalescer::new())
 }
 
 /// Maximum number of pooled Redis connections per client. With ~20
@@ -302,38 +316,72 @@ impl WalkedDirsProvider for RedisWalkedDirs {
 pub struct PathDigestCache {
     map: SharedPathDigestMap,
     walked_dirs: Box<dyn WalkedDirsProvider>,
+    /// Process-shared single-flight registry. Threaded alongside
+    /// `map` so concurrent `download_to_directory(path, digest)` calls
+    /// across every manager in the process collapse into one walk.
+    coalescer: SharedDirWalkCoalescer,
 }
 
 impl PathDigestCache {
-    /// Create with a fresh (un-shared) map and local-only walked-dirs.
+    /// Create with a fresh (un-shared) map, local-only walked-dirs,
+    /// and a fresh coalescer.
     pub fn new() -> Self {
         Self {
             map: Arc::new(RwLock::new(HashMap::new())),
             walked_dirs: Box::new(LocalWalkedDirs::new()),
+            coalescer: new_shared_dir_walk_coalescer(),
         }
     }
 
     /// Create with a fresh (un-shared) map and a custom walked-dirs
     /// provider (e.g. Redis-backed). Used by tests and by callers that
-    /// want a single self-contained cache.
+    /// want a single self-contained cache. Coalescer is fresh.
     pub fn with_walked_dirs(walked_dirs: Box<dyn WalkedDirsProvider>) -> Self {
         Self {
             map: Arc::new(RwLock::new(HashMap::new())),
             walked_dirs,
+            coalescer: new_shared_dir_walk_coalescer(),
         }
     }
 
-    /// Create with a caller-supplied shared map and a per-instance
-    /// walked-dirs provider. This is the constructor used by
-    /// `RunningActionsManagerImpl::new_with_callbacks` when a
-    /// process-level `SharedPathDigestMap` is injected: the manager
-    /// picks up the shared Plan K state while still building its own
-    /// Plan L provider from `shared_walked_dirs_redis_url`.
+    /// Create with a caller-supplied shared map, a per-instance
+    /// walked-dirs provider, and a caller-supplied shared coalescer.
+    /// This is the constructor used by
+    /// `RunningActionsManagerImpl::new_with_callbacks` when process-
+    /// level shared state is injected: the manager picks up the
+    /// shared Plan K state and the shared single-flight registry
+    /// while still building its own Plan L provider from
+    /// `shared_walked_dirs_redis_url`.
+    pub fn with_shared_state(
+        map: SharedPathDigestMap,
+        coalescer: SharedDirWalkCoalescer,
+        walked_dirs: Box<dyn WalkedDirsProvider>,
+    ) -> Self {
+        Self {
+            map,
+            walked_dirs,
+            coalescer,
+        }
+    }
+
+    /// Backwards-compat constructor for the previous Slice-1 shape.
+    /// Builds a fresh coalescer; new wiring should prefer
+    /// `with_shared_state` so the coalescer is also process-shared.
     pub fn with_shared_map_and_walked_dirs(
         map: SharedPathDigestMap,
         walked_dirs: Box<dyn WalkedDirsProvider>,
     ) -> Self {
-        Self { map, walked_dirs }
+        Self {
+            map,
+            walked_dirs,
+            coalescer: new_shared_dir_walk_coalescer(),
+        }
+    }
+
+    /// Access the shared coalescer for this cache. Used by
+    /// `download_to_directory` to claim or join walks.
+    pub fn coalescer(&self) -> &SharedDirWalkCoalescer {
+        &self.coalescer
     }
 
     pub fn contains(&self, path: &Path, digest: &DigestInfo) -> bool {

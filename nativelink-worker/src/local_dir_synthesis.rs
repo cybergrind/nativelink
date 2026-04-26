@@ -49,9 +49,11 @@ pub enum SynthResult {
 /// Side-effects of a successful synthesis: every Directory proto
 /// produced and every file whose contents were verified during the
 /// walk. `download_to_directory` consults `protos` to skip CAS
-/// fetches at every recursive level, and Plan I consults
-/// `verified_files` to skip a redundant `file_matches_digest` call
-/// before hardlinking.
+/// fetches at every recursive level, Plan I consults `verified_files`
+/// to skip a redundant `file_matches_digest` call before hardlinking,
+/// and `prepare_action_inputs` consults `dir_paths` to bulk-mark
+/// Plan L for every visited subtree (so subsequent actions hit Plan L
+/// at the root and skip the whole walk).
 #[derive(Debug, Default)]
 pub struct SynthBundle {
     /// Every Directory proto produced during the recursive walk,
@@ -62,6 +64,14 @@ pub struct SynthBundle {
     /// the digest the file's contents hashed to. Plan I uses this to
     /// elide its own re-hash pass when about to hardlink.
     pub verified_files: HashMap<PathBuf, DigestInfo>,
+    /// Every visited subdirectory's absolute hint path paired with
+    /// the digest of its synthesized Directory proto. In shared-tree
+    /// mode (hint_root == work_directory), these are exactly the
+    /// keys `download_to_directory` will look up in Plan L on
+    /// subsequent actions — bulk-marking on synthesis Hit makes
+    /// subsequent actions short-circuit at the Plan L check, never
+    /// running the walk again.
+    pub dir_paths: Vec<(PathBuf, DigestInfo)>,
 }
 
 /// Walk `hint_dir` once, synthesize a `Directory` proto for the root
@@ -220,6 +230,11 @@ fn build_subtree<'a>(
         let bytes = proto.encode_to_vec();
         let digest = compute_buf_digest(&bytes, &mut hasher.hasher());
         bundle.protos.insert(digest, proto);
+        // Record (path, digest) for this directory so callers can
+        // bulk-mark Plan L on synthesis Hit. Used by
+        // `prepare_action_inputs` to short-circuit subsequent actions
+        // at the Plan L check.
+        bundle.dir_paths.push((dir.to_path_buf(), digest));
         Ok(digest)
     })
 }
@@ -387,5 +402,47 @@ mod tests {
         let bundle = synth_to_hit(&root).await;
         assert_eq!(bundle.protos.len(), 1, "empty dir → one proto, the root");
         assert!(bundle.verified_files.is_empty());
+    }
+
+    /// 1.3.2 slice (Plan L bulk-mark): SynthBundle.dir_paths must
+    /// contain a `(absolute_path, computed_digest)` entry for every
+    /// directory the walker visited, including the root. This is the
+    /// bridge that lets `prepare_action_inputs` mark Plan L for every
+    /// visited subtree on synthesis Hit, so subsequent actions hit
+    /// Plan L at the root and never re-walk.
+    #[nativelink_test]
+    async fn synthesis_bundle_records_dir_paths_for_plan_l_marking() {
+        let root = temp_root("dir_paths");
+        tokio::fs::create_dir_all(root.join("alpha/beta")).await.unwrap();
+        tokio::fs::write(root.join("top.txt"), b"top").await.unwrap();
+        tokio::fs::write(root.join("alpha/mid.txt"), b"mid").await.unwrap();
+        tokio::fs::write(root.join("alpha/beta/leaf.txt"), b"leaf").await.unwrap();
+
+        let bundle = synth_to_hit(&root).await;
+        assert_eq!(
+            bundle.dir_paths.len(),
+            3,
+            "dir_paths must include root + alpha + alpha/beta",
+        );
+        // Every entry's path must exist on disk and its digest must
+        // be present in bundle.protos (otherwise we'd be marking
+        // Plan L for a digest we never produced).
+        for (path, digest) in &bundle.dir_paths {
+            assert!(path.exists(), "dir_paths entry must reference a real dir: {path:?}");
+            assert!(
+                bundle.protos.contains_key(digest),
+                "dir_paths digest must also appear in protos map: {digest:?}",
+            );
+        }
+        // The root path itself must be among them (the action-time
+        // Plan L lookup at the top of `download_to_directory` uses
+        // exactly this path).
+        let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        assert!(
+            bundle.dir_paths.iter().any(|(p, _)| p.canonicalize()
+                .ok()
+                .as_ref() == Some(&root_canonical)),
+            "root path must appear in dir_paths so action's Plan L lookup hits",
+        );
     }
 }

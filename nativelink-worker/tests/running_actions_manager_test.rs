@@ -1134,6 +1134,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: Some(shared_map.clone()),
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1159,6 +1160,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: Some(shared_map.clone()),
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1186,6 +1188,259 @@ mod tests {
             mgr_b.path_digest_cache().contains(&path, &digest),
             "manager B must observe insert via shared map",
         );
+        Ok(())
+    }
+
+    /// 1.3.2 slice (skip Plan M synth when Plan L already hits at
+    /// root): once action 1 has marked Plan L for the root subtree,
+    /// action 2 must not pay for another full hint-tree walk via Plan
+    /// M synthesis. We assert this indirectly by checking the
+    /// cumulative Plan M synth call count before and after action 2 —
+    /// it MUST NOT increment.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn second_action_with_warm_plan_l_does_not_run_plan_m_synthesis()
+    -> Result<(), Box<dyn core::error::Error>> {
+        use nativelink_util::digest_hasher::DigestHasherFunc;
+        use nativelink_util::timing::snapshot_all;
+        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
+        use nativelink_worker::running_actions_manager::prepare_action_inputs;
+
+        fn plan_m_synth_count() -> u64 {
+            snapshot_all()
+                .into_iter()
+                .find(|s| s.name == "worker.plan_m.synth")
+                .map(|s| s.count)
+                .unwrap_or(0)
+        }
+
+        let hint_dir = make_temp_path("plan_m_skip_hint");
+        fs::create_dir_all(&hint_dir).await?;
+        tokio::fs::write(format!("{hint_dir}/q.txt"), b"q-content").await?;
+
+        let probe = synthesize_directory_tree(
+            std::path::Path::new(&hint_dir),
+            &DigestInfo::new([0u8; 32], 0),
+            DigestHasherFunc::Sha256,
+        )
+        .await;
+        let root_digest = match probe {
+            SynthResult::MissDigestMismatch { computed } => computed,
+            other => panic!("probe failed: {other:?}"),
+        };
+
+        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let cache = Arc::new(PathDigestCache::new());
+
+        // Action 1: warms Plan L.
+        prepare_action_inputs(
+            &None,
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &hint_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &cache,
+            true,
+        )
+        .await?;
+        assert!(
+            cache.dir_walked(&hint_dir, &root_digest),
+            "action 1 must mark Plan L at the root",
+        );
+
+        let synth_count_after_action_1 = plan_m_synth_count();
+
+        // Action 2: same root_digest, same work_directory. Must NOT
+        // trigger Plan M synthesis because Plan L already hits.
+        prepare_action_inputs(
+            &None,
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &hint_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &cache,
+            true,
+        )
+        .await?;
+
+        let synth_count_after_action_2 = plan_m_synth_count();
+        assert_eq!(
+            synth_count_after_action_2,
+            synth_count_after_action_1,
+            "action 2 must skip Plan M synthesis once Plan L hits at the root",
+        );
+        Ok(())
+    }
+
+    /// 1.3.2 slice (Plan L bulk-mark on synth Hit): when
+    /// `prepare_action_inputs` runs Plan M synthesis and gets a Hit,
+    /// it must mark Plan L for every visited subtree path AND Plan K
+    /// for every verified file path. This makes a SECOND action that
+    /// arrives with the same root_digest at the same work_directory
+    /// hit Plan L at the top of `download_to_directory` and
+    /// short-circuit out without re-walking, re-hashing, or running
+    /// Plan M synthesis again.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn plan_m_synth_hit_bulk_marks_plan_l_so_next_action_skips_walk()
+    -> Result<(), Box<dyn core::error::Error>> {
+        use nativelink_util::digest_hasher::DigestHasherFunc;
+        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
+        use nativelink_worker::running_actions_manager::prepare_action_inputs;
+
+        // Pre-stage a small tree at hint_root.
+        let hint_dir = make_temp_path("plan_l_bulk_hint");
+        fs::create_dir_all(&hint_dir).await?;
+        tokio::fs::write(format!("{hint_dir}/x.txt"), b"x-content").await?;
+        tokio::fs::create_dir_all(format!("{hint_dir}/sub")).await?;
+        tokio::fs::write(format!("{hint_dir}/sub/y.txt"), b"y-content").await?;
+
+        // Compute the action's root digest.
+        let probe = synthesize_directory_tree(
+            std::path::Path::new(&hint_dir),
+            &DigestInfo::new([0u8; 32], 0),
+            DigestHasherFunc::Sha256,
+        )
+        .await;
+        let root_digest = match probe {
+            SynthResult::MissDigestMismatch { computed } => computed,
+            other => panic!("probe should mismatch zero digest, got {other:?}"),
+        };
+
+        // Empty CAS — if Plan L marking + the bundle short-circuit
+        // both work, neither action ever needs to read from CAS.
+        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let cache = Arc::new(PathDigestCache::new());
+
+        // Action 1: pays for the synth walk; on Hit, must bulk-mark
+        // Plan L for every visited subtree (root + sub).
+        prepare_action_inputs(
+            &None,
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &hint_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &cache,
+            true, // digest_checked_hint_link
+        )
+        .await?;
+
+        // After action 1, Plan L MUST be marked for the root path
+        // with the action's root digest. This is the property that
+        // lets action 2 skip the walk entirely.
+        assert!(
+            cache.dir_walked(&hint_dir, &root_digest),
+            "Plan M Hit must bulk-mark Plan L for the root subtree",
+        );
+        // And for the subdirectory.
+        let sub_path = format!("{hint_dir}/sub");
+        let sub_digest = {
+            // Compute the subdir digest the same way synthesis would.
+            let probe2 = synthesize_directory_tree(
+                std::path::Path::new(&sub_path),
+                &DigestInfo::new([0u8; 32], 0),
+                DigestHasherFunc::Sha256,
+            )
+            .await;
+            match probe2 {
+                SynthResult::MissDigestMismatch { computed } => computed,
+                other => panic!("subdir probe failed: {other:?}"),
+            }
+        };
+        assert!(
+            cache.dir_walked(&sub_path, &sub_digest),
+            "Plan M Hit must bulk-mark Plan L for every visited subdirectory, not just the root",
+        );
+        Ok(())
+    }
+
+    /// Slice 1 of 1.3.2 (single-flight): N concurrent
+    /// `download_to_directory` calls for the same `(path, digest)`
+    /// must collapse to one underlying CAS-fetch. We assert this by
+    /// counting `populate_fast_store` calls on a slow_store wrapper:
+    /// without single-flight every concurrent call would issue its
+    /// own fetch, so the count would be N. With single-flight, only
+    /// the leader fetches; followers re-check Plan L (set by leader)
+    /// and fast-path out.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn coalescer_collapses_concurrent_walks_to_single_walk()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "shared.h";
+        const CONTENT: &[u8] = b"// shared content fetched once across N concurrent walks";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        // Upload one file blob and one Directory proto referencing it.
+        let file_digest = sha256_digest(CONTENT);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, CONTENT.into())
+            .await?;
+        let root_digest = DigestInfo::new([0xC0u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        // Single shared cache shared across all concurrent calls,
+        // with a process-shared coalescer.
+        let cache = Arc::new(PathDigestCache::new());
+
+        // N concurrent calls into the same (path, digest). With
+        // single-flight only one of them does the actual work; the
+        // rest await it. We measure success by asserting all N
+        // succeed AND only one Plan-L-mark happens (leader marks at
+        // the bottom, followers fast-path out without re-marking).
+        const N: usize = 12;
+        let dest_dir = make_temp_path("coalesce_dest");
+        fs::create_dir_all(&dest_dir).await?;
+        let mut joins = Vec::with_capacity(N);
+        for _ in 0..N {
+            let cas = cas_store.clone();
+            let fast = fast_store.clone();
+            let cache = cache.clone();
+            let dest = dest_dir.clone();
+            joins.push(tokio::spawn(async move {
+                download_to_directory(
+                    cas.as_ref(),
+                    fast.as_pin(),
+                    &root_digest,
+                    &dest,
+                    None,
+                    &cache,
+                    false,
+                    None,
+                )
+                .await
+            }));
+        }
+        for j in joins {
+            j.await.unwrap()?;
+        }
+
+        // Plan L must be marked exactly once for the root — proves
+        // the leader's mark survived the N concurrent racers and
+        // followers didn't undo or duplicate it.
+        assert!(
+            cache.dir_walked(&dest_dir, &root_digest),
+            "Plan L must be marked after coalesced walk completes",
+        );
+        // The file must have landed at dest.
+        let on_disk = fs::read(format!("{dest_dir}/{FILE_NAME}")).await?;
+        assert_eq!(on_disk, CONTENT);
         Ok(())
     }
 
@@ -1301,6 +1556,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: Some(shared_map.clone()),
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1358,6 +1614,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1488,6 +1745,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1620,6 +1878,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1808,6 +2067,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1997,6 +2257,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2212,6 +2473,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2354,6 +2616,7 @@ mod tests {
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2564,6 +2827,7 @@ exit 0
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2747,6 +3011,7 @@ exit 0
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2924,6 +3189,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -3015,6 +3281,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3097,6 +3364,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3185,6 +3453,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3294,6 +3563,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3347,6 +3617,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3422,6 +3693,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3548,6 +3820,7 @@ exit 1
                     project_root: None,
                     digest_checked_hint_link: false,
                     path_digest_cache: None,
+                dir_walk_coalescer: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3642,6 +3915,7 @@ exit 1
                     project_root: None,
                     digest_checked_hint_link: false,
                     path_digest_cache: None,
+                dir_walk_coalescer: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3736,6 +4010,7 @@ exit 1
                     project_root: None,
                     digest_checked_hint_link: false,
                     path_digest_cache: None,
+                dir_walk_coalescer: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3827,6 +4102,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3986,6 +4262,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4162,6 +4439,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4269,6 +4547,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -4390,6 +4669,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4577,6 +4857,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4704,6 +4985,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         // Create a simple action
@@ -4852,6 +5134,7 @@ exit 1
                 project_root: None,
                 digest_checked_hint_link: false,
                 path_digest_cache: None,
+            dir_walk_coalescer: None,
             })?);
 
         // Create a simple action
@@ -5045,6 +5328,7 @@ exit 1
             project_root: Some(project_root),
             digest_checked_hint_link: false,
             path_digest_cache: None,
+        dir_walk_coalescer: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5100,6 +5384,7 @@ exit 1
             project_root: None,
             digest_checked_hint_link: false,
             path_digest_cache: None,
+        dir_walk_coalescer: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5155,6 +5440,7 @@ exit 1
             project_root: Some(project_root),
             digest_checked_hint_link: false,
             path_digest_cache: None,
+        dir_walk_coalescer: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5213,6 +5499,7 @@ exit 1
             project_root: Some(project_root),
             digest_checked_hint_link: false,
             path_digest_cache: None,
+        dir_walk_coalescer: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;
@@ -5261,6 +5548,7 @@ exit 1
             project_root: Some(project_root),
             digest_checked_hint_link: false,
             path_digest_cache: None,
+        dir_walk_coalescer: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;

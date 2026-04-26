@@ -117,6 +117,22 @@ static PLAN_M_SYNTH: StageStats = StageStats::new("worker.plan_m.synth");
 /// without this counter, the storm is invisible in the timing dump.
 static PLAN_I_FILE_HASH: StageStats =
     StageStats::new("worker.plan_i.file_hash");
+/// Single-flight `download_to_directory` coalescer counters. `lead`
+/// fires when this caller is the first for a `(path, digest)` and
+/// will do the actual walk. `follow` fires when another caller is
+/// already in-flight; we await them. `follow_late_miss` fires when
+/// after waiting we find Plan L still empty (leader failed) and fall
+/// through to running our own walk — should be near zero, dominates
+/// only when the underlying walk is consistently failing.
+static COALESCE_LEAD: StageStats = StageStats::new("worker.coalesce.lead");
+static COALESCE_FOLLOW: StageStats = StageStats::new("worker.coalesce.follow");
+static COALESCE_FOLLOW_LATE_MISS: StageStats =
+    StageStats::new("worker.coalesce.follow_late_miss");
+/// Wall-clock that followers spend awaiting their leader — the time
+/// they would otherwise have spent re-walking the same subtree. Pair
+/// with `follow` count to compute average savings per coalesce.
+static COALESCE_FOLLOW_WAIT: StageStats =
+    StageStats::new("worker.coalesce.follow_wait");
 static ACTION_EXECUTE: StageStats = StageStats::new("worker.action_execute");
 static UPLOAD_RESULTS: StageStats = StageStats::new("worker.upload_results");
 use parking_lot::Mutex;
@@ -198,6 +214,57 @@ pub fn download_to_directory<'a>(
             return Ok(());
         }
         PLAN_L_MISS.incr();
+
+        // Single-flight: if another concurrent action is already
+        // walking this exact (path, digest), wait for it instead of
+        // duplicating the work. This collapses the cold-start
+        // thundering herd (N actions × full recursive walk) into one
+        // walk + (N-1) cheap awaits. After the leader finishes we
+        // re-check Plan L — on success it hits and we fast-path out;
+        // on failure it stays empty and we fall through to do our own
+        // walk (so a transient leader error doesn't block followers).
+        let coalesce_path = std::path::PathBuf::from(current_directory);
+        let _lead_guard = match path_digest_cache
+            .coalescer()
+            .try_lead_or_follow(&coalesce_path, *digest)
+        {
+            crate::dir_walk_coalescer::CoalesceOutcome::Lead(g) => {
+                COALESCE_LEAD.incr();
+                Some(g)
+            }
+            crate::dir_walk_coalescer::CoalesceOutcome::Follow(slot) => {
+                COALESCE_FOLLOW.incr();
+                {
+                    let _t = COALESCE_FOLLOW_WAIT.timer();
+                    slot.wait().await;
+                }
+                if path_digest_cache.dir_walked(current_directory, digest) {
+                    trace!(
+                        ?digest,
+                        current_directory,
+                        "coalesce: leader succeeded, fast-path out"
+                    );
+                    return Ok(());
+                }
+                COALESCE_FOLLOW_LATE_MISS.incr();
+                trace!(
+                    ?digest,
+                    current_directory,
+                    "coalesce: leader failed; running our own walk"
+                );
+                // Try once more to claim the lead so a *third* caller
+                // arriving here can also coalesce against us. If we
+                // can't lead (someone else became the new leader
+                // first), just proceed without coalescing.
+                match path_digest_cache
+                    .coalescer()
+                    .try_lead_or_follow(&coalesce_path, *digest)
+                {
+                    crate::dir_walk_coalescer::CoalesceOutcome::Lead(g) => Some(g),
+                    crate::dir_walk_coalescer::CoalesceOutcome::Follow(_) => None,
+                }
+            }
+        };
 
         // Plan M: if a synthesis bundle from the top-level walk already
         // contains a Directory proto for this digest, skip the CAS round
@@ -636,7 +703,20 @@ pub async fn prepare_action_inputs(
     // when synthesis cost is dominating wall time on workloads
     // synthesis was not designed for (e.g. 100k-file hint tree
     // re-walked per action with no per-file memoization yet).
-    let synth_bundle = if digest_checked_hint_link && !plan_m_disabled_via_env() {
+    //
+    // Skip synthesis entirely if Plan L already has the root subtree
+    // marked walked at this work_directory. The downstream
+    // `download_to_directory` would Plan-L-hit on the first call and
+    // return immediately, so the synth walk would be pure overhead —
+    // hashing every file in `hint_root` only to throw the bundle away
+    // at the first Plan L check. After action 1 warms Plan L, every
+    // subsequent action with the same root_digest at the same
+    // work_directory takes this fast path.
+    let plan_l_already_warm = path_digest_cache.dir_walked(work_directory, digest);
+    let synth_bundle = if digest_checked_hint_link
+        && !plan_m_disabled_via_env()
+        && !plan_l_already_warm
+    {
         match hint_root.as_ref() {
             Some(hint) => {
                 let hasher_func = opentelemetry::Context::current()
@@ -2517,6 +2597,15 @@ pub struct RunningActionsManagerArgs<'a> {
     /// shared map does not silently override per-worker Redis-backed
     /// Plan L sharing.
     pub path_digest_cache: Option<crate::path_digest_cache::SharedPathDigestMap>,
+    /// Optional process-level shared single-flight registry. When
+    /// `Some`, concurrent `download_to_directory(path, digest)` calls
+    /// across every manager in the process collapse to one underlying
+    /// walk. Without this, N concurrent actions on a cold cache each
+    /// independently re-walk and re-hash the entire input tree
+    /// (the `cold_walk × N` problem we hit in 1.3.0/1.3.1). When
+    /// `None`, each manager builds its own coalescer (deduplicates
+    /// only within that manager).
+    pub dir_walk_coalescer: Option<crate::path_digest_cache::SharedDirWalkCoalescer>,
 }
 
 struct CleanupGuard {
@@ -2640,17 +2729,31 @@ impl RunningActionsManagerImpl {
                     } else {
                         Box::new(crate::path_digest_cache::LocalWalkedDirs::new())
                     };
-                let cache = if let Some(shared_map) = args.path_digest_cache {
-                    info!(
-                        walked_dirs_kind = walked_dirs.kind(),
-                        "Process-shared Plan K map injected; per-manager Plan L preserved",
-                    );
-                    crate::path_digest_cache::PathDigestCache::with_shared_map_and_walked_dirs(
-                        shared_map,
-                        walked_dirs,
-                    )
-                } else {
-                    crate::path_digest_cache::PathDigestCache::with_walked_dirs(walked_dirs)
+                let cache = match (args.path_digest_cache, args.dir_walk_coalescer) {
+                    (Some(shared_map), Some(shared_coalescer)) => {
+                        info!(
+                            walked_dirs_kind = walked_dirs.kind(),
+                            "Process-shared Plan K map + dir-walk coalescer injected",
+                        );
+                        crate::path_digest_cache::PathDigestCache::with_shared_state(
+                            shared_map,
+                            shared_coalescer,
+                            walked_dirs,
+                        )
+                    }
+                    (Some(shared_map), None) => {
+                        info!(
+                            walked_dirs_kind = walked_dirs.kind(),
+                            "Process-shared Plan K map injected; coalescer is per-manager",
+                        );
+                        crate::path_digest_cache::PathDigestCache::with_shared_map_and_walked_dirs(
+                            shared_map,
+                            walked_dirs,
+                        )
+                    }
+                    (None, _) => {
+                        crate::path_digest_cache::PathDigestCache::with_walked_dirs(walked_dirs)
+                    }
                 };
                 Arc::new(cache)
             },
