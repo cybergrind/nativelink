@@ -719,50 +719,101 @@ pub async fn prepare_action_inputs(
     {
         match hint_root.as_ref() {
             Some(hint) => {
-                let hasher_func = opentelemetry::Context::current()
-                    .get::<DigestHasherFunc>()
-                    .map_or_else(
-                        nativelink_util::digest_hasher::default_digest_hasher_func,
-                        |v| *v,
-                    );
-                let _synth_timer = PLAN_M_SYNTH.timer();
-                match crate::local_dir_synthesis::synthesize_directory_tree(
-                    hint, digest, hasher_func,
-                )
-                .await
-                {
-                    crate::local_dir_synthesis::SynthResult::Hit(bundle) => {
-                        PLAN_M_HIT.incr();
-                        trace!(
-                            ?digest,
-                            hint = %hint.display(),
-                            protos = bundle.protos.len(),
-                            verified_files = bundle.verified_files.len(),
-                            "Plan M: local synthesis hit, skipping CAS dir-proto fetches",
-                        );
-                        Some(Arc::new(bundle))
+                // Coalesce concurrent Plan M synth on the same
+                // (hint_root, root_digest). Without this, N actions
+                // arriving on a cold cache each independently walk +
+                // hash the entire hint tree before any of them mark
+                // Plan L — the cold-start herd we hit in production
+                // (1.3.0 / 1.3.1 / 1.3.2). With coalescing the first
+                // caller leads, the rest wait. On leader Hit we
+                // bulk-mark Plan L for every visited subtree so
+                // followers (and every subsequent action) Plan-L-hit
+                // at the root and skip the walk entirely.
+                let outcome = path_digest_cache
+                    .coalescer()
+                    .try_lead_or_follow(hint, *digest);
+                match outcome {
+                    crate::dir_walk_coalescer::CoalesceOutcome::Follow(slot) => {
+                        // Wait for the leader. After wake re-check
+                        // Plan L; on leader-success this hits and we
+                        // skip synth entirely.
+                        slot.wait().await;
+                        if path_digest_cache.dir_walked(work_directory, digest) {
+                            None
+                        } else {
+                            // Leader didn't mark Plan L (synth missed
+                            // or errored). Don't do our own synth —
+                            // fall through to the CAS path below
+                            // unchanged.
+                            None
+                        }
                     }
-                    crate::local_dir_synthesis::SynthResult::MissDigestMismatch {
-                        computed,
-                    } => {
-                        PLAN_M_MISS_DIGEST.incr();
-                        trace!(
-                            ?digest,
-                            ?computed,
-                            hint = %hint.display(),
-                            "Plan M miss: local tree digest != expected",
-                        );
-                        None
-                    }
-                    crate::local_dir_synthesis::SynthResult::MissIoError(e) => {
-                        PLAN_M_MISS_IO.incr();
-                        trace!(
-                            ?digest,
-                            hint = %hint.display(),
-                            ?e,
-                            "Plan M miss: I/O error walking hint tree",
-                        );
-                        None
+                    crate::dir_walk_coalescer::CoalesceOutcome::Lead(_guard) => {
+                        let hasher_func = opentelemetry::Context::current()
+                            .get::<DigestHasherFunc>()
+                            .map_or_else(
+                                nativelink_util::digest_hasher::default_digest_hasher_func,
+                                |v| *v,
+                            );
+                        let _synth_timer = PLAN_M_SYNTH.timer();
+                        match crate::local_dir_synthesis::synthesize_directory_tree(
+                            hint, digest, hasher_func,
+                        )
+                        .await
+                        {
+                            crate::local_dir_synthesis::SynthResult::Hit(bundle) => {
+                                PLAN_M_HIT.incr();
+                                // Bulk-mark Plan L for every visited
+                                // subtree. In shared-tree mode the
+                                // bundle's `dir_paths` are the same
+                                // absolute paths `download_to_directory`
+                                // will look up on subsequent actions.
+                                // Marking now means the very next
+                                // Plan L check at the root hits → no
+                                // recursion, no walk. This is what
+                                // collapses the steady-state to a
+                                // one-time cost.
+                                for (path, dir_digest) in &bundle.dir_paths {
+                                    if let Some(path_str) = path.to_str() {
+                                        path_digest_cache
+                                            .mark_dir_walked(path_str, *dir_digest);
+                                    }
+                                }
+                                trace!(
+                                    ?digest,
+                                    hint = %hint.display(),
+                                    protos = bundle.protos.len(),
+                                    verified_files = bundle.verified_files.len(),
+                                    dir_paths = bundle.dir_paths.len(),
+                                    "Plan M: local synthesis hit, bulk-marked Plan L, skipping CAS dir-proto fetches",
+                                );
+                                // Guard drops at end of match arm,
+                                // signalling waiting followers.
+                                Some(Arc::new(bundle))
+                            }
+                            crate::local_dir_synthesis::SynthResult::MissDigestMismatch {
+                                computed,
+                            } => {
+                                PLAN_M_MISS_DIGEST.incr();
+                                trace!(
+                                    ?digest,
+                                    ?computed,
+                                    hint = %hint.display(),
+                                    "Plan M miss: local tree digest != expected",
+                                );
+                                None
+                            }
+                            crate::local_dir_synthesis::SynthResult::MissIoError(e) => {
+                                PLAN_M_MISS_IO.incr();
+                                trace!(
+                                    ?digest,
+                                    hint = %hint.display(),
+                                    ?e,
+                                    "Plan M miss: I/O error walking hint tree",
+                                );
+                                None
+                            }
+                        }
                     }
                 }
             }

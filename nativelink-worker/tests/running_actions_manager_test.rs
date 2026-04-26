@@ -1191,6 +1191,97 @@ mod tests {
         Ok(())
     }
 
+    /// 1.3.3 slice (Plan M synth coalescing): N concurrent
+    /// `prepare_action_inputs` calls with the same `(hint_root,
+    /// root_digest)` on a cold cache must collapse to ONE Plan M
+    /// synth walk. Without coalescing, all N actions independently
+    /// hash the entire hint tree before any of them mark Plan L
+    /// (the production "synth herd" the user hit). With coalescing
+    /// the leader walks; followers wait + Plan-L-hit on wake.
+    ///
+    /// We assert by checking `worker.plan_m.synth.count` before vs.
+    /// after the concurrent burst — it must increment by exactly 1.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn concurrent_prepare_action_inputs_coalesce_plan_m_synth()
+    -> Result<(), Box<dyn core::error::Error>> {
+        use nativelink_util::digest_hasher::DigestHasherFunc;
+        use nativelink_util::timing::snapshot_all;
+        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
+        use nativelink_worker::running_actions_manager::prepare_action_inputs;
+
+        fn plan_m_synth_count() -> u64 {
+            snapshot_all()
+                .into_iter()
+                .find(|s| s.name == "worker.plan_m.synth")
+                .map(|s| s.count)
+                .unwrap_or(0)
+        }
+
+        let hint_dir = make_temp_path("plan_m_coalesce_hint");
+        fs::create_dir_all(&hint_dir).await?;
+        // A few files so synth has actual work to do (otherwise the
+        // walk could finish before any followers register).
+        for i in 0..6 {
+            tokio::fs::write(format!("{hint_dir}/f{i}.txt"), format!("content-{i}").as_bytes())
+                .await?;
+        }
+
+        let probe = synthesize_directory_tree(
+            std::path::Path::new(&hint_dir),
+            &DigestInfo::new([0u8; 32], 0),
+            DigestHasherFunc::Sha256,
+        )
+        .await;
+        let root_digest = match probe {
+            SynthResult::MissDigestMismatch { computed } => computed,
+            other => panic!("probe should mismatch zero digest, got {other:?}"),
+        };
+
+        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let cache = Arc::new(PathDigestCache::new());
+
+        let synth_count_before = plan_m_synth_count();
+
+        // Fire N concurrent prepare_action_inputs calls with the
+        // same root_digest at the same work_directory. Without
+        // coalescing each one runs its own synth walk (count
+        // increments by N). With coalescing only one runs.
+        const N: usize = 20;
+        let mut joins = Vec::with_capacity(N);
+        for _ in 0..N {
+            let cas = cas_store.clone();
+            let fast = fast_store.clone();
+            let cache = cache.clone();
+            let hint = hint_dir.clone();
+            joins.push(tokio::spawn(async move {
+                prepare_action_inputs(
+                    &None,
+                    cas.as_ref(),
+                    fast.as_pin(),
+                    &root_digest,
+                    &hint,
+                    Some(PathBuf::from(&hint)),
+                    &cache,
+                    true, // digest_checked_hint_link
+                )
+                .await
+            }));
+        }
+        for j in joins {
+            j.await.unwrap()?;
+        }
+
+        let synth_count_after = plan_m_synth_count();
+        let synth_runs = synth_count_after - synth_count_before;
+        assert!(
+            synth_runs <= 1,
+            "Plan M synth must coalesce: expected at most 1 walk for {N} concurrent \
+             actions on the same (hint_root, root_digest), got {synth_runs}",
+        );
+        Ok(())
+    }
+
     /// 1.3.2 slice (skip Plan M synth when Plan L already hits at
     /// root): once action 1 has marked Plan L for the root subtree,
     /// action 2 must not pay for another full hint-tree walk via Plan
