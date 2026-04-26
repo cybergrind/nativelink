@@ -103,6 +103,13 @@ static PLAN_M_MISS_DIGEST: StageStats =
 static PLAN_M_MISS_IO: StageStats = StageStats::new("worker.plan_m.miss_io_error");
 static PLAN_M_PROTO_REUSE: StageStats =
     StageStats::new("worker.plan_m.proto_reuse");
+/// Wall-clock cost of one top-level Plan M synthesis call (the
+/// recursive walk + per-file streaming hash + per-dir proto encode).
+/// This is the *cost* side of Plan M — paired with `plan_m.hit` it
+/// tells you whether synthesis is net-positive vs. the CAS
+/// round-trips it replaces. If `count` is high but `hit` is zero,
+/// every synthesis is being thrown away (mtime/mode drift).
+static PLAN_M_SYNTH: StageStats = StageStats::new("worker.plan_m.synth");
 static ACTION_EXECUTE: StageStats = StageStats::new("worker.action_execute");
 static UPLOAD_RESULTS: StageStats = StageStats::new("worker.upload_results");
 use parking_lot::Mutex;
@@ -608,6 +615,7 @@ pub async fn prepare_action_inputs(
                         nativelink_util::digest_hasher::default_digest_hasher_func,
                         |v| *v,
                     );
+                let _synth_timer = PLAN_M_SYNTH.timer();
                 match crate::local_dir_synthesis::synthesize_directory_tree(
                     hint, digest, hasher_func,
                 )
