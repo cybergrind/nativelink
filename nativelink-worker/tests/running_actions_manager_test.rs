@@ -1065,6 +1065,202 @@ mod tests {
             as for<'a> fn(&'a RunningActionsManagerArgs<'_>) -> &'a Option<String>;
     }
 
+    /// Cross-worker shared Plan K map: `RunningActionsManagerArgs`
+    /// must carry an injectable `Option<SharedPathDigestMap>` so that
+    /// callers can hoist the path->digest map to the process level
+    /// while every manager keeps its own per-instance walked-dirs
+    /// (Plan L) provider. Compile-only.
+    #[test]
+    fn running_actions_manager_args_accepts_shared_path_digest_cache() {
+        use nativelink_worker::path_digest_cache::SharedPathDigestMap;
+        use nativelink_worker::running_actions_manager::RunningActionsManagerArgs;
+        fn _assert_field_exists<'a>(
+            args: &'a RunningActionsManagerArgs<'_>,
+        ) -> &'a Option<SharedPathDigestMap> {
+            &args.path_digest_cache
+        }
+        let _ = _assert_field_exists
+            as for<'a> fn(
+                &'a RunningActionsManagerArgs<'_>,
+            ) -> &'a Option<SharedPathDigestMap>;
+    }
+
+    /// When two `RunningActionsManagerImpl` instances are constructed
+    /// with the same `SharedPathDigestMap` injected via args, they must
+    /// observe each other's Plan K inserts and the
+    /// `path_digest_cache().share_map()` accessor must return an Arc
+    /// identity-equal to the injected handle. Guards the cold-start
+    /// optimization at the manager boundary.
+    #[nativelink_test]
+    async fn shared_path_digest_cache_is_visible_across_workers()
+    -> Result<(), Box<dyn core::error::Error>> {
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, _, cas_store_a, ac_store_a) = setup_stores().await?;
+        let (_, _, cas_store_b, ac_store_b) = setup_stores().await?;
+        let root_a = make_temp_path("shared_cache_root_a");
+        let root_b = make_temp_path("shared_cache_root_b");
+        fs::create_dir_all(&root_a).await?;
+        fs::create_dir_all(&root_b).await?;
+
+        let shared_map =
+            nativelink_worker::path_digest_cache::new_shared_path_digest_map();
+
+        let upload_cfg = nativelink_config::cas_server::UploadActionResultConfig {
+            upload_ac_results_strategy:
+                nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+            ..Default::default()
+        };
+
+        let mgr_a = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory: root_a,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store_a.clone(),
+                ac_store: Some(Store::new(ac_store_a.clone())),
+                historical_store: Store::new(cas_store_a.clone()),
+                upload_action_result_config: &upload_cfg,
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
+                shared_tree_path: None,
+                project_root: None,
+                digest_checked_hint_link: false,
+                path_digest_cache: Some(shared_map.clone()),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        let mgr_b = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory: root_b,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store_b.clone(),
+                ac_store: Some(Store::new(ac_store_b.clone())),
+                historical_store: Store::new(cas_store_b.clone()),
+                upload_action_result_config: &upload_cfg,
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
+                shared_tree_path: None,
+                project_root: None,
+                digest_checked_hint_link: false,
+                path_digest_cache: Some(shared_map.clone()),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Identity: each manager's wrapper points at the injected map.
+        assert!(
+            Arc::ptr_eq(&shared_map, mgr_a.path_digest_cache().share_map()),
+            "manager A must hold the injected map by identity",
+        );
+        assert!(
+            Arc::ptr_eq(&shared_map, mgr_b.path_digest_cache().share_map()),
+            "manager B must hold the injected map by identity",
+        );
+
+        // Visibility: an insert through one manager is observable
+        // through the other.
+        let path = PathBuf::from("/shared/test/path.bin");
+        let digest = DigestInfo::new([42u8; 32], 1234);
+        mgr_a
+            .path_digest_cache()
+            .insert(path.clone(), digest);
+
+        assert!(
+            mgr_b.path_digest_cache().contains(&path, &digest),
+            "manager B must observe insert via shared map",
+        );
+        Ok(())
+    }
+
+    /// Slice 1 regression test (Plan M): when a `SharedPathDigestMap`
+    /// is injected AND `shared_walked_dirs_redis_url` is set, the
+    /// manager must build a Redis-backed walked-dirs provider —
+    /// **not** silently fall back to `LocalWalkedDirs`. Verified via
+    /// `walked_dirs_kind()` which returns "local" or "redis" without
+    /// requiring an actual Redis connection.
+    #[nativelink_test]
+    async fn shared_map_does_not_silence_redis_walked_dirs_config()
+    -> Result<(), Box<dyn core::error::Error>> {
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let root = make_temp_path("shared_map_redis_root");
+        fs::create_dir_all(&root).await?;
+
+        let shared_map =
+            nativelink_worker::path_digest_cache::new_shared_path_digest_map();
+
+        let upload_cfg = nativelink_config::cas_server::UploadActionResultConfig {
+            upload_ac_results_strategy:
+                nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+            ..Default::default()
+        };
+
+        // Syntactically-valid Redis URL pointed at an unused port. The
+        // provider is constructed without opening a connection, so this
+        // is safe in unit tests; what we actually verify is that
+        // `walked_dirs_kind() == "redis"`.
+        let mgr = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory: root,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config: &upload_cfg,
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                shared_walked_dirs_redis_url: Some(
+                    "redis://127.0.0.1:6399/0".to_string(),
+                ),
+                machine_id: "test-machine-id".to_string(),
+                shared_tree_path: None,
+                project_root: None,
+                digest_checked_hint_link: false,
+                path_digest_cache: Some(shared_map.clone()),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        assert_eq!(
+            mgr.path_digest_cache().walked_dirs_kind(),
+            "redis",
+            "Redis-backed walked-dirs must be honored even when a SharedPathDigestMap is injected",
+        );
+        // And the Plan K map is still the injected one.
+        assert!(
+            Arc::ptr_eq(&shared_map, mgr.path_digest_cache().share_map()),
+            "shared Plan K map must still be wired through",
+        );
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn ensure_output_files_full_directories_are_created_no_working_directory_test()
     -> Result<(), Box<dyn core::error::Error>> {
@@ -1101,6 +1297,7 @@ mod tests {
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1230,6 +1427,7 @@ mod tests {
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1361,6 +1559,7 @@ mod tests {
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1548,6 +1747,7 @@ mod tests {
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1736,6 +1936,7 @@ mod tests {
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1950,6 +2151,7 @@ mod tests {
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2091,6 +2293,7 @@ mod tests {
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2300,6 +2503,7 @@ exit 0
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2482,6 +2686,7 @@ exit 0
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2658,6 +2863,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2748,6 +2954,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2829,6 +3036,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2916,6 +3124,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3024,6 +3233,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3076,6 +3286,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3150,6 +3361,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3275,6 +3487,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3368,6 +3581,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3461,6 +3675,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3551,6 +3766,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3709,6 +3925,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3884,6 +4101,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3990,6 +4208,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -4110,6 +4329,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4296,6 +4516,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4422,6 +4643,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         // Create a simple action
@@ -4569,6 +4791,7 @@ exit 1
                 shared_tree_path: None,
                 project_root: None,
                 digest_checked_hint_link: false,
+                path_digest_cache: None,
             })?);
 
         // Create a simple action
@@ -4762,6 +4985,7 @@ exit 1
             shared_tree_path: None,
             project_root: Some(project_root),
             digest_checked_hint_link: false,
+            path_digest_cache: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -4817,6 +5041,7 @@ exit 1
             shared_tree_path: None,
             project_root: None,
             digest_checked_hint_link: false,
+            path_digest_cache: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -4872,6 +5097,7 @@ exit 1
             shared_tree_path: None,
             project_root: Some(project_root),
             digest_checked_hint_link: false,
+            path_digest_cache: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -4930,6 +5156,7 @@ exit 1
             shared_tree_path: None,
             project_root: Some(project_root),
             digest_checked_hint_link: false,
+            path_digest_cache: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;
@@ -4978,6 +5205,7 @@ exit 1
             shared_tree_path: None,
             project_root: Some(project_root),
             digest_checked_hint_link: false,
+            path_digest_cache: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;

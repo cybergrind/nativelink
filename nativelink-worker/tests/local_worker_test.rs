@@ -454,6 +454,7 @@ async fn new_local_worker_creates_work_directory_test() -> Result<(), Error> {
         cas_store.clone(),
         Some(ac_store),
         cas_store,
+        None,
     )
     .await?;
 
@@ -501,6 +502,7 @@ async fn new_local_worker_removes_work_directory_before_start_test() -> Result<(
         cas_store.clone(),
         Some(ac_store),
         cas_store,
+        None,
     )
     .await?;
 

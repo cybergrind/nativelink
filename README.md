@@ -99,22 +99,33 @@ Client (siso) uploads blob via ByteStream.Write
   tells the worker about missing files. Workers do not walk input trees
   themselves — they just drain the journal.
 
-- **Per-worker caches (Plan K/L)**: in-memory caches retained as a safety net
-  for the cases where the journal isn't used (config missing, Redis
-  unreachable).
+- **Process-shared caches (Plan K/L)**: the in-memory `(path, digest)` cache
+  (Plan K) and walked-dirs cache (Plan L) are constructed once per
+  `nativelink` process and shared by every `workers[]` entry that lives in
+  it. This eliminates the per-worker cold-start hashing tax: the first
+  worker to verify a pre-staged file primes the cache for every other
+  worker on the same machine, with no CAS round-trips. The map is backed
+  by an `RwLock` so concurrent `contains` lookups (the steady-state hot
+  path) do not serialize on each other. Sharing is in-process only —
+  state is unbounded in size, does not survive restarts, and refills
+  lazily on first use.
 
 - **Trust-EEXIST on hard_link**: if a file already exists on disk, we trust it.
   Combined with the scheduler-side dedup, this means the journal only lists
   files the worker actually needs to fetch.
 
-- **Plan I (digest-checked hint link, opt-in)**: legacy Plan I was disabled
-  because it size-matched only and silently substituted same-size/different-
-  content files. The opt-in `experimental_digest_checked_hint_link`
+- **Plan I (digest-checked hint link, on by default since 1.3.0)**: legacy
+  Plan I was disabled because it size-matched only and silently substituted
+  same-size/different-content files. `experimental_digest_checked_hint_link`
   re-enables the hardlink-from-pre-staged-tree fast path with a streaming
-  hash check against the action's digest function. Correctness-preserving:
-  any miss (size, content, missing, I/O) falls through to the existing CAS
-  path. Primary win is for off-LAN / tunnel-bound workers where local
-  hashing is orders of magnitude cheaper than a CAS round-trip.
+  hash check against the action's digest function and is now **on by
+  default**. Correctness-preserving: any miss (size, content, missing, I/O)
+  falls through to the existing CAS path. On a Plan K miss the worker pays
+  a local stat+hash, fills the process-shared Plan K cache, and
+  short-circuits the network CAS round trip; after the first action
+  touches a given file every other worker in the same `nativelink`
+  process gets the result for free. Set the field to `false` to opt out
+  (e.g. on workers without a pre-staged source tree on disk).
 
 ## Target use case
 
@@ -193,15 +204,18 @@ new config field:
 | `workers[].local.machine_id` | Worker | With Redis | Machine identifier — **must equal `name`** and must match the value used across Redis keys for this worker |
 | `workers[].local.name` | Worker | With Redis | Worker name prefix — **must equal `machine_id`** (scheduler strips a 36-char UUID suffix to recover `machine_id`) |
 | `workers[].local.project_root` | Worker | Optional | `{ in_action, on_disk }` path remap for workers whose local tree path differs from the action-borne `InputRootAbsolutePath`. Unset → identity (same path on worker and in action). |
-| `workers[].local.experimental_digest_checked_hint_link` | Worker | Optional | Re-enable Plan I (hardlink-from-pre-staged-tree) with per-file digest verification. On Plan K miss the worker stream-hashes the on-disk file at `hint_root/<name>` with the action's digest function and only short-circuits CAS on a full `(path, digest)` match. Misses (size, content, missing, I/O) fall through to CAS unchanged. Default `false`. Off-LAN workers where CAS is tunnel-bound are the primary use case — local hashing is orders of magnitude cheaper than the network round-trip. |
+| `workers[].local.experimental_digest_checked_hint_link` | Worker | Default `true` (since 1.3.0) | Plan I: hardlink-from-pre-staged-tree with per-file digest verification. On Plan K miss the worker stream-hashes the on-disk file at `hint_root/<name>` with the action's digest function and only short-circuits CAS on a full `(path, digest)` match. Misses (size, content, missing, I/O) fall through to CAS unchanged. Combined with the process-shared Plan K cache, the first action seeds the cache via local hashing and every subsequent worker in the same process reuses it without any CAS round-trip. Set to `false` to opt out on workers without an on-disk source tree. |
 
 **All three `*_redis_url` values must point to the same Redis instance.**
 
 ### Minimal config (no Redis, fallback mode)
 
 If you omit all Redis URLs, the worker falls back to walking the input tree
-via `download_to_directory` as before. In-memory caches (Plan K/L) still
-speed up repeated actions within a single worker process.
+via `download_to_directory` as before. The process-shared in-memory caches
+(Plan K/L) still speed up repeated actions across every `workers[]` entry
+in the same `nativelink` process. `experimental_digest_checked_hint_link`
+is on by default in this mode too, so any host with the pre-staged source
+tree recovers most of the cold-start win without any external services.
 
 ### Pre-staging the source tree
 

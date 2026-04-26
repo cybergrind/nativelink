@@ -2358,6 +2358,19 @@ pub struct RunningActionsManagerArgs<'a> {
     /// expected digest before hitting CAS. On match → hardlink-from-disk
     /// (Plan I). On miss → falls through to CAS unchanged.
     pub digest_checked_hint_link: bool,
+    /// Optional process-level shared path->digest map (Plan K). When
+    /// `Some`, every `RunningActionsManagerImpl` constructed with the
+    /// same `SharedPathDigestMap` shares the in-memory Plan K state so
+    /// the first worker to verify a (path, digest) pair primes the
+    /// cache for every other worker in the same nativelink process.
+    /// When `None`, each manager constructs its own per-instance map.
+    ///
+    /// The walked-dirs provider (Plan L) is **not** carried by this
+    /// field — each manager builds its own provider from
+    /// `shared_walked_dirs_redis_url` / `machine_id`, so injecting a
+    /// shared map does not silently override per-worker Redis-backed
+    /// Plan L sharing.
+    pub path_digest_cache: Option<crate::path_digest_cache::SharedPathDigestMap>,
 }
 
 struct CleanupGuard {
@@ -2462,23 +2475,39 @@ impl RunningActionsManagerImpl {
             directory_cache: args.directory_cache,
             project_root: args.project_root,
             digest_checked_hint_link: args.digest_checked_hint_link,
-            path_digest_cache: Arc::new(
-                if let Some(ref redis_url) = args.shared_walked_dirs_redis_url {
-                    let machine_id = if args.machine_id.is_empty() {
-                        "default"
+            path_digest_cache: {
+                // Plan L provider is always per-manager: each worker honors
+                // its own `shared_walked_dirs_redis_url`/`machine_id` even
+                // when the Plan K map is process-shared.
+                let walked_dirs: Box<dyn crate::path_digest_cache::WalkedDirsProvider> =
+                    if let Some(ref redis_url) = args.shared_walked_dirs_redis_url {
+                        let machine_id = if args.machine_id.is_empty() {
+                            "default"
+                        } else {
+                            &args.machine_id
+                        };
+                        let redis_walked_dirs = crate::path_digest_cache::RedisWalkedDirs::new(
+                            redis_url, machine_id,
+                        )?;
+                        info!("Per-machine walked-dirs cache enabled via Redis: {redis_url}");
+                        Box::new(redis_walked_dirs)
                     } else {
-                        &args.machine_id
+                        Box::new(crate::path_digest_cache::LocalWalkedDirs::new())
                     };
-                    let redis_walked_dirs =
-                        crate::path_digest_cache::RedisWalkedDirs::new(redis_url, machine_id)?;
-                    info!("Per-machine walked-dirs cache enabled via Redis: {redis_url}");
-                    crate::path_digest_cache::PathDigestCache::with_walked_dirs(
-                        Box::new(redis_walked_dirs),
+                let cache = if let Some(shared_map) = args.path_digest_cache {
+                    info!(
+                        walked_dirs_kind = walked_dirs.kind(),
+                        "Process-shared Plan K map injected; per-manager Plan L preserved",
+                    );
+                    crate::path_digest_cache::PathDigestCache::with_shared_map_and_walked_dirs(
+                        shared_map,
+                        walked_dirs,
                     )
                 } else {
-                    crate::path_digest_cache::PathDigestCache::new()
-                },
-            ),
+                    crate::path_digest_cache::PathDigestCache::with_walked_dirs(walked_dirs)
+                };
+                Arc::new(cache)
+            },
         };
 
         // Periodic timing dump: log a sorted summary of every registered
@@ -2521,6 +2550,16 @@ impl RunningActionsManagerImpl {
                 sleep_fn: |duration| Box::pin(tokio::time::sleep(duration)),
             },
         )
+    }
+
+    /// Returns the `PathDigestCache` (Plan K + Plan L) this manager is using.
+    /// When a single `Arc<PathDigestCache>` is injected via
+    /// `RunningActionsManagerArgs::path_digest_cache`, every manager built
+    /// from that args returns an identity-equal `Arc` here, which lets a
+    /// process-level owner verify that all `workers[]` entries truly share
+    /// one in-memory cache.
+    pub fn path_digest_cache(&self) -> &Arc<crate::path_digest_cache::PathDigestCache> {
+        &self.path_digest_cache
     }
 
     /// Fixes a race condition that occurs when an action fails to execute on a worker, and the same worker

@@ -514,6 +514,7 @@ pub async fn new_local_worker(
     cas_store: Store,
     ac_store: Option<Store>,
     historical_store: Store,
+    path_digest_cache: Option<crate::path_digest_cache::SharedPathDigestMap>,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
     let fast_slow_store = cas_store
         .downcast_ref::<FastSlowStore>(None)
@@ -623,6 +624,7 @@ pub async fn new_local_worker(
                 }),
             project_root: config.project_root.clone(),
             digest_checked_hint_link: config.experimental_digest_checked_hint_link,
+            path_digest_cache,
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),

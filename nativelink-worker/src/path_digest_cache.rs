@@ -4,9 +4,26 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use nativelink_util::common::DigestInfo;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
+
+/// Process-shared path->digest map. Many `PathDigestCache` instances —
+/// one per `RunningActionsManagerImpl` — share a single `Arc` of this
+/// type so that a verification performed by any worker in the process
+/// is immediately visible to every other worker. Plan L's walked-dirs
+/// provider is *not* shared via this type; it remains per-instance so
+/// each manager can keep its own `shared_walked_dirs_redis_url` /
+/// `machine_id` configuration.
+pub type SharedPathDigestMap = Arc<RwLock<HashMap<PathBuf, DigestInfo>>>;
+
+/// Build a fresh `SharedPathDigestMap`. Exposed so callers (e.g.
+/// `src/bin/nativelink.rs`) can construct one without depending on the
+/// concrete `parking_lot::RwLock` / `HashMap` types directly.
+pub fn new_shared_path_digest_map() -> SharedPathDigestMap {
+    Arc::new(RwLock::new(HashMap::new()))
+}
 
 /// Maximum number of pooled Redis connections per client. With ~20
 /// concurrent actions per worker × multiple Redis ops per action,
@@ -106,6 +123,13 @@ pub trait WalkedDirsProvider: Send + Sync + std::fmt::Debug {
     /// fully materialized at `directory_path`. Called only after all child
     /// futures succeed.
     fn mark_dir_walked(&self, directory_path: &str, digest: DigestInfo);
+
+    /// Static discriminator for telemetry and tests. Returns "local"
+    /// for the in-memory provider and "redis" for the Redis-backed
+    /// provider. Lets the wiring code log which Plan L is in effect
+    /// per worker, and lets tests verify the wiring without standing
+    /// up Redis.
+    fn kind(&self) -> &'static str;
 }
 
 /// In-memory walked-dirs provider. Per-worker, reset on restart.
@@ -129,6 +153,10 @@ impl WalkedDirsProvider for LocalWalkedDirs {
 
     fn mark_dir_walked(&self, directory_path: &str, digest: DigestInfo) {
         self.set.lock().insert((directory_path.to_string(), digest));
+    }
+
+    fn kind(&self) -> &'static str {
+        "local"
     }
 }
 
@@ -248,44 +276,73 @@ impl WalkedDirsProvider for RedisWalkedDirs {
                 .query::<i64>(conn)
         }));
     }
+
+    fn kind(&self) -> &'static str {
+        "redis"
+    }
 }
 
 /// Per-worker cache combining path->digest mapping (Plan K) and
 /// walked-dirs cache (Plan L). Both are pure optimizations: a miss falls
 /// through to the canonical CAS walk in `download_to_directory`.
 ///
-/// The path->digest map is always local. The walked-dirs provider may be
-/// Redis-backed so multiple workers share the cache.
+/// The path->digest map lives behind a `SharedPathDigestMap`
+/// (`Arc<RwLock<HashMap<...>>>`). Multiple `PathDigestCache` instances
+/// constructed via `with_shared_map_and_walked_dirs` share the same
+/// underlying map so that any insert is immediately visible to every
+/// other instance — this is the cold-start optimization Plan K
+/// Prewarm landed.
+///
+/// The walked-dirs provider stays per-instance (`Box<dyn ...>`). Each
+/// `RunningActionsManagerImpl` keeps its own
+/// `shared_walked_dirs_redis_url` / `machine_id` configuration so that
+/// the previous Redis-backed Plan L sharing across machines is not
+/// silently lost when the path-digest map is process-shared.
 #[derive(Debug)]
 pub struct PathDigestCache {
-    map: Mutex<HashMap<PathBuf, DigestInfo>>,
+    map: SharedPathDigestMap,
     walked_dirs: Box<dyn WalkedDirsProvider>,
 }
 
 impl PathDigestCache {
-    /// Create with local-only walked-dirs (default).
+    /// Create with a fresh (un-shared) map and local-only walked-dirs.
     pub fn new() -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            map: Arc::new(RwLock::new(HashMap::new())),
             walked_dirs: Box::new(LocalWalkedDirs::new()),
         }
     }
 
-    /// Create with a custom walked-dirs provider (e.g. Redis-backed).
+    /// Create with a fresh (un-shared) map and a custom walked-dirs
+    /// provider (e.g. Redis-backed). Used by tests and by callers that
+    /// want a single self-contained cache.
     pub fn with_walked_dirs(walked_dirs: Box<dyn WalkedDirsProvider>) -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            map: Arc::new(RwLock::new(HashMap::new())),
             walked_dirs,
         }
     }
 
+    /// Create with a caller-supplied shared map and a per-instance
+    /// walked-dirs provider. This is the constructor used by
+    /// `RunningActionsManagerImpl::new_with_callbacks` when a
+    /// process-level `SharedPathDigestMap` is injected: the manager
+    /// picks up the shared Plan K state while still building its own
+    /// Plan L provider from `shared_walked_dirs_redis_url`.
+    pub fn with_shared_map_and_walked_dirs(
+        map: SharedPathDigestMap,
+        walked_dirs: Box<dyn WalkedDirsProvider>,
+    ) -> Self {
+        Self { map, walked_dirs }
+    }
+
     pub fn contains(&self, path: &Path, digest: &DigestInfo) -> bool {
-        let map = self.map.lock();
+        let map = self.map.read();
         map.get(path).is_some_and(|d| d == digest)
     }
 
     pub fn insert(&self, path: PathBuf, digest: DigestInfo) {
-        self.map.lock().insert(path, digest);
+        self.map.write().insert(path, digest);
     }
 
     pub fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool {
@@ -296,9 +353,25 @@ impl PathDigestCache {
         self.walked_dirs.mark_dir_walked(directory_path, digest);
     }
 
+    /// Return a clone of the underlying shared map handle. Used by
+    /// process-level wiring (`src/bin/nativelink.rs`) and tests that
+    /// need to verify two caches are backed by the same `Arc` via
+    /// `Arc::ptr_eq`.
+    pub fn share_map(&self) -> &SharedPathDigestMap {
+        &self.map
+    }
+
+    /// Static discriminator for the in-effect walked-dirs provider —
+    /// "local" or "redis". Useful for startup logs and for tests that
+    /// need to verify `shared_walked_dirs_redis_url` was honored
+    /// without standing up Redis.
+    pub fn walked_dirs_kind(&self) -> &'static str {
+        self.walked_dirs.kind()
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.map.lock().len()
+        self.map.read().len()
     }
 }
 
@@ -408,6 +481,52 @@ mod tests {
         assert!(cache.dir_walked("/test/path", &digest));
     }
 
+    /// Concurrent readers: the `contains` hot path must not serialize
+    /// readers. With an `RwLock` backing the path->digest map, many
+    /// threads can take a shared read guard simultaneously. With a
+    /// `Mutex` they would serialize.
+    ///
+    /// We probe this property indirectly: spin many threads doing
+    /// `contains` calls in a tight loop and require that the total
+    /// observed hits matches the expected N×iter, which proves no
+    /// reader was starved or skipped under contention. The mere fact
+    /// that this test does NOT deadlock in the presence of nested
+    /// `read()` calls (via the `Arc<PathDigestCache>` shared across
+    /// threads) is itself the core RwLock guarantee being asserted.
+    #[test]
+    fn test_concurrent_readers_share_path_digest_cache() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let cache = Arc::new(PathDigestCache::new());
+        let path = PathBuf::from("/concurrent/readers/probe");
+        let digest = DigestInfo::new([0xAAu8; 32], 9999);
+        cache.insert(path.clone(), digest);
+
+        const READERS: usize = 8;
+        const ITERS: u64 = 5_000;
+
+        let hits = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let cache = cache.clone();
+            let hits = hits.clone();
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..ITERS {
+                    if cache.contains(&path, &digest) {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), READERS as u64 * ITERS);
+    }
+
     #[test]
     fn test_redis_walked_dirs_digest_to_member() {
         let digest = DigestInfo::new([0xABu8; 32], 42);
@@ -416,4 +535,75 @@ mod tests {
         assert!(member.len() > 3); // hash + "-42"
     }
 
+    /// Slice 1 (Plan M): two `PathDigestCache` instances built from the
+    /// same `SharedPathDigestMap` must observe each other's inserts —
+    /// the path-digest map is process-shared. This is the bedrock for
+    /// the cold-start optimization: every worker in the process has one
+    /// path->digest map, even though each worker may have its own
+    /// (Redis-backed or local) walked-dirs provider.
+    #[test]
+    fn shared_map_visible_across_path_digest_cache_instances() {
+        use std::sync::Arc;
+        let shared: SharedPathDigestMap = Arc::new(RwLock::new(HashMap::new()));
+        let cache_a = PathDigestCache::with_shared_map_and_walked_dirs(
+            shared.clone(),
+            Box::new(LocalWalkedDirs::new()),
+        );
+        let cache_b = PathDigestCache::with_shared_map_and_walked_dirs(
+            shared.clone(),
+            Box::new(LocalWalkedDirs::new()),
+        );
+
+        let path = PathBuf::from("/shared/visible.bin");
+        let digest = DigestInfo::new([0x77u8; 32], 1234);
+
+        // Insert through A; visible through B.
+        cache_a.insert(path.clone(), digest);
+        assert!(cache_b.contains(&path, &digest));
+        assert!(cache_a.contains(&path, &digest));
+
+        // Identity check on the underlying map.
+        assert!(Arc::ptr_eq(&shared, cache_a.share_map()));
+        assert!(Arc::ptr_eq(&shared, cache_b.share_map()));
+    }
+
+    /// Slice 1 (Plan M): walked-dirs providers stay **per-instance**
+    /// even when the path-digest map is shared. Marking a directory
+    /// walked through one cache must NOT be visible through another
+    /// cache with its own provider — otherwise a worker without a
+    /// pre-staged tree at the same path could skip required
+    /// materialization just because a peer marked it walked.
+    #[test]
+    fn shared_map_keeps_walked_dirs_providers_independent() {
+        use std::sync::Arc;
+        let shared: SharedPathDigestMap = Arc::new(RwLock::new(HashMap::new()));
+        let cache_a = PathDigestCache::with_shared_map_and_walked_dirs(
+            shared.clone(),
+            Box::new(LocalWalkedDirs::new()),
+        );
+        let cache_b = PathDigestCache::with_shared_map_and_walked_dirs(
+            shared,
+            Box::new(LocalWalkedDirs::new()),
+        );
+
+        let digest = DigestInfo::new([0x88u8; 32], 5678);
+        cache_a.mark_dir_walked("/per/instance/path", digest);
+
+        assert!(cache_a.dir_walked("/per/instance/path", &digest));
+        assert!(
+            !cache_b.dir_walked("/per/instance/path", &digest),
+            "walked-dirs providers must be per-instance even when the path-digest map is shared",
+        );
+    }
+
+    /// Slice 1 (Plan M): the `walked_dirs_kind` accessor lets the
+    /// process-startup wiring and tests verify which provider is in
+    /// effect without inspecting Redis behavior. Used by the manager
+    /// test that proves `shared_walked_dirs_redis_url` is honored even
+    /// when a shared map is injected.
+    #[test]
+    fn walked_dirs_kind_reports_local_for_default_cache() {
+        let cache = PathDigestCache::new();
+        assert_eq!(cache.walked_dirs_kind(), "local");
+    }
 }

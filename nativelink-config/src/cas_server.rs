@@ -933,14 +933,19 @@ pub struct LocalWorkerConfig {
     /// and only short-circuits on a full `(path, digest)` match. Misses
     /// fall through to the existing CAS path unchanged.
     ///
-    /// Off by default. Turn on per-worker; primarily useful for off-LAN
-    /// workers where a CAS fetch is tunnel-bound and a local hash is
-    /// orders of magnitude cheaper than the network round-trip.
+    /// On by default since 1.3.0: pairs with the process-shared Plan K
+    /// cache to amortize the cold-start verification across every worker
+    /// in the same `nativelink` process and skip CAS round-trips for
+    /// any pre-staged file that matches the action digest. Set to
+    /// `false` to opt out (e.g. workers without an on-disk source tree).
     ///
-    /// Default: false (Plan I stays disabled, only Plan K's
-    /// `path_digest_cache` short-circuits)
-    #[serde(default)]
+    /// Default: true
+    #[serde(default = "default_experimental_digest_checked_hint_link")]
     pub experimental_digest_checked_hint_link: bool,
+}
+
+const fn default_experimental_digest_checked_hint_link() -> bool {
+    true
 }
 
 /// Per-worker path remap for the action-borne `InputRootAbsolutePath`.
@@ -1074,5 +1079,68 @@ impl CasConfig {
         let json_contents = std::fs::read_to_string(config_file)
             .err_tip(|| format!("Could not open config file {config_file}"))?;
         Ok(serde_json5::from_str(&json_contents)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal JSON5 that satisfies every non-defaulted field of
+    /// `LocalWorkerConfig`. Used by the `experimental_digest_checked_hint_link`
+    /// default-flip tests below so they exercise serde's default path.
+    const MINIMAL_LOCAL_WORKER_CFG: &str = r#"{
+        "worker_api_endpoint": { "uri": "grpc://127.0.0.1:50061" },
+        "cas_fast_slow_store": "CAS_MAIN_STORE",
+        "work_directory": "/tmp/work",
+        "platform_properties": {}
+    }"#;
+
+    /// `experimental_digest_checked_hint_link` defaults to `true`: any
+    /// `LocalWorkerConfig` deserialized from a config that omits the
+    /// field must come out with Plan I enabled. This is the documented
+    /// recommended setting and the cold-start optimization relies on it
+    /// being on out of the box.
+    #[test]
+    fn experimental_digest_checked_hint_link_defaults_to_true() {
+        let cfg: LocalWorkerConfig =
+            serde_json5::from_str(MINIMAL_LOCAL_WORKER_CFG).expect("minimal cfg parses");
+        assert!(
+            cfg.experimental_digest_checked_hint_link,
+            "experimental_digest_checked_hint_link must default to true",
+        );
+    }
+
+    /// Explicit `false` in the user-provided config still wins, so
+    /// operators can opt out without rebuilding.
+    #[test]
+    fn experimental_digest_checked_hint_link_explicit_false_is_respected() {
+        let cfg_json = r#"{
+            "worker_api_endpoint": { "uri": "grpc://127.0.0.1:50061" },
+            "cas_fast_slow_store": "CAS_MAIN_STORE",
+            "work_directory": "/tmp/work",
+            "platform_properties": {},
+            "experimental_digest_checked_hint_link": false
+        }"#;
+        let cfg: LocalWorkerConfig =
+            serde_json5::from_str(cfg_json).expect("explicit-false cfg parses");
+        assert!(!cfg.experimental_digest_checked_hint_link);
+    }
+
+    /// Explicit `true` round-trips just like any other bool: catches
+    /// regressions where a future refactor accidentally inverts the
+    /// boolean polarity in the deserializer.
+    #[test]
+    fn experimental_digest_checked_hint_link_explicit_true_is_respected() {
+        let cfg_json = r#"{
+            "worker_api_endpoint": { "uri": "grpc://127.0.0.1:50061" },
+            "cas_fast_slow_store": "CAS_MAIN_STORE",
+            "work_directory": "/tmp/work",
+            "platform_properties": {},
+            "experimental_digest_checked_hint_link": true
+        }"#;
+        let cfg: LocalWorkerConfig =
+            serde_json5::from_str(cfg_json).expect("explicit-true cfg parses");
+        assert!(cfg.experimental_digest_checked_hint_link);
     }
 }

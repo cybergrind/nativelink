@@ -626,6 +626,16 @@ async fn inner_main(
         // of these services it will be able to connect.
         let worker_cfgs = cfg.workers.unwrap_or_default();
         let mut worker_names = HashSet::with_capacity(worker_cfgs.len());
+        // Process-shared Plan K map. Constructed once here and handed to
+        // every `workers[]` entry so that input-tree verification performed
+        // by one worker primes the in-memory cache for every other worker
+        // living in the same nativelink process. Plan L (walked-dirs) is
+        // intentionally **not** carried by this handle — each worker keeps
+        // its own `shared_walked_dirs_redis_url` / `machine_id` provider so
+        // the existing Redis-backed cross-machine Plan L sharing remains
+        // intact.
+        let shared_path_digest_map =
+            nativelink_worker::path_digest_cache::new_shared_path_digest_map();
         for (i, worker_cfg) in worker_cfgs.into_iter().enumerate() {
             let spawn_fut = match worker_cfg {
                 WorkerConfig::Local(local_worker_cfg) => {
@@ -666,6 +676,7 @@ async fn inner_main(
                         fast_slow_store,
                         maybe_ac_store,
                         historical_store,
+                        Some(shared_path_digest_map.clone()),
                     )
                     .await
                     .err_tip(|| "Could not make LocalWorker")?;
