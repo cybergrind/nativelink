@@ -14,6 +14,7 @@
 
 pub mod directory_cache;
 pub mod file_digest_check;
+pub mod local_dir_synthesis;
 pub mod local_worker;
 pub mod path_digest_cache;
 pub mod running_actions_manager;

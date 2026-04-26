@@ -236,6 +236,7 @@ mod tests {
                 None,
                 &PathDigestCache::new(),
                 false,
+                None,
             )
             .await?;
             download_dir
@@ -344,6 +345,7 @@ mod tests {
                 None,
                 &PathDigestCache::new(),
                 false,
+                None,
             )
             .await?;
             download_dir
@@ -421,6 +423,7 @@ mod tests {
                 None,
                 &PathDigestCache::new(),
                 false,
+                None,
             )
             .await?;
             download_dir
@@ -497,6 +500,7 @@ mod tests {
             None,
             &cache,
             false,
+            None,
         )
         .await?;
         assert_eq!(
@@ -519,6 +523,7 @@ mod tests {
             None,
             &cache,
             false,
+            None,
         )
         .await?;
 
@@ -612,6 +617,7 @@ mod tests {
             None,
             &PathDigestCache::new(),
             false,
+            None,
         )
         .await?;
 
@@ -686,6 +692,7 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             true, // digest_checked_hint_link
+            None,
         )
         .await?;
 
@@ -739,6 +746,7 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             false, // digest_checked_hint_link disabled
+            None,
         )
         .await;
         assert!(
@@ -799,6 +807,7 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             true,
+            None,
         )
         .await?;
 
@@ -855,6 +864,7 @@ mod tests {
             Some(PathBuf::from(&hint_dir)),
             &PathDigestCache::new(),
             true,
+            None,
         )
         .await?;
 
@@ -1186,6 +1196,81 @@ mod tests {
         assert!(
             mgr_b.path_digest_cache().contains(&path, &digest),
             "manager B must observe insert via shared map",
+        );
+        Ok(())
+    }
+
+    /// Slice 2 (Plan M) end-to-end: with `digest_checked_hint_link`
+    /// on and a hint tree on disk that hashes to the action's root
+    /// digest, `prepare_action_inputs` must succeed even when the
+    /// CAS has neither the Directory proto nor any file blobs.
+    /// Synthesis builds the proto locally; Plan I hardlinks files
+    /// from hint. This is the cold-start "no CAS at all" property.
+    #[cfg(not(target_family = "windows"))]
+    #[nativelink_test]
+    async fn plan_m_synthesis_avoids_all_cas_when_hint_tree_is_complete(
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        use nativelink_worker::local_dir_synthesis::{
+            synthesize_directory_tree, SynthResult,
+        };
+        use nativelink_worker::running_actions_manager::prepare_action_inputs;
+        use nativelink_util::digest_hasher::DigestHasherFunc;
+
+        // Pre-stage a small tree at hint_root.
+        let hint_dir = make_temp_path("plan_m_hint");
+        fs::create_dir_all(&hint_dir).await?;
+        tokio::fs::write(format!("{hint_dir}/a.txt"), b"alpha").await?;
+        tokio::fs::write(format!("{hint_dir}/b.txt"), b"bravo").await?;
+        let sub = format!("{hint_dir}/sub");
+        fs::create_dir_all(&sub).await?;
+        tokio::fs::write(format!("{sub}/c.txt"), b"charlie").await?;
+
+        // Compute the root digest the synthesis will produce. First
+        // call probes against a deliberately-wrong expected to
+        // extract the actual computed digest, then we hand that to
+        // prepare_action_inputs as the action's root.
+        let probe = synthesize_directory_tree(
+            std::path::Path::new(&hint_dir),
+            &DigestInfo::new([0u8; 32], 0),
+            DigestHasherFunc::Sha256,
+        )
+        .await;
+        let root_digest = match probe {
+            SynthResult::MissDigestMismatch { computed } => computed,
+            other => panic!("probe should mismatch zero digest, got {other:?}"),
+        };
+
+        // Empty CAS: the action's root proto is NOT uploaded. If
+        // Plan M synthesis fails (or its protos aren't reused),
+        // download_to_directory will fail get_and_decode_digest.
+        let (fast_store, _slow_store, cas_store, _ac_store) = setup_stores().await?;
+        let dest_dir = make_temp_path("plan_m_dest");
+        fs::create_dir_all(&dest_dir).await?;
+
+        prepare_action_inputs(
+            &None,
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &dest_dir,
+            Some(PathBuf::from(&hint_dir)),
+            &PathDigestCache::new(),
+            true, // digest_checked_hint_link
+        )
+        .await?;
+
+        // All files materialized at dest, content-equal to hint.
+        assert_eq!(
+            fs::read(format!("{dest_dir}/a.txt")).await?,
+            b"alpha"
+        );
+        assert_eq!(
+            fs::read(format!("{dest_dir}/b.txt")).await?,
+            b"bravo"
+        );
+        assert_eq!(
+            fs::read(format!("{dest_dir}/sub/c.txt")).await?,
+            b"charlie"
         );
         Ok(())
     }
