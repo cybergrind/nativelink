@@ -22,12 +22,12 @@ mod tests {
     use core::task::Poll;
     use core::time::Duration;
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::env;
     use std::ffi::OsString;
     use std::io::{Cursor, Write};
     #[cfg(target_family = "unix")]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::PathBuf;
     use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -64,12 +64,12 @@ mod tests {
     use nativelink_util::common::{DigestInfo, fs};
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
     use nativelink_util::store_trait::{Store, StoreLike};
+    use nativelink_worker::path_digest_cache::PathDigestCache;
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, ProjectRoot, RunningAction, RunningActionImpl,
         RunningActionsManager, RunningActionsManagerArgs, RunningActionsManagerImpl,
         download_to_directory, prepare_action_inputs,
     };
-    use nativelink_worker::path_digest_cache::PathDigestCache;
     use pretty_assertions::assert_eq;
     use prost::Message;
     use rand::Rng;
@@ -454,8 +454,8 @@ mod tests {
     /// After the fix (Plan L removed), the walk always proceeds and fetches
     /// files that are missing from the target directory.
     #[nativelink_test]
-    async fn download_to_directory_plan_l_must_not_skip_missing_files(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_plan_l_must_not_skip_missing_files()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "source.cc";
         const FILE_CONTENT: &str = "int main() {}";
 
@@ -545,8 +545,8 @@ mod tests {
     /// the same directory must still be downloaded.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn download_to_directory_eexist_does_not_abort_walk(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_eexist_does_not_abort_walk()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE1_NAME: &str = "utility";
         const FILE1_CONTENT: &str = "// existing"; // 11 bytes
         const FILE2_NAME: &str = "type_list.h";
@@ -600,11 +600,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             tokio::fs::write(&file1_path, FILE1_CONTENT).await?;
-            tokio::fs::set_permissions(
-                &file1_path,
-                std::fs::Permissions::from_mode(0o444),
-            )
-            .await?;
+            tokio::fs::set_permissions(&file1_path, std::fs::Permissions::from_mode(0o444)).await?;
         }
 
         // download_to_directory must succeed: file1 gets EEXIST (trusted),
@@ -651,8 +647,8 @@ mod tests {
     /// action can succeed is if the hint path is consulted.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn download_to_directory_plan_i_hint_hit_short_circuits_cas(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_plan_i_hint_hit_short_circuits_cas()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "header.h";
         const CONTENT: &[u8] = b"// pre-staged on disk; CAS does not have this digest";
 
@@ -710,8 +706,8 @@ mod tests {
     /// digest. Locks in that the flag actually gates the new behavior.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn download_to_directory_plan_i_flag_off_ignores_hint(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_plan_i_flag_off_ignores_hint()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "header.h";
         const CONTENT: &[u8] = b"// pre-staged on disk; CAS does not have this digest";
 
@@ -762,8 +758,8 @@ mod tests {
     /// over, delivering the correct content to dest.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn download_to_directory_plan_i_content_mismatch_falls_through_to_cas(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_plan_i_content_mismatch_falls_through_to_cas()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "header.h";
         const STALE: &[u8] = b"// stale: previous tag's content"; // 32 bytes
         const FRESH: &[u8] = b"// fresh: this tag's content!!!!"; // 32 bytes — same length
@@ -824,8 +820,8 @@ mod tests {
     /// CAS so the action succeeds.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn download_to_directory_plan_i_hint_absent_falls_through_to_cas(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_plan_i_hint_absent_falls_through_to_cas()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "header.h";
         const CONTENT: &[u8] = b"// only in CAS, hint dir is empty";
 
@@ -890,8 +886,8 @@ mod tests {
     /// before: hint_root is set (shared-tree mode), yet the input tree
     /// is only available in CAS. The walk must fetch and materialize it.
     #[nativelink_test]
-    async fn prepare_action_inputs_always_walks_even_in_shared_tree_mode(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn prepare_action_inputs_always_walks_even_in_shared_tree_mode()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "must_be_created.txt";
         const FILE_CONTENT: &str = "walk must have run even with hint_root";
 
@@ -949,8 +945,8 @@ mod tests {
 
     /// Companion test for the no-hint_root case.
     #[nativelink_test]
-    async fn prepare_action_inputs_walks_without_hint_root(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn prepare_action_inputs_walks_without_hint_root()
+    -> Result<(), Box<dyn core::error::Error>> {
         const FILE_NAME: &str = "should_be_created.txt";
         const FILE_CONTENT: &str = "walk ran as expected";
 
@@ -1065,9 +1061,7 @@ mod tests {
     #[test]
     fn running_actions_manager_args_has_shared_tree_path_field() {
         use nativelink_worker::running_actions_manager::RunningActionsManagerArgs;
-        fn _assert_field_exists<'a>(
-            args: &'a RunningActionsManagerArgs<'_>,
-        ) -> &'a Option<String> {
+        fn _assert_field_exists<'a>(args: &'a RunningActionsManagerArgs<'_>) -> &'a Option<String> {
             &args.shared_tree_path
         }
         // Force the function to be monomorphized/referenced.
@@ -1090,9 +1084,7 @@ mod tests {
             &args.path_digest_cache
         }
         let _ = _assert_field_exists
-            as for<'a> fn(
-                &'a RunningActionsManagerArgs<'_>,
-            ) -> &'a Option<SharedPathDigestMap>;
+            as for<'a> fn(&'a RunningActionsManagerArgs<'_>) -> &'a Option<SharedPathDigestMap>;
     }
 
     /// When two `RunningActionsManagerImpl` instances are constructed
@@ -1116,8 +1108,7 @@ mod tests {
         fs::create_dir_all(&root_a).await?;
         fs::create_dir_all(&root_b).await?;
 
-        let shared_map =
-            nativelink_worker::path_digest_cache::new_shared_path_digest_map();
+        let shared_map = nativelink_worker::path_digest_cache::new_shared_path_digest_map();
 
         let upload_cfg = nativelink_config::cas_server::UploadActionResultConfig {
             upload_ac_results_strategy:
@@ -1189,9 +1180,7 @@ mod tests {
         // through the other.
         let path = PathBuf::from("/shared/test/path.bin");
         let digest = DigestInfo::new([42u8; 32], 1234);
-        mgr_a
-            .path_digest_cache()
-            .insert(path.clone(), digest);
+        mgr_a.path_digest_cache().insert(path.clone(), digest);
 
         assert!(
             mgr_b.path_digest_cache().contains(&path, &digest),
@@ -1208,13 +1197,11 @@ mod tests {
     /// from hint. This is the cold-start "no CAS at all" property.
     #[cfg(not(target_family = "windows"))]
     #[nativelink_test]
-    async fn plan_m_synthesis_avoids_all_cas_when_hint_tree_is_complete(
-    ) -> Result<(), Box<dyn core::error::Error>> {
-        use nativelink_worker::local_dir_synthesis::{
-            synthesize_directory_tree, SynthResult,
-        };
-        use nativelink_worker::running_actions_manager::prepare_action_inputs;
+    async fn plan_m_synthesis_avoids_all_cas_when_hint_tree_is_complete()
+    -> Result<(), Box<dyn core::error::Error>> {
         use nativelink_util::digest_hasher::DigestHasherFunc;
+        use nativelink_worker::local_dir_synthesis::{SynthResult, synthesize_directory_tree};
+        use nativelink_worker::running_actions_manager::prepare_action_inputs;
 
         // Pre-stage a small tree at hint_root.
         let hint_dir = make_temp_path("plan_m_hint");
@@ -1260,18 +1247,9 @@ mod tests {
         .await?;
 
         // All files materialized at dest, content-equal to hint.
-        assert_eq!(
-            fs::read(format!("{dest_dir}/a.txt")).await?,
-            b"alpha"
-        );
-        assert_eq!(
-            fs::read(format!("{dest_dir}/b.txt")).await?,
-            b"bravo"
-        );
-        assert_eq!(
-            fs::read(format!("{dest_dir}/sub/c.txt")).await?,
-            b"charlie"
-        );
+        assert_eq!(fs::read(format!("{dest_dir}/a.txt")).await?, b"alpha");
+        assert_eq!(fs::read(format!("{dest_dir}/b.txt")).await?, b"bravo");
+        assert_eq!(fs::read(format!("{dest_dir}/sub/c.txt")).await?, b"charlie");
         Ok(())
     }
 
@@ -1293,8 +1271,7 @@ mod tests {
         let root = make_temp_path("shared_map_redis_root");
         fs::create_dir_all(&root).await?;
 
-        let shared_map =
-            nativelink_worker::path_digest_cache::new_shared_path_digest_map();
+        let shared_map = nativelink_worker::path_digest_cache::new_shared_path_digest_map();
 
         let upload_cfg = nativelink_config::cas_server::UploadActionResultConfig {
             upload_ac_results_strategy:
@@ -1318,9 +1295,7 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                shared_walked_dirs_redis_url: Some(
-                    "redis://127.0.0.1:6399/0".to_string(),
-                ),
+                shared_walked_dirs_redis_url: Some("redis://127.0.0.1:6399/0".to_string()),
                 machine_id: "test-machine-id".to_string(),
                 shared_tree_path: None,
                 project_root: None,
@@ -3567,12 +3542,12 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
-                shared_walked_dirs_redis_url: None,
-                machine_id: String::new(),
-                shared_tree_path: None,
-                project_root: None,
-                digest_checked_hint_link: false,
-                path_digest_cache: None,
+                    shared_walked_dirs_redis_url: None,
+                    machine_id: String::new(),
+                    shared_tree_path: None,
+                    project_root: None,
+                    digest_checked_hint_link: false,
+                    path_digest_cache: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3661,12 +3636,12 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
-                shared_walked_dirs_redis_url: None,
-                machine_id: String::new(),
-                shared_tree_path: None,
-                project_root: None,
-                digest_checked_hint_link: false,
-                path_digest_cache: None,
+                    shared_walked_dirs_redis_url: None,
+                    machine_id: String::new(),
+                    shared_tree_path: None,
+                    project_root: None,
+                    digest_checked_hint_link: false,
+                    path_digest_cache: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3755,12 +3730,12 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
-                shared_walked_dirs_redis_url: None,
-                machine_id: String::new(),
-                shared_tree_path: None,
-                project_root: None,
-                digest_checked_hint_link: false,
-                path_digest_cache: None,
+                    shared_walked_dirs_redis_url: None,
+                    machine_id: String::new(),
+                    shared_tree_path: None,
+                    project_root: None,
+                    digest_checked_hint_link: false,
+                    path_digest_cache: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -5055,12 +5030,11 @@ exit 1
             cas_store: cas_store.clone(),
             ac_store: None,
             historical_store: Store::new(cas_store.clone()),
-            upload_action_result_config:
-                &nativelink_config::cas_server::UploadActionResultConfig {
-                    upload_ac_results_strategy:
-                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
-                    ..Default::default()
-                },
+            upload_action_result_config: &nativelink_config::cas_server::UploadActionResultConfig {
+                upload_ac_results_strategy:
+                    nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                ..Default::default()
+            },
             max_action_timeout: Duration::MAX,
             max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
             timeout_handled_externally: false,
@@ -5100,8 +5074,8 @@ exit 1
     // With `project_root = None`, the raw InputRootAbsolutePath must be
     // used verbatim (legacy / `.132`-`.133` behavior).
     #[nativelink_test]
-    async fn project_root_unset_preserves_work_directory()
-    -> Result<(), Box<dyn core::error::Error>> {
+    async fn project_root_unset_preserves_work_directory() -> Result<(), Box<dyn core::error::Error>>
+    {
         let (_, _, cas_store, _ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
         fs::create_dir_all(&root_action_directory).await?;
@@ -5111,12 +5085,11 @@ exit 1
             cas_store: cas_store.clone(),
             ac_store: None,
             historical_store: Store::new(cas_store.clone()),
-            upload_action_result_config:
-                &nativelink_config::cas_server::UploadActionResultConfig {
-                    upload_ac_results_strategy:
-                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
-                    ..Default::default()
-                },
+            upload_action_result_config: &nativelink_config::cas_server::UploadActionResultConfig {
+                upload_ac_results_strategy:
+                    nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                ..Default::default()
+            },
             max_action_timeout: Duration::MAX,
             max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
             timeout_handled_externally: false,
@@ -5167,12 +5140,11 @@ exit 1
             cas_store: cas_store.clone(),
             ac_store: None,
             historical_store: Store::new(cas_store.clone()),
-            upload_action_result_config:
-                &nativelink_config::cas_server::UploadActionResultConfig {
-                    upload_ac_results_strategy:
-                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
-                    ..Default::default()
-                },
+            upload_action_result_config: &nativelink_config::cas_server::UploadActionResultConfig {
+                upload_ac_results_strategy:
+                    nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                ..Default::default()
+            },
             max_action_timeout: Duration::MAX,
             max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
             timeout_handled_externally: false,
@@ -5211,8 +5183,8 @@ exit 1
     // regardless of project_root config. Otherwise Plan I would try to
     // hardlink-check against a bogus path.
     #[nativelink_test]
-    async fn hint_root_is_none_without_platform_property()
-    -> Result<(), Box<dyn core::error::Error>> {
+    async fn hint_root_is_none_without_platform_property() -> Result<(), Box<dyn core::error::Error>>
+    {
         let (_, _, cas_store, _ac_store) = setup_stores().await?;
         let root_action_directory = make_temp_path("root_action_directory");
         fs::create_dir_all(&root_action_directory).await?;
@@ -5226,12 +5198,11 @@ exit 1
             cas_store: cas_store.clone(),
             ac_store: None,
             historical_store: Store::new(cas_store.clone()),
-            upload_action_result_config:
-                &nativelink_config::cas_server::UploadActionResultConfig {
-                    upload_ac_results_strategy:
-                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
-                    ..Default::default()
-                },
+            upload_action_result_config: &nativelink_config::cas_server::UploadActionResultConfig {
+                upload_ac_results_strategy:
+                    nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                ..Default::default()
+            },
             max_action_timeout: Duration::MAX,
             max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
             timeout_handled_externally: false,
@@ -5275,12 +5246,11 @@ exit 1
             cas_store: cas_store.clone(),
             ac_store: None,
             historical_store: Store::new(cas_store.clone()),
-            upload_action_result_config:
-                &nativelink_config::cas_server::UploadActionResultConfig {
-                    upload_ac_results_strategy:
-                        nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
-                    ..Default::default()
-                },
+            upload_action_result_config: &nativelink_config::cas_server::UploadActionResultConfig {
+                upload_ac_results_strategy:
+                    nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                ..Default::default()
+            },
             max_action_timeout: Duration::MAX,
             max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
             timeout_handled_externally: false,

@@ -110,6 +110,13 @@ static PLAN_M_PROTO_REUSE: StageStats =
 /// round-trips it replaces. If `count` is high but `hit` is zero,
 /// every synthesis is being thrown away (mtime/mode drift).
 static PLAN_M_SYNTH: StageStats = StageStats::new("worker.plan_m.synth");
+/// Wall-clock cost of one Plan I `file_matches_digest` call (one
+/// per-file streaming SHA-256/Blake3 of an on-disk hint file). On a
+/// cold Plan K cache with many concurrent actions sharing the same
+/// hint tree, this is where the worker actually spends its time —
+/// without this counter, the storm is invisible in the timing dump.
+static PLAN_I_FILE_HASH: StageStats =
+    StageStats::new("worker.plan_i.file_hash");
 static ACTION_EXECUTE: StageStats = StageStats::new("worker.action_execute");
 static UPLOAD_RESULTS: StageStats = StageStats::new("worker.upload_results");
 use parking_lot::Mutex;
@@ -281,6 +288,12 @@ pub fn download_to_directory<'a>(
                                     nativelink_util::digest_hasher::default_digest_hasher_func,
                                     |v| *v,
                                 );
+                            // Timer-wrap so the Plan I storm is visible
+                            // in the periodic timing dump. Without this
+                            // worker.plan_i.file_hash stat, a worker
+                            // hashing thousands of files across many
+                            // concurrent actions looks idle in metrics.
+                            let _t = PLAN_I_FILE_HASH.timer();
                             crate::file_digest_check::file_matches_digest(
                                 hint_path,
                                 &digest,
@@ -551,6 +564,17 @@ pub fn download_to_directory<'a>(
     .boxed()
 }
 
+/// Operator escape hatch for the 1.3.0 default-on Plan M behavior.
+/// Set `NATIVELINK_PLAN_M_DISABLE=1` (or `true` / `yes` / `on`) to
+/// skip the per-action top-level synthesis pass without rebuilding or
+/// editing config. Plan I and Plan K continue working unchanged.
+fn plan_m_disabled_via_env() -> bool {
+    std::env::var("NATIVELINK_PLAN_M_DISABLE")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Prepares action inputs by first trying the directory cache (if available),
 /// then falling back to traditional `download_to_directory`.
 ///
@@ -606,7 +630,13 @@ pub async fn prepare_action_inputs(
     // per-file Plan I check) reuses the bundle to skip both the CAS
     // Directory-proto fetch and the Plan I re-hash. On any miss
     // variant the walk falls back to its existing CAS path unchanged.
-    let synth_bundle = if digest_checked_hint_link {
+    // Operator escape hatch for the 1.3.0 default-on Plan M behavior:
+    // NATIVELINK_PLAN_M_DISABLE=1 forces synthesis off without a
+    // rebuild, even when `digest_checked_hint_link` is true. Use this
+    // when synthesis cost is dominating wall time on workloads
+    // synthesis was not designed for (e.g. 100k-file hint tree
+    // re-walked per action with no per-file memoization yet).
+    let synth_bundle = if digest_checked_hint_link && !plan_m_disabled_via_env() {
         match hint_root.as_ref() {
             Some(hint) => {
                 let hasher_func = opentelemetry::Context::current()

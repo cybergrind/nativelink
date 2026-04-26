@@ -507,6 +507,18 @@ impl<
     }
 }
 
+/// Operator escape hatch for the 1.3.0 default-on Plan I behavior.
+/// Set `NATIVELINK_PLAN_I_DISABLE=1` (or `true` / `yes` / `on`) to
+/// force `digest_checked_hint_link` off across every worker in this
+/// process, regardless of per-worker config. Returns `false` for
+/// unset or any other value so the default stays on.
+fn plan_i_disabled_via_env() -> bool {
+    std::env::var("NATIVELINK_PLAN_I_DISABLE")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Creates a new `LocalWorker`. The `cas_store` must be an instance of
 /// `FastSlowStore` and will be checked at runtime.
 pub async fn new_local_worker(
@@ -623,7 +635,15 @@ pub async fn new_local_worker(
                     _ => None,
                 }),
             project_root: config.project_root.clone(),
-            digest_checked_hint_link: config.experimental_digest_checked_hint_link,
+            // Operator escape hatch: NATIVELINK_PLAN_I_DISABLE=1 forces
+            // Plan I (digest-checked hint link) off without rebuilding
+            // or editing the per-worker config. Same for Plan M via the
+            // env var honored downstream in prepare_action_inputs. The
+            // 1.3.0 default is on; this lets you flip it back at runtime
+            // when a cold-cache + many-concurrent-actions workload turns
+            // the per-file SHA-256 storm into a foreground problem.
+            digest_checked_hint_link: config.experimental_digest_checked_hint_link
+                && !plan_i_disabled_via_env(),
             path_digest_cache,
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
