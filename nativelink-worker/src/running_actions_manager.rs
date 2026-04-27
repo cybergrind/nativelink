@@ -1887,7 +1887,7 @@ impl RunningActionImpl {
             Ok(())
         });
         drop(output_path_futures);
-        debug!(
+        info!(
             operation_id = ?self.operation_id,
             elapsed_ms = join_start.elapsed().as_millis(),
             success = upload_result.is_ok(),
@@ -1907,6 +1907,12 @@ impl RunningActionImpl {
 
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
+        let first_output_file_summary = output_files
+            .first()
+            .map(|f| format!("{:?} digest={:?}", f.name_or_path, f.digest));
+        let last_output_file_summary = output_files
+            .last()
+            .map(|f| format!("{:?} digest={:?}", f.name_or_path, f.digest));
         {
             let mut state = self.state.lock();
             execution_metadata.worker_completed_timestamp =
@@ -1925,11 +1931,13 @@ impl RunningActionImpl {
                 message: String::new(), // Will be filled in on cache_action_result if needed.
             });
         }
-        debug!(
+        info!(
             operation_id = ?self.operation_id,
             total_elapsed_ms = upload_start.elapsed().as_millis(),
             num_output_files,
             num_output_folders,
+            first_output_file = first_output_file_summary,
+            last_output_file = last_output_file_summary,
             "upload_results: inner_upload_results completed successfully",
         );
         Ok(self)

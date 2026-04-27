@@ -756,6 +756,19 @@ where
                         warn!(state = ?awaited_action.state(), "Action already assigned");
                         return Err(make_err!(Code::Aborted, "Action already assigned"));
                     }
+                    if let ActionStage::Completed(action_result) = stage {
+                        info!(
+                            %operation_id,
+                            ?maybe_worker_id,
+                            num_output_files = action_result.output_files.len(),
+                            num_output_folders = action_result.output_folders.len(),
+                            exit_code = action_result.exit_code,
+                            first_output_digest = ?action_result.output_files.first().map(|f| f.digest),
+                            last_output_digest = ?action_result.output_files.last().map(|f| f.digest),
+                            stdout_digest = ?action_result.stdout_digest,
+                            "scheduler: storing Completed ActionResult (no CAS self-check; siso may fetch before blobs durable)",
+                        );
+                    }
                     stage.clone()
                 }
                 UpdateOperationType::UpdateWithError(err) => {
