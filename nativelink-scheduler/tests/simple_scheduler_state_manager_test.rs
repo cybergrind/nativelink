@@ -27,6 +27,7 @@ async fn drops_missing_actions() -> Result<(), Error> {
         awaited_action_db,
         SystemTime::now,
         None,
+        None,
     );
     state_manager
         .update_operation(

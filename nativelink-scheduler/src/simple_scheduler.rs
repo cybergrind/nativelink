@@ -33,6 +33,7 @@ use nativelink_util::operation_state_manager::{
 use nativelink_util::origin_event::OriginMetadata;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::spawn;
+use nativelink_util::store_trait::Store;
 use nativelink_util::timing::StageStats;
 
 static DO_TRY_MATCH_CYCLE: StageStats = StageStats::new("scheduler.do_try_match.cycle");
@@ -426,6 +427,7 @@ impl SimpleScheduler {
         awaited_action_db: A,
         task_change_notify: Arc<Notify>,
         maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
+        maybe_cas_self_check_store: Option<Store>,
     ) -> (Arc<Self>, Arc<dyn WorkerScheduler>) {
         Self::new_with_callback(
             spec,
@@ -444,6 +446,7 @@ impl SimpleScheduler {
             task_change_notify,
             SystemTime::now,
             maybe_origin_event_tx,
+            maybe_cas_self_check_store,
         )
     }
 
@@ -460,6 +463,7 @@ impl SimpleScheduler {
         task_change_notify: Arc<Notify>,
         now_fn: NowFn,
         maybe_origin_event_tx: Option<mpsc::Sender<OriginEvent>>,
+        maybe_cas_self_check_store: Option<Store>,
     ) -> (Arc<Self>, Arc<dyn WorkerScheduler>) {
         let platform_property_manager = Arc::new(PlatformPropertyManager::new(
             spec.supported_platform_properties
@@ -505,6 +509,7 @@ impl SimpleScheduler {
             awaited_action_db,
             now_fn,
             Some(worker_registry.clone()),
+            maybe_cas_self_check_store,
         );
 
         let worker_scheduler = ApiWorkerScheduler::new(

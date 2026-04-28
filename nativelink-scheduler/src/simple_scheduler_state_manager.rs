@@ -36,6 +36,7 @@ use nativelink_util::operation_state_manager::{
     OperationFilter, OperationStageFlags, OrderDirection, UpdateOperationType, WorkerStateManager,
 };
 use nativelink_util::origin_event::OriginMetadata;
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use opentelemetry::KeyValue;
 use tracing::{debug, info, trace, warn};
 
@@ -317,6 +318,15 @@ where
 
     /// Worker registry for checking worker liveness.
     worker_registry: Option<SharedWorkerRegistry>,
+
+    /// Optional CAS store for verifying that a worker-reported Completed
+    /// ActionResult's output digests are actually present in CAS before
+    /// the result is broadcast to clients. When None, the scheduler
+    /// trusts the worker's broadcast unconditionally (legacy behavior).
+    /// When Some, missing-output Completed transitions are converted
+    /// into a Queued re-dispatch instead, closing the SOLINK
+    /// missing-`.o` "phantom-success" window.
+    cas_self_check_store: Option<Store>,
 }
 
 impl<T, I, NowFn> SimpleSchedulerStateManager<T, I, NowFn>
@@ -333,6 +343,7 @@ where
         action_db: T,
         now_fn: NowFn,
         worker_registry: Option<SharedWorkerRegistry>,
+        cas_self_check_store: Option<Store>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak_self| Self {
             action_db,
@@ -344,6 +355,7 @@ where
             weak_self: weak_self.clone(),
             now_fn,
             worker_registry,
+            cas_self_check_store,
         })
     }
 
@@ -757,6 +769,89 @@ where
                         return Err(make_err!(Code::Aborted, "Action already assigned"));
                     }
                     if let ActionStage::Completed(action_result) = stage {
+                        // CAS self-check: when configured, verify every output
+                        // digest is present in CAS before broadcasting the
+                        // Completed ActionResult. This closes the
+                        // "phantom-success" window where the worker reports
+                        // complete (and may have skipped a redundant upload
+                        // via running_actions_manager.rs's has(digest) gate)
+                        // but the blob is not actually fetchable by the
+                        // client. On miss we convert to a Queued re-dispatch.
+                        if action_result.exit_code == 0 {
+                            if let Some(cas) = self.cas_self_check_store.as_ref() {
+                                let digests: Vec<StoreKey<'static>> = action_result
+                                    .output_files
+                                    .iter()
+                                    .map(|f| StoreKey::from(f.digest))
+                                    .collect();
+                                if !digests.is_empty() {
+                                    let has_results = cas.has_many(&digests).await;
+                                    match has_results {
+                                        Ok(results) => {
+                                            let missing: Vec<_> = action_result
+                                                .output_files
+                                                .iter()
+                                                .zip(results.iter())
+                                                .filter(|(_, present)| present.is_none())
+                                                .map(|(f, _)| f.digest)
+                                                .collect();
+                                            if !missing.is_empty() {
+                                                warn!(
+                                                    %operation_id,
+                                                    ?maybe_worker_id,
+                                                    num_missing = missing.len(),
+                                                    first_missing_digest = ?missing.first(),
+                                                    last_missing_digest = ?missing.last(),
+                                                    "scheduler: CAS self-check FAILED — output digests not present; re-queueing for re-dispatch instead of broadcasting Completed",
+                                                );
+                                                awaited_action.attempts += 1;
+                                                let now_inner = (self.now_fn)().now();
+                                                awaited_action.set_worker_id(None, now_inner);
+                                                awaited_action.worker_set_state(
+                                                    Arc::new(ActionState {
+                                                        stage: ActionStage::Queued,
+                                                        client_operation_id: operation_id.clone(),
+                                                        action_digest: awaited_action
+                                                            .action_info()
+                                                            .digest(),
+                                                        last_transition_timestamp: now_inner,
+                                                    }),
+                                                    now_inner,
+                                                );
+                                                let update_action_result = self
+                                                    .action_db
+                                                    .update_awaited_action(awaited_action.clone())
+                                                    .await
+                                                    .err_tip(|| {
+                                                        "In SimpleSchedulerStateManager::update_operation (CAS self-check re-queue)"
+                                                    });
+                                                match update_action_result {
+                                                    Ok(()) => return Ok(()),
+                                                    Err(err) if err.code == Code::Aborted => {
+                                                        last_err = Some(err);
+                                                        continue;
+                                                    }
+                                                    Err(err) => return Err(err),
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                %operation_id,
+                                                ?maybe_worker_id,
+                                                ?err,
+                                                "scheduler: CAS self-check has_many() failed; proceeding with Completed (treating store error as transient)",
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let self_check_label = if self.cas_self_check_store.is_some() {
+                            "CAS self-check OK"
+                        } else {
+                            "no CAS self-check; siso may fetch before blobs durable"
+                        };
                         info!(
                             %operation_id,
                             ?maybe_worker_id,
@@ -766,7 +861,8 @@ where
                             first_output_digest = ?action_result.output_files.first().map(|f| f.digest),
                             last_output_digest = ?action_result.output_files.last().map(|f| f.digest),
                             stdout_digest = ?action_result.stdout_digest,
-                            "scheduler: storing Completed ActionResult (no CAS self-check; siso may fetch before blobs durable)",
+                            self_check = self_check_label,
+                            "scheduler: storing Completed ActionResult",
                         );
                     }
                     stage.clone()

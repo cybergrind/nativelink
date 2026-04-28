@@ -177,6 +177,24 @@ pub struct SimpleSpec {
     /// download_to_directory walk).
     #[serde(default)]
     pub dir_index_redis_url: Option<String>,
+
+    /// Optional CAS store name for verifying that all output digests of a
+    /// Completed ActionResult are present in CAS before broadcasting the
+    /// result to clients (e.g. siso). When a worker reports an action
+    /// Completed but one or more output blobs are not yet (or no longer)
+    /// queryable in CAS, the scheduler re-queues the action for
+    /// re-dispatch instead of returning a phantom-success result.
+    ///
+    /// This closes the SOLINK missing-`.o` failure window where siso
+    /// records `F CXX` for an action whose output it cannot fetch.
+    ///
+    /// The value is a store name from the `stores` section, typically
+    /// the central CAS store on a combined-mode scheduler+worker host.
+    ///
+    /// Default: None (no self-check; original behavior — scheduler trusts
+    /// the worker's Completed broadcast unconditionally).
+    #[serde(default)]
+    pub completed_cas_self_check_store: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

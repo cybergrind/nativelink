@@ -106,6 +106,14 @@ async fn simple_scheduler_factory(
     now_fn: fn() -> SystemTime,
     maybe_origin_event_tx: Option<&mpsc::Sender<OriginEvent>>,
 ) -> Result<SchedulerFactoryResults, Error> {
+    let maybe_cas_self_check_store = match spec.completed_cas_self_check_store.as_deref() {
+        Some(name) => Some(store_manager.get_store(name).err_tip(|| {
+            format!(
+                "'completed_cas_self_check_store': '{name}' does not exist"
+            )
+        })?),
+        None => None,
+    };
     match spec
         .experimental_backend
         .as_ref()
@@ -123,6 +131,7 @@ async fn simple_scheduler_factory(
                 awaited_action_db,
                 task_change_notify,
                 maybe_origin_event_tx.cloned(),
+                maybe_cas_self_check_store,
             );
             Ok((Some(action_scheduler), Some(worker_scheduler)))
         }
@@ -159,6 +168,7 @@ async fn simple_scheduler_factory(
                 awaited_action_db,
                 task_change_notify,
                 maybe_origin_event_tx.cloned(),
+                maybe_cas_self_check_store,
             );
             Ok((Some(action_scheduler), Some(worker_scheduler)))
         }

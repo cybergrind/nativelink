@@ -272,6 +272,7 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
         task_change_notify,
         MockInstantWrapped::default,
         None,
+        None,
     );
 
     // First client adds the action
