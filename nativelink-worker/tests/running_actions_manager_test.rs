@@ -534,6 +534,111 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test: Plan L / Plan K must not skip materialization when
+    /// a file that was previously walked into the SAME path has since been
+    /// removed from disk. Simulates the missing-`.o` shape: a prior action's
+    /// walk marked Plan L for a subtree and Plan K for each file at their
+    /// absolute paths (shared-tree mode), then between actions the file
+    /// disappeared (FS-store eviction of the only hardlink, sibling action
+    /// cleanup, manual gclient sync, etc.). The next action with the same
+    /// (path, digest) must NOT see Plan L's walked-stamp and Plan K's
+    /// (path, digest) entry as proof of materialization — the file is no
+    /// longer there and the walk has to re-fetch it from CAS.
+    #[nativelink_test]
+    async fn download_to_directory_must_rematerialize_after_file_removed()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const FILE_NAME: &str = "missing.o";
+        const FILE_CONTENT: &str = "object-file-bytes";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        let root_directory_digest = {
+            let file_digest = DigestInfo::new([7u8; 32], FILE_CONTENT.len() as u64);
+            slow_store
+                .as_ref()
+                .update_oneshot(file_digest, FILE_CONTENT.into())
+                .await?;
+
+            let root_digest = DigestInfo::new([8u8; 32], 32);
+            let root_dir = Directory {
+                files: vec![FileNode {
+                    name: FILE_NAME.to_string(),
+                    digest: Some(file_digest.into()),
+                    is_executable: false,
+                    node_properties: None,
+                }],
+                ..Default::default()
+            };
+            slow_store
+                .as_ref()
+                .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+                .await?;
+            root_digest
+        };
+
+        // Reuse the same cache across both walks — this is what makes
+        // Plan L/K "remember" the prior walk and (incorrectly) skip the
+        // second one.
+        let cache = PathDigestCache::new();
+
+        let work_directory = make_temp_path("rematerialize_after_remove");
+        fs::create_dir_all(&work_directory)
+            .await
+            .err_tip(|| "create work_directory")?;
+
+        // First walk: materializes the file at work_directory/FILE_NAME
+        // and marks Plan K (per-file) + Plan L (per-directory).
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_directory_digest,
+            &work_directory,
+            None,
+            &cache,
+            false,
+        )
+        .await?;
+        let file_path = format!("{work_directory}/{FILE_NAME}");
+        assert_eq!(
+            from_utf8(&fs::read(&file_path).await?)?,
+            FILE_CONTENT,
+            "first walk must materialize the file"
+        );
+
+        // Simulate the file disappearing between actions: FS-store evicted
+        // the only hardlink, a sibling action's cleanup nuked it, gclient
+        // re-synced, etc. The cache still says (path, digest) is present.
+        tokio::fs::remove_file(&file_path)
+            .await
+            .err_tip(|| "remove file to simulate eviction")?;
+        assert!(
+            tokio::fs::metadata(&file_path).await.is_err(),
+            "precondition: file must be gone before second walk"
+        );
+
+        // Second walk with the SAME cache, SAME digest, SAME path. With
+        // Plan L's `dir_walked` short-circuit, this returns Ok(()) without
+        // doing any work — the file stays missing. Correct behavior is to
+        // re-materialize.
+        download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_directory_digest,
+            &work_directory,
+            None,
+            &cache,
+            false,
+        )
+        .await?;
+
+        let content = fs::read(&file_path).await.err_tip(
+            || "second walk must re-materialize the file even though Plan L/K had it cached",
+        )?;
+        assert_eq!(from_utf8(&content)?, FILE_CONTENT);
+
+        Ok(())
+    }
+
     /// Test: a read-only file from rsync that already exists on disk must NOT
     /// cause EEXIST to abort the entire directory walk. The hard_link gets
     /// EEXIST, trusts the existing file, and continues. Subsequent files in

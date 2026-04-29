@@ -393,6 +393,15 @@ impl PathDigestCache {
         self.map.write().insert(path, digest);
     }
 
+    /// Remove a (path, _) entry. Used by `download_to_directory`'s
+    /// Plan K hit gate: when the cached entry says a file is at `path`
+    /// but a `symlink_metadata` stat shows it's gone, the entry is
+    /// stale and must be evicted so the next walk falls through to
+    /// the CAS/Plan I path and actually re-materializes the file.
+    pub fn evict(&self, path: &Path) {
+        self.map.write().remove(path);
+    }
+
     pub fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool {
         self.walked_dirs.dir_walked(directory_path, digest)
     }

@@ -183,20 +183,25 @@ pub fn download_to_directory<'a>(
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
         let _walk_timer = DIR_WALK.timer();
-        // Plan L (path-aware): if this Directory subtree has been fully walked
-        // into THIS specific target path before, skip the walk. The path is
-        // part of the cache key so walking digest D into path A does not imply
-        // D was walked into path B (fixes cross-machine false positives).
+        // Plan L (path-aware): records that this Directory subtree was
+        // fully walked into THIS specific target path. We retain the
+        // marker for telemetry and for the per-file Plan K fast path
+        // it warms, but we DO NOT short-circuit the walk on a hit:
+        // a "walked once" stamp is not a "still on disk" guarantee
+        // (FS-store eviction, sibling cleanup, gclient re-sync, etc.
+        // can remove files between mark and re-hit). The walk re-runs
+        // and Plan K (with its own per-file stat gate, see below) is
+        // the trust boundary for whether each file is actually present.
         if path_digest_cache.dir_walked(current_directory, digest) {
             PLAN_L_HIT.incr();
             trace!(
                 ?digest,
                 current_directory,
-                "Plan L: skipping already-walked directory subtree"
+                "Plan L: prior-walk stamp present; re-walking to verify on-disk state"
             );
-            return Ok(());
+        } else {
+            PLAN_L_MISS.incr();
         }
-        PLAN_L_MISS.incr();
 
         // Single-flight: if another concurrent action is already
         // walking this exact (path, digest), wait for it instead of
@@ -280,11 +285,26 @@ pub fn download_to_directory<'a>(
             };
             futures.push(
                 async move {
-                    // Plan K: cache-first. If this (path, digest) pair is already
-                    // known, skip all filesystem work.
+                    // Plan K: cache-first, BUT verify the file still exists
+                    // on disk before trusting the (path, digest) entry. A
+                    // stale entry (FS-store evicted the only hardlink, a
+                    // sibling action cleaned up, gclient re-synced, etc.)
+                    // would otherwise let us return Ok(()) for a missing
+                    // file — the action then runs against an input root
+                    // with a hole in it. Cheap symlink_metadata stat is
+                    // the trust boundary; on miss we evict the stale
+                    // entry and fall through to Plan I / CAS.
                     if path_digest_cache.contains(&dest_path_for_cache, &digest) {
-                        PLAN_K_HIT.incr();
-                        return Ok::<(), Error>(());
+                        if tokio::fs::symlink_metadata(&dest_path_for_cache).await.is_ok() {
+                            PLAN_K_HIT.incr();
+                            return Ok::<(), Error>(());
+                        }
+                        path_digest_cache.evict(&dest_path_for_cache);
+                        trace!(
+                            dest = %dest,
+                            ?digest,
+                            "Plan K stale: cached (path, digest) but file missing on disk; re-materializing"
+                        );
                     }
                     PLAN_K_MISS.incr();
                     trace!(
