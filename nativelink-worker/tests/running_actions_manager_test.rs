@@ -639,6 +639,120 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test (1.3.8): chmod failure on the materialization dest
+    /// must NOT fail the action. Real-world trigger on macOS: action input
+    /// tree contains files under `out/Mac/sdk/xcode_links/MacOSX.sdk/...`,
+    /// where `xcode_links/MacOSX.sdk` is a symlink into the user's
+    /// pre-extracted SDK. Apple SDK files carry file flags (uchg / SIP-
+    /// derived) that block `chmod` even for the file's owner. Pre-1.3.8
+    /// the worker propagated EPERM as `Could not set unix mode in Plan I`
+    /// / `... in download_to_directory` and the action failed; siso
+    /// retried 4× and gave up. Post-1.3.8 the chmod failure is a non-fatal
+    /// warning and the action continues — the file content is already in
+    /// place via hardlink, which is what the action actually needs.
+    ///
+    /// The test reproduces the same error class (EACCES from chmod) on
+    /// Linux without privileges by routing `dest` through a symlink whose
+    /// target lives in a 0o000-mode directory, so `chmod()`'s path
+    /// resolution fails on the symlink target's parent. The error code
+    /// path inside `set_permissions` is identical to the Apple-SDK case.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn download_to_directory_chmod_eperm_is_non_fatal()
+    -> Result<(), Box<dyn core::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        const FILE_NAME: &str = "module.modulemap";
+        const FILE_CONTENT: &str = "// SDK module map content";
+
+        let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
+
+        let file_digest = DigestInfo::new([90u8; 32], FILE_CONTENT.len() as u64);
+        slow_store
+            .as_ref()
+            .update_oneshot(file_digest, FILE_CONTENT.into())
+            .await?;
+
+        let root_digest = DigestInfo::new([91u8; 32], 32);
+        let root_dir = Directory {
+            files: vec![FileNode {
+                name: FILE_NAME.to_string(),
+                digest: Some(file_digest.into()),
+                // is_executable forces unix_mode propagation through the
+                // download_to_directory chmod path.
+                is_executable: false,
+                node_properties: Some(NodeProperties {
+                    properties: vec![],
+                    mtime: None,
+                    unix_mode: Some(0o644),
+                }),
+            }],
+            ..Default::default()
+        };
+        slow_store
+            .as_ref()
+            .update_oneshot(root_digest, root_dir.encode_to_vec().into())
+            .await?;
+
+        let test_root = make_temp_path("chmod_eperm");
+        fs::create_dir_all(&test_root).await?;
+        let blocked_dir = format!("{test_root}/blocked");
+        let work_directory = format!("{test_root}/work");
+        fs::create_dir_all(&blocked_dir).await?;
+        fs::create_dir_all(&work_directory).await?;
+
+        // Real file lives under `blocked/`. Content matches the digest so
+        // any read that does succeed reads correct bytes (irrelevant for
+        // this test, kept consistent for future expansion).
+        let real_file_path = format!("{blocked_dir}/real_file");
+        tokio::fs::write(&real_file_path, FILE_CONTENT).await?;
+
+        // dest exists as a symlink into the soon-to-be-blocked dir.
+        // hard_link(src, dest) sees `dest` already exists → EEXIST → NL's
+        // "trust" branch fires (line ~437 of running_actions_manager.rs)
+        // and the walk proceeds to chmod. chmod follows the symlink and
+        // tries to operate on real_file inside the blocked dir.
+        let dest_path = format!("{work_directory}/{FILE_NAME}");
+        tokio::fs::symlink(&real_file_path, &dest_path).await?;
+
+        // Drop traverse permission on the symlink target's parent. Now
+        // any path resolution through `blocked/real_file` fails with
+        // EACCES, which `set_permissions` surfaces as PermissionDenied —
+        // the same error class macOS file-flag-protected SDK files
+        // produce on chmod.
+        tokio::fs::set_permissions(&blocked_dir, std::fs::Permissions::from_mode(0o000)).await?;
+
+        // Guard: restore perms even on early return so cleanup works.
+        struct Restore<'a>(&'a str);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                drop(std::fs::set_permissions(
+                    self.0,
+                    std::fs::Permissions::from_mode(0o755),
+                ));
+            }
+        }
+        let _restore = Restore(&blocked_dir);
+
+        let result = download_to_directory(
+            cas_store.as_ref(),
+            fast_store.as_pin(),
+            &root_digest,
+            &work_directory,
+            None,
+            &PathDigestCache::new(),
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "chmod EPERM/EACCES on dest must be a non-fatal warning, not propagate as action failure. Got: {result:?}"
+        );
+
+        Ok(())
+    }
+
     /// Test: a read-only file from rsync that already exists on disk must NOT
     /// cause EEXIST to abort the entire directory walk. The hard_link gets
     /// EEXIST, trusts the existing file, and continues. Subsequent files in

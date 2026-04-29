@@ -162,6 +162,71 @@ struct SideChannelInfo {
     failure: Option<SideChannelFailureReason>,
 }
 
+/// Apply unix mode to `dest`, downgrading PermissionDenied to a non-fatal
+/// warning. macOS SDK files staged under `xcode_links/MacOSX*.sdk` carry
+/// uchg / SIP-derived flags that block any chmod for the file's owner;
+/// the file content is already in place via hardlink, which is what the
+/// action actually consumes. Other error classes still propagate so a
+/// genuinely broken filesystem still surfaces as a hard error.
+#[cfg(target_family = "unix")]
+async fn apply_chmod_or_warn(dest: &str, unix_mode: u32, context: &str) -> Result<(), Error> {
+    match fs::set_permissions(dest, Permissions::from_mode(unix_mode)).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.code == Code::PermissionDenied => {
+            warn!(
+                dest = %dest,
+                unix_mode = format!("{unix_mode:o}"),
+                error = ?e,
+                context,
+                "set_permissions denied (immutable / SDK file flag / read-only mount); \
+                 continuing — file content already present via hardlink",
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.append(format!("Could not set unix mode in {context} {dest}"))),
+    }
+}
+
+/// Apply mtime to `dest`, downgrading PermissionDenied to a non-fatal
+/// warning. Same rationale as `apply_chmod_or_warn`: utimes() also
+/// fails on uchg-flagged Apple SDK files, and the action does not
+/// depend on perfect mtime mirroring.
+async fn apply_mtime_or_warn(
+    dest: &str,
+    mtime_seconds: i64,
+    mtime_nanos: i32,
+    context: &str,
+) -> Result<(), Error> {
+    let dest_owned = dest.to_string();
+    let context_owned = context.to_string();
+    let result: Result<(), Error> = spawn_blocking!("apply_mtime_or_warn", move || {
+        set_file_mtime(
+            &dest_owned,
+            FileTime::from_unix_time(mtime_seconds, mtime_nanos as u32),
+        )
+        .map_err(|e| {
+            let err: Error = e.into();
+            err.append(format!("Failed to set mtime in {context_owned} {dest_owned}"))
+        })
+    })
+    .await
+    .err_tip(|| format!("Failed to launch spawn_blocking for mtime in {context}"))?;
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.code == Code::PermissionDenied => {
+            warn!(
+                dest = %dest,
+                error = ?e,
+                context,
+                "set_file_mtime denied (immutable / SDK file flag / read-only mount); \
+                 continuing — file content already present via hardlink",
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Aggressively download the digests of files and make a local folder from it. This function
 /// will spawn unbounded number of futures to try and get these downloaded. The store itself
 /// should be rate limited if spawning too many requests at once is an issue.
@@ -391,35 +456,23 @@ pub fn download_to_directory<'a>(
                     if plan_i_hit {
                         // Apply perms/mtime same as the CAS path so the
                         // file presented to the action is identical either
-                        // way, then record in Plan K and return.
+                        // way, then record in Plan K and return. Both
+                        // chmod and utimes are downgraded to non-fatal
+                        // warnings on PermissionDenied: macOS SDK files
+                        // pre-staged under `xcode_links/` carry uchg
+                        // (immutable) flags that block any mode/mtime
+                        // change for the file's owner, and the file
+                        // content is already in place via hardlink — the
+                        // action only needs the bytes, not perfect
+                        // metadata mirroring. Other error classes still
+                        // propagate.
                         #[cfg(target_family = "unix")]
                         if let Some(unix_mode) = unix_mode {
-                            fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
-                                .await
-                                .err_tip(|| {
-                                    format!(
-                                        "Could not set unix mode in Plan I {dest}"
-                                    )
-                                })?;
+                            apply_chmod_or_warn(&dest, unix_mode, "Plan I").await?;
                         }
                         if let Some(mtime) = mtime {
-                            let dest_for_mtime = dest.clone();
-                            spawn_blocking!("plan_i_set_mtime", move || {
-                                set_file_mtime(
-                                    &dest_for_mtime,
-                                    FileTime::from_unix_time(
-                                        mtime.seconds,
-                                        mtime.nanos as u32,
-                                    ),
-                                )
-                                .err_tip(|| {
-                                    format!(
-                                        "Failed to set mtime in Plan I {dest_for_mtime}"
-                                    )
-                                })
-                            })
-                            .await
-                            .err_tip(|| "Failed to launch spawn_blocking in Plan I")??;
+                            apply_mtime_or_warn(&dest, mtime.seconds, mtime.nanos, "Plan I")
+                                .await?;
                         }
                         path_digest_cache.insert(dest_path_for_cache, digest);
                         return Ok::<(), Error>(());
@@ -494,35 +547,22 @@ pub fn download_to_directory<'a>(
                     }
 
                     // Always apply perms and mtime — we always fetch from CAS
-                    // on Plan K miss.
+                    // on Plan K miss. Same PermissionDenied degradation as
+                    // Plan I above: SDK files / immutable filesystems can
+                    // refuse chmod/utimes on otherwise-owned content.
                     {
                         #[cfg(target_family = "unix")]
                         if let Some(unix_mode) = unix_mode {
-                            fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
-                                .await
-                                .err_tip(|| {
-                                    format!(
-                                        "Could not set unix mode in download_to_directory {dest}"
-                                    )
-                                })?;
+                            apply_chmod_or_warn(&dest, unix_mode, "download_to_directory").await?;
                         }
                         if let Some(mtime) = mtime {
-                            let dest_for_mtime = dest.clone();
-                            spawn_blocking!("download_to_directory_set_mtime", move || {
-                                set_file_mtime(
-                                    &dest_for_mtime,
-                                    FileTime::from_unix_time(mtime.seconds, mtime.nanos as u32),
-                                )
-                                .err_tip(|| {
-                                    format!(
-                                        "Failed to set mtime in download_to_directory {dest_for_mtime}"
-                                    )
-                                })
-                            })
-                            .await
-                            .err_tip(
-                                || "Failed to launch spawn_blocking in download_to_directory",
-                            )??;
+                            apply_mtime_or_warn(
+                                &dest,
+                                mtime.seconds,
+                                mtime.nanos,
+                                "download_to_directory",
+                            )
+                            .await?;
                         }
                     }
 
