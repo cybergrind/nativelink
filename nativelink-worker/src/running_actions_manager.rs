@@ -119,6 +119,18 @@ static COALESCE_FOLLOW_WAIT: StageStats =
     StageStats::new("worker.coalesce.follow_wait");
 static ACTION_EXECUTE: StageStats = StageStats::new("worker.action_execute");
 static UPLOAD_RESULTS: StageStats = StageStats::new("worker.upload_results");
+/// Wall-clock spent in the GetTree-based input-tree prewarm and outcome
+/// counters. `ok` = full subtree fetched and written to fast store. `skip`
+/// = slow store isn't a direct GrpcStore (compression / verify wrapper).
+/// `err` = RPC or stream-level failure (we fall through to per-Read walk).
+static INPUT_TREE_PREWARM: StageStats =
+    StageStats::new("worker.input_tree_prewarm");
+static INPUT_TREE_PREWARM_OK: StageStats =
+    StageStats::new("worker.input_tree_prewarm.ok");
+static INPUT_TREE_PREWARM_SKIP: StageStats =
+    StageStats::new("worker.input_tree_prewarm.skip");
+static INPUT_TREE_PREWARM_ERR: StageStats =
+    StageStats::new("worker.input_tree_prewarm.err");
 use parking_lot::Mutex;
 use prost::Message;
 use relative_path::RelativePath;
@@ -661,6 +673,54 @@ fn plan_m_disabled_via_env() -> bool {
 ///
 /// This provides a significant performance improvement for repeated builds
 /// with the same input directories.
+/// 1.3.9 GetTree input-tree prewarm wrapper. Extracted out of
+/// `prepare_action_inputs` so the latter's async state machine stays
+/// compact (a large state machine on the hot path was overflowing test
+/// stacks). All failures are swallowed → caller falls through to the
+/// per-Read recursion. See `LocalWorkerConfig::experimental_input_tree_prewarm`.
+async fn run_input_tree_prewarm(
+    cas_store: &FastSlowStore,
+    digest: &DigestInfo,
+    work_directory: &str,
+) {
+    let hasher_func = opentelemetry::Context::current()
+        .get::<DigestHasherFunc>()
+        .map_or_else(
+            nativelink_util::digest_hasher::default_digest_hasher_func,
+            |v| *v,
+        );
+    let _t = INPUT_TREE_PREWARM.timer();
+    match nativelink_store::ac_utils::prewarm_input_tree(cas_store, *digest, hasher_func, "")
+        .await
+    {
+        Ok(nativelink_store::ac_utils::PrewarmOutcome::Prewarmed { count }) => {
+            INPUT_TREE_PREWARM_OK.incr();
+            trace!(
+                ?digest,
+                work_directory,
+                count,
+                "Input tree prewarm via GetTree complete"
+            );
+        }
+        Ok(nativelink_store::ac_utils::PrewarmOutcome::SlowStoreNotGrpc) => {
+            INPUT_TREE_PREWARM_SKIP.incr();
+            trace!(
+                ?digest,
+                "Input tree prewarm skipped: slow store is not a direct GrpcStore"
+            );
+        }
+        Err(e) => {
+            INPUT_TREE_PREWARM_ERR.incr();
+            warn!(
+                ?digest,
+                work_directory,
+                ?e,
+                "Input tree prewarm via GetTree failed; falling back to per-Read recursion"
+            );
+        }
+    }
+}
+
 pub async fn prepare_action_inputs(
     directory_cache: &Option<Arc<crate::directory_cache::DirectoryCache>>,
     cas_store: &FastSlowStore,
@@ -1364,6 +1424,14 @@ impl RunningActionImpl {
                     .await
                     .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
                 self.did_cleanup.store(false, Ordering::Release);
+                if self.running_actions_manager.input_tree_prewarm {
+                    run_input_tree_prewarm(
+                        &self.running_actions_manager.cas_store,
+                        &self.action_info.input_root_digest,
+                        &self.work_directory,
+                    )
+                    .await;
+                }
                 self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -2550,6 +2618,13 @@ pub struct RunningActionsManagerArgs<'a> {
     /// expected digest before hitting CAS. On match → hardlink-from-disk
     /// (Plan I). On miss → falls through to CAS unchanged.
     pub digest_checked_hint_link: bool,
+    /// Experimental: when true, `prepare_action_inputs` runs a single
+    /// REAPI `GetTree` against the slow CAS before the recursive walk so
+    /// every transitive `Directory` proto is already in the local fast
+    /// store. Compresses the depth-D `Read` critical path into ~1 RTT.
+    /// No-op when the slow store isn't a direct `GrpcStore`. See
+    /// `LocalWorkerConfig::experimental_input_tree_prewarm`.
+    pub input_tree_prewarm: bool,
     /// Optional process-level shared path->digest map (Plan K). When
     /// `Some`, every `RunningActionsManagerImpl` constructed with the
     /// same `SharedPathDigestMap` shares the in-memory Plan K state so
@@ -2630,6 +2705,9 @@ pub struct RunningActionsManagerImpl {
     /// Experimental: gate for Plan I (digest-checked hint-path
     /// short-circuit). See `LocalWorkerConfig::experimental_digest_checked_hint_link`.
     pub(crate) digest_checked_hint_link: bool,
+    /// Experimental: gate for the GetTree input-tree prewarm. See
+    /// `LocalWorkerConfig::experimental_input_tree_prewarm`.
+    pub(crate) input_tree_prewarm: bool,
 }
 
 impl RunningActionsManagerImpl {
@@ -2676,6 +2754,7 @@ impl RunningActionsManagerImpl {
             directory_cache: args.directory_cache,
             project_root: args.project_root,
             digest_checked_hint_link: args.digest_checked_hint_link,
+            input_tree_prewarm: args.input_tree_prewarm,
             path_digest_cache: {
                 // Plan L provider is always per-manager: each worker honors
                 // its own `shared_walked_dirs_redis_url`/`machine_id` even

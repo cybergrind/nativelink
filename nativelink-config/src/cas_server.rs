@@ -942,6 +942,28 @@ pub struct LocalWorkerConfig {
     /// Default: true
     #[serde(default = "default_experimental_digest_checked_hint_link")]
     pub experimental_digest_checked_hint_link: bool,
+
+    /// Experimental: before recursively walking an action's input tree,
+    /// drive a single REAPI `GetTree` call against the slow CAS to populate
+    /// the worker's local fast store with every transitive `Directory`
+    /// proto. After prewarm, the recursive `download_to_directory` walk
+    /// hits the fast store at every level — collapsing depth-D sequential
+    /// `Read` round-trips on the slow CAS into ~1 RTT of `GetTree`.
+    ///
+    /// Only effective when the slow CAS is a direct `GrpcStore` (i.e. not
+    /// wrapped in compression / verify stores). On a non-`GrpcStore` slow
+    /// side, prewarm is a no-op and the legacy per-Read recursion runs
+    /// unchanged.
+    ///
+    /// Best suited for shared-tree topologies (workers tagged with the
+    /// `InputRootAbsolutePath` platform property, talking to a remote
+    /// scheduler-CAS over a high-latency link). On co-located workers
+    /// (LAN, sub-ms RTT) the depth-D critical path is already cheap and
+    /// prewarm just shifts CPU from worker to scheduler.
+    ///
+    /// Default: false (opt-in).
+    #[serde(default)]
+    pub experimental_input_tree_prewarm: bool,
 }
 
 const fn default_experimental_digest_checked_hint_link() -> bool {

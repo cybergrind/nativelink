@@ -645,6 +645,7 @@ pub async fn new_local_worker(
             // the per-file SHA-256 storm into a foreground problem.
             digest_checked_hint_link: config.experimental_digest_checked_hint_link
                 && !plan_i_disabled_via_env(),
+            input_tree_prewarm: config.experimental_input_tree_prewarm,
             path_digest_cache,
             dir_walk_coalescer,
         })?);
