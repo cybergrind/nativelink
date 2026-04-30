@@ -22,7 +22,8 @@ use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    ActionResult, Digest, GetActionResultRequest, UpdateActionResultRequest, digest_function,
+    ActionResult, Digest, GetActionResultRequest, OutputFile, UpdateActionResultRequest,
+    digest_function,
 };
 use nativelink_service::ac_server::AcServer;
 use nativelink_store::default_store_factory::store_factory;
@@ -81,6 +82,7 @@ fn make_ac_server(store_manager: &StoreManager) -> Result<AcServer, Error> {
             config: nativelink_config::cas_server::AcStoreConfig {
                 ac_store: "main_ac".to_string(),
                 read_only: false,
+                get_self_check_store: None,
             },
         }],
         store_manager,
@@ -185,6 +187,104 @@ async fn update_action_result(
             digest_function: digest_function::Value::Sha256.into(),
         }))
         .await
+}
+
+fn make_ac_server_with_self_check(
+    store_manager: &StoreManager,
+) -> Result<AcServer, Error> {
+    AcServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: nativelink_config::cas_server::AcStoreConfig {
+                ac_store: "main_ac".to_string(),
+                read_only: false,
+                get_self_check_store: Some("main_cas".to_string()),
+            },
+        }],
+        store_manager,
+    )
+}
+
+const OUTPUT_HASH: &str =
+    "fedcba9876543210000000000000000000000000000000000fedcba987654321";
+const OUTPUT_SIZE: i64 = 4096;
+
+fn action_result_referencing_output() -> ActionResult {
+    ActionResult {
+        exit_code: 0,
+        output_files: vec![OutputFile {
+            path: "out/foo.o".to_string(),
+            digest: Some(Digest {
+                hash: OUTPUT_HASH.to_string(),
+                size_bytes: OUTPUT_SIZE,
+            }),
+            is_executable: false,
+            contents: Default::default(),
+            node_properties: None,
+        }],
+        ..Default::default()
+    }
+}
+
+#[nativelink_test]
+async fn self_check_returns_not_found_when_output_blob_missing_from_cas()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let ac_server = make_ac_server_with_self_check(&store_manager)?;
+    let ac_store = store_manager.get_store("main_ac").unwrap();
+
+    let action_result = action_result_referencing_output();
+    insert_into_store(ac_store.as_pin(), HASH1, HASH1_SIZE, &action_result).await?;
+
+    let raw_response = get_action_result(&ac_server, HASH1, HASH1_SIZE).await;
+
+    let err = raw_response.expect_err("expected NotFound from AC self-check");
+    assert_eq!(err.code(), Code::NotFound);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn self_check_returns_ok_when_output_blob_present_in_cas()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let ac_server = make_ac_server_with_self_check(&store_manager)?;
+    let ac_store = store_manager.get_store("main_ac").unwrap();
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+
+    let output_digest = DigestInfo::try_new(OUTPUT_HASH, OUTPUT_SIZE)?;
+    cas_store
+        .update_oneshot(output_digest, bytes::Bytes::from_static(b"obj-bytes"))
+        .await?;
+
+    let action_result = action_result_referencing_output();
+    insert_into_store(ac_store.as_pin(), HASH1, HASH1_SIZE, &action_result).await?;
+
+    let raw_response = get_action_result(&ac_server, HASH1, HASH1_SIZE).await;
+
+    let response = raw_response.expect("expected AC hit when CAS has the blob");
+    assert_eq!(response.into_inner(), action_result);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn self_check_disabled_serves_stale_action_result()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    // Reuse the standard make_ac_server (get_self_check_store: None) — this
+    // is the upstream behaviour and must keep returning the cached entry
+    // even when the referenced output blob is absent from CAS.
+    let ac_server = make_ac_server(&store_manager)?;
+    let ac_store = store_manager.get_store("main_ac").unwrap();
+
+    let action_result = action_result_referencing_output();
+    insert_into_store(ac_store.as_pin(), HASH1, HASH1_SIZE, &action_result).await?;
+
+    let raw_response = get_action_result(&ac_server, HASH1, HASH1_SIZE).await;
+
+    let response =
+        raw_response.expect("self-check disabled: AC hit should pass through unchanged");
+    assert_eq!(response.into_inner(), action_result);
+    Ok(())
 }
 
 #[nativelink_test]

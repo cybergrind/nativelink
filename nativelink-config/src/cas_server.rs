@@ -118,6 +118,25 @@ pub struct AcStoreConfig {
     /// it is only possible to read from the Action Cache.
     #[serde(default)]
     pub read_only: bool,
+
+    /// Optional CAS-store reference used to verify that every output digest
+    /// referenced by a cached `ActionResult` is still present in CAS before
+    /// returning the result to a `GetActionResult` caller. This is the AC-read
+    /// counterpart of the scheduler's `completed_cas_self_check_store`: it
+    /// closes the failure window where a stale AC entry from a previous build
+    /// (or a different CAS topology) names output blobs that no longer exist
+    /// in the current shared CAS, which would otherwise cause the client to
+    /// see a "successful" cached action whose `.o` files cannot be
+    /// materialized. On any missing digest the AC entry is treated as
+    /// `NotFound`, forcing the client to re-Execute.
+    ///
+    /// When unset, AC reads are unchanged from upstream (no validation).
+    /// Typical setting: the same CAS store referenced elsewhere in the
+    /// config (e.g. `"SHARED_CAS"`).
+    ///
+    /// Default: None (no validation)
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub get_self_check_store: Option<StoreRefName>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

@@ -30,16 +30,21 @@ use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use opentelemetry::context::FutureExt;
 use prost::Message;
 use tonic::{Request, Response, Status};
-use tracing::{Instrument, Level, error, error_span, instrument};
+use tracing::{Instrument, Level, error, error_span, info, instrument, warn};
 
 #[derive(Debug, Clone)]
 pub struct AcStoreInfo {
     store: Store,
     read_only: bool,
+    /// When set, every successful `GetActionResult` decodes the cached
+    /// `ActionResult` and checks that every output file digest is present in
+    /// this CAS store before returning. On any miss the AC read is converted
+    /// to `NotFound`. See `AcStoreConfig::get_self_check_store`.
+    get_self_check_store: Option<Store>,
 }
 
 pub struct AcServer {
@@ -62,11 +67,23 @@ impl AcServer {
             let store = store_manager.get_store(&config.ac_store).ok_or_else(|| {
                 make_input_err!("'ac_store': '{}' does not exist", config.ac_store)
             })?;
+            let get_self_check_store = match config.get_self_check_store.as_deref() {
+                Some(name) if !name.is_empty() => Some(
+                    store_manager.get_store(name).ok_or_else(|| {
+                        make_input_err!(
+                            "'get_self_check_store': '{name}' does not exist (referenced from ac instance '{}')",
+                            config.instance_name,
+                        )
+                    })?,
+                ),
+                _ => None,
+            };
             stores.insert(
                 config.instance_name.to_string(),
                 AcStoreInfo {
                     store,
                     read_only: config.read_only,
+                    get_self_check_store,
                 },
             );
         }
@@ -106,7 +123,73 @@ impl AcServer {
 
         let res = get_and_decode_digest::<ActionResult>(&store_info.store, digest.into()).await;
         match res {
-            Ok(action_result) => Ok(Response::new(action_result)),
+            Ok(action_result) => {
+                // CAS self-check on the AC read path. Mirrors the scheduler's
+                // `completed_cas_self_check_store` logic in
+                // `simple_scheduler_state_manager.rs::inner_update_operation`,
+                // but on the cache-hit side: a stale `ActionResult` whose
+                // output blobs are no longer in the current CAS would
+                // otherwise be returned to the client and surface as a
+                // missing-output failure at the next step (e.g. SOLINK / AR
+                // failing on a `.o` that was never materialized).
+                if let Some(cas) = store_info.get_self_check_store.as_ref() {
+                    let digests: Vec<StoreKey<'static>> = action_result
+                        .output_files
+                        .iter()
+                        .filter_map(|f| f.digest.as_ref())
+                        .filter_map(|d| DigestInfo::try_from(d.clone()).ok())
+                        .map(|d| StoreKey::from(d).into_owned())
+                        .collect();
+                    if !digests.is_empty() {
+                        match cas.has_many(&digests).await {
+                            Ok(results) => {
+                                let missing_count =
+                                    results.iter().filter(|present| present.is_none()).count();
+                                if missing_count > 0 {
+                                    let first_missing = action_result
+                                        .output_files
+                                        .iter()
+                                        .zip(results.iter())
+                                        .find(|(_, present)| present.is_none())
+                                        .and_then(|(f, _)| f.digest.clone());
+                                    warn!(
+                                        action_digest = ?digest,
+                                        instance_name = %instance_name,
+                                        num_missing = missing_count,
+                                        ?first_missing,
+                                        "ac_server: AC self-check FAILED — cached ActionResult references output digests not present in CAS; converting hit to NotFound to force re-Execute",
+                                    );
+                                    return Err(make_err!(
+                                        Code::NotFound,
+                                        "AC self-check failed: {missing_count} output digest(s) missing from CAS",
+                                    ));
+                                }
+                                info!(
+                                    action_digest = ?digest,
+                                    instance_name = %instance_name,
+                                    num_output_files = action_result.output_files.len(),
+                                    "ac_server: AC self-check OK",
+                                );
+                            }
+                            Err(err) => {
+                                // Match the scheduler's behaviour: treat a
+                                // self-check store error as transient and
+                                // serve the cached result rather than
+                                // synthesising a NotFound. The alternative
+                                // would degrade availability whenever the
+                                // CAS store backend hiccups.
+                                warn!(
+                                    action_digest = ?digest,
+                                    instance_name = %instance_name,
+                                    ?err,
+                                    "ac_server: AC self-check has_many() failed; serving cached ActionResult (treating store error as transient)",
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(Response::new(action_result))
+            }
             Err(mut e) => {
                 if e.code == Code::NotFound {
                     // `get_action_result` is frequent to get NotFound errors, so remove all
