@@ -2647,6 +2647,13 @@ pub struct RunningActionsManagerArgs<'a> {
     /// `None`, each manager builds its own coalescer (deduplicates
     /// only within that manager).
     pub dir_walk_coalescer: Option<crate::path_digest_cache::SharedDirWalkCoalescer>,
+    /// Optional process-shared dirty bit for Plan K disk persistence.
+    /// When `Some`, the constructed `PathDigestCache` marks this bit on
+    /// every `insert`/`evict` so the background flush task knows there
+    /// are un-flushed changes. When `None`, persistence is disabled and
+    /// the cache behaves as in-memory-only — the historical default.
+    /// See `nativelink-worker/src/path_digest_persistence.rs`.
+    pub path_digest_cache_dirty: Option<crate::path_digest_persistence::DirtyBit>,
 }
 
 struct CleanupGuard {
@@ -2799,6 +2806,12 @@ impl RunningActionsManagerImpl {
                     (None, _) => {
                         crate::path_digest_cache::PathDigestCache::with_walked_dirs(walked_dirs)
                     }
+                };
+                // Attach the persistence dirty bit only when one was
+                // injected. Without it, the cache stays in-memory-only.
+                let cache = match args.path_digest_cache_dirty {
+                    Some(dirty) => cache.with_dirty_bit(dirty),
+                    None => cache,
                 };
                 Arc::new(cache)
             },

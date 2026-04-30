@@ -1345,6 +1345,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: Some(shared_map.clone()),
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1372,6 +1373,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: Some(shared_map.clone()),
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1625,6 +1627,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: Some(shared_map.clone()),
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1684,6 +1687,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1816,6 +1820,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1950,6 +1955,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2140,6 +2146,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2331,6 +2338,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2548,6 +2556,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2692,6 +2701,7 @@ mod tests {
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2904,6 +2914,7 @@ exit 0
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -3089,6 +3100,7 @@ exit 0
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -3268,6 +3280,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -3361,6 +3374,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3445,6 +3459,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3535,6 +3550,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3646,6 +3662,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3701,6 +3718,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3778,6 +3796,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3906,6 +3925,7 @@ exit 1
                     input_tree_prewarm: false,
                     path_digest_cache: None,
                 dir_walk_coalescer: None,
+                path_digest_cache_dirty: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -4002,6 +4022,7 @@ exit 1
                     input_tree_prewarm: false,
                     path_digest_cache: None,
                 dir_walk_coalescer: None,
+                path_digest_cache_dirty: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -4098,6 +4119,7 @@ exit 1
                     input_tree_prewarm: false,
                     path_digest_cache: None,
                 dir_walk_coalescer: None,
+                path_digest_cache_dirty: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -4191,6 +4213,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4352,6 +4375,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4530,6 +4554,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4639,6 +4664,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -4762,6 +4788,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4951,6 +4978,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -5080,6 +5108,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         // Create a simple action
@@ -5230,6 +5259,7 @@ exit 1
                 input_tree_prewarm: false,
                 path_digest_cache: None,
             dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
             })?);
 
         // Create a simple action
@@ -5425,6 +5455,7 @@ exit 1
             input_tree_prewarm: false,
             path_digest_cache: None,
         dir_walk_coalescer: None,
+        path_digest_cache_dirty: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5482,6 +5513,7 @@ exit 1
             input_tree_prewarm: false,
             path_digest_cache: None,
         dir_walk_coalescer: None,
+        path_digest_cache_dirty: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5539,6 +5571,7 @@ exit 1
             input_tree_prewarm: false,
             path_digest_cache: None,
         dir_walk_coalescer: None,
+        path_digest_cache_dirty: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5599,6 +5632,7 @@ exit 1
             input_tree_prewarm: false,
             path_digest_cache: None,
         dir_walk_coalescer: None,
+        path_digest_cache_dirty: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;
@@ -5649,6 +5683,7 @@ exit 1
             input_tree_prewarm: false,
             path_digest_cache: None,
         dir_walk_coalescer: None,
+        path_digest_cache_dirty: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;

@@ -645,6 +645,70 @@ async fn inner_main(
         // 600k file ops contending on disk and the page cache.
         let shared_dir_walk_coalescer =
             nativelink_worker::path_digest_cache::new_shared_dir_walk_coalescer();
+
+        // Plan K disk persistence (opt-in). When configured at the top
+        // level, load any prior snapshot into the shared map (each entry
+        // stat-gated against the on-disk file's existence and size) and
+        // spawn a background flush task that writes the map back on a
+        // dirty cadence. Without the config block, behavior is identical
+        // to today's in-memory-only Plan K.
+        let path_digest_dirty_bit =
+            nativelink_worker::path_digest_persistence::new_dirty_bit();
+        let path_digest_persistence_shutdown = if let Some(persist_cfg) =
+            cfg.path_digest_cache_persistence.as_ref()
+        {
+            let snapshot_path = std::path::PathBuf::from(&persist_cfg.path);
+            let stats = nativelink_worker::path_digest_persistence::load_into(
+                &shared_path_digest_map,
+                &snapshot_path,
+            );
+            tracing::info!(
+                target: "nativelink",
+                path = %snapshot_path.display(),
+                loaded = stats.loaded,
+                dropped_stale = stats.dropped_stale,
+                dropped_corrupt = stats.dropped_corrupt,
+                "plan_k.persistence: snapshot load complete",
+            );
+            // Default 30 s — generous enough that quiet workers do
+            // negligible disk I/O, tight enough that a crash loses at
+            // most ~30 s of warm entries (which the next cold worker
+            // would otherwise re-hash anyway).
+            let interval = std::time::Duration::from_secs(
+                persist_cfg.flush_interval_seconds.unwrap_or(30),
+            );
+            // Bridge from the broadcast::ShutdownGuard channel that
+            // owns the rest of the shutdown flow into the persistence
+            // module's Notify-based handle. Keeps the persistence
+            // module decoupled from this binary's shutdown types.
+            let flush_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+            let flush_shutdown_inner = flush_shutdown.clone();
+            let mut shutdown_rx_for_flush = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                drop(shutdown_rx_for_flush.recv().await);
+                flush_shutdown_inner.notify_one();
+            });
+            let flush_handle = nativelink_worker::path_digest_persistence::spawn_flush_task(
+                shared_path_digest_map.clone(),
+                path_digest_dirty_bit.clone(),
+                snapshot_path,
+                interval,
+                flush_shutdown.clone(),
+            );
+            // Push the flush task's join handle into the same
+            // root_futures pool that everything else awaits, so the
+            // process doesn't exit before the final flush completes.
+            root_futures.push(Box::pin(async move {
+                drop(flush_handle.await);
+                Ok(())
+            }));
+            Some(flush_shutdown)
+        } else {
+            None
+        };
+        // Suppress unused warning when persistence is off.
+        drop(path_digest_persistence_shutdown);
+
         for (i, worker_cfg) in worker_cfgs.into_iter().enumerate() {
             let spawn_fut = match worker_cfg {
                 WorkerConfig::Local(local_worker_cfg) => {
@@ -687,6 +751,10 @@ async fn inner_main(
                         historical_store,
                         Some(shared_path_digest_map.clone()),
                         Some(shared_dir_walk_coalescer.clone()),
+                        // Always pass the dirty bit; when persistence
+                        // is off (no flush task spawned) it's harmless
+                        // — nobody reads it.
+                        Some(path_digest_dirty_bit.clone()),
                     )
                     .await
                     .err_tip(|| "Could not make LocalWorker")?;

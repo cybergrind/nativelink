@@ -320,6 +320,11 @@ pub struct PathDigestCache {
     /// `map` so concurrent `download_to_directory(path, digest)` calls
     /// across every manager in the process collapse into one walk.
     coalescer: SharedDirWalkCoalescer,
+    /// Optional persistence dirty bit. When present, `insert` and
+    /// `evict` mark it so the background flush task knows there are
+    /// un-flushed changes. `None` means persistence is disabled — the
+    /// in-memory map behaves exactly as before.
+    dirty: Option<crate::path_digest_persistence::DirtyBit>,
 }
 
 impl PathDigestCache {
@@ -330,6 +335,7 @@ impl PathDigestCache {
             map: Arc::new(RwLock::new(HashMap::new())),
             walked_dirs: Box::new(LocalWalkedDirs::new()),
             coalescer: new_shared_dir_walk_coalescer(),
+            dirty: None,
         }
     }
 
@@ -341,6 +347,7 @@ impl PathDigestCache {
             map: Arc::new(RwLock::new(HashMap::new())),
             walked_dirs,
             coalescer: new_shared_dir_walk_coalescer(),
+            dirty: None,
         }
     }
 
@@ -361,7 +368,20 @@ impl PathDigestCache {
             map,
             walked_dirs,
             coalescer,
+            dirty: None,
         }
+    }
+
+    /// Builder: attach a process-shared dirty bit so `insert` and
+    /// `evict` notify the persistence flush task. Without this, the
+    /// cache behaves identically to the in-memory-only configuration.
+    #[must_use]
+    pub fn with_dirty_bit(
+        mut self,
+        bit: crate::path_digest_persistence::DirtyBit,
+    ) -> Self {
+        self.dirty = Some(bit);
+        self
     }
 
     /// Backwards-compat constructor for the previous Slice-1 shape.
@@ -375,6 +395,7 @@ impl PathDigestCache {
             map,
             walked_dirs,
             coalescer: new_shared_dir_walk_coalescer(),
+            dirty: None,
         }
     }
 
@@ -391,6 +412,9 @@ impl PathDigestCache {
 
     pub fn insert(&self, path: PathBuf, digest: DigestInfo) {
         self.map.write().insert(path, digest);
+        if let Some(d) = &self.dirty {
+            crate::path_digest_persistence::mark_dirty(d);
+        }
     }
 
     /// Remove a (path, _) entry. Used by `download_to_directory`'s
@@ -400,6 +424,9 @@ impl PathDigestCache {
     /// the CAS/Plan I path and actually re-materializes the file.
     pub fn evict(&self, path: &Path) {
         self.map.write().remove(path);
+        if let Some(d) = &self.dirty {
+            crate::path_digest_persistence::mark_dirty(d);
+        }
     }
 
     pub fn dir_walked(&self, directory_path: &str, digest: &DigestInfo) -> bool {
@@ -446,6 +473,51 @@ mod tests {
     fn test_new_cache_is_empty() {
         let cache = PathDigestCache::new();
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn insert_marks_dirty_when_bit_attached() {
+        let dirty = crate::path_digest_persistence::new_dirty_bit();
+        let cache = PathDigestCache::new().with_dirty_bit(dirty.clone());
+        assert!(!crate::path_digest_persistence::is_dirty(&dirty));
+        cache.insert(PathBuf::from("/p"), DigestInfo::new([0u8; 32], 1));
+        assert!(crate::path_digest_persistence::is_dirty(&dirty));
+    }
+
+    #[test]
+    fn evict_marks_dirty_when_bit_attached() {
+        let dirty = crate::path_digest_persistence::new_dirty_bit();
+        let cache = PathDigestCache::new().with_dirty_bit(dirty.clone());
+        let p = PathBuf::from("/q");
+        cache.insert(p.clone(), DigestInfo::new([0u8; 32], 1));
+        // Reset and verify evict re-arms.
+        let _ = crate::path_digest_persistence::take_dirty(&dirty);
+        assert!(!crate::path_digest_persistence::is_dirty(&dirty));
+        cache.evict(&p);
+        assert!(crate::path_digest_persistence::is_dirty(&dirty));
+    }
+
+    #[test]
+    fn contains_does_not_mark_dirty() {
+        let dirty = crate::path_digest_persistence::new_dirty_bit();
+        let cache = PathDigestCache::new().with_dirty_bit(dirty.clone());
+        let digest = DigestInfo::new([0u8; 32], 1);
+        // contains on empty + with-entry — neither path may dirty.
+        assert!(!cache.contains(Path::new("/missing"), &digest));
+        cache.insert(PathBuf::from("/present"), digest);
+        let _ = crate::path_digest_persistence::take_dirty(&dirty);
+        assert!(cache.contains(Path::new("/present"), &digest));
+        assert!(!crate::path_digest_persistence::is_dirty(&dirty));
+    }
+
+    #[test]
+    fn insert_without_dirty_bit_is_silent() {
+        // No bit attached → existing behavior preserved.
+        let cache = PathDigestCache::new();
+        cache.insert(PathBuf::from("/p"), DigestInfo::new([0u8; 32], 1));
+        // No assertion on a flag — the point is "doesn't panic / doesn't
+        // require a bit." Functional correctness covered by
+        // test_insert_then_contains_hit below.
     }
 
     #[test]

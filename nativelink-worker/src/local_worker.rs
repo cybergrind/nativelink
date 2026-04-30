@@ -528,6 +528,7 @@ pub async fn new_local_worker(
     historical_store: Store,
     path_digest_cache: Option<crate::path_digest_cache::SharedPathDigestMap>,
     dir_walk_coalescer: Option<crate::path_digest_cache::SharedDirWalkCoalescer>,
+    path_digest_cache_dirty: Option<crate::path_digest_persistence::DirtyBit>,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
     let fast_slow_store = cas_store
         .downcast_ref::<FastSlowStore>(None)
@@ -648,6 +649,7 @@ pub async fn new_local_worker(
             input_tree_prewarm: config.experimental_input_tree_prewarm,
             path_digest_cache,
             dir_walk_coalescer,
+            path_digest_cache_dirty,
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),

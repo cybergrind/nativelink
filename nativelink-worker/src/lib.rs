@@ -18,6 +18,7 @@ pub mod file_digest_check;
 pub mod local_dir_synthesis;
 pub mod local_worker;
 pub mod path_digest_cache;
+pub mod path_digest_persistence;
 pub mod plan_l_prewarm;
 pub mod running_actions_manager;
 pub mod worker_api_client_wrapper;

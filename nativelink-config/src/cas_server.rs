@@ -1110,6 +1110,45 @@ pub struct CasConfig {
 
     /// Any global configurations that apply to all modules live here.
     pub global: Option<GlobalConfig>,
+
+    /// Opt-in disk persistence for the worker's path-digest cache
+    /// (Plan K). When configured, the process-shared map is loaded
+    /// from `path` at startup (each entry stat-gated against the
+    /// on-disk file's existence and size), and a background task
+    /// flushes the map back to disk on the cadence below. When absent,
+    /// Plan K stays in-memory-only — the historical behavior.
+    ///
+    /// Lives at the top level rather than per-`LocalWorkerConfig`
+    /// because the underlying map is constructed once per
+    /// `nativelink` process (see `src/bin/nativelink.rs`'s
+    /// `shared_path_digest_map`) and is shared across every
+    /// configured worker; per-worker config would invite divergent
+    /// persistence paths backing the same map.
+    ///
+    /// Default: absent (off).
+    #[serde(default)]
+    pub path_digest_cache_persistence: Option<PathDigestCachePersistenceConfig>,
+}
+
+/// Configuration for opt-in Plan K persistence. See
+/// `CasConfig::path_digest_cache_persistence`.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct PathDigestCachePersistenceConfig {
+    /// Absolute path to the snapshot file. The parent directory must
+    /// exist and be writable; the file itself is created on the first
+    /// flush. The `MAC_DATA_DIR` shellexpand convention used elsewhere
+    /// in the config is supported.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub path: String,
+
+    /// How often the background task wakes to check for un-flushed
+    /// changes. Set generously (~30 s) — flushes only happen when the
+    /// dirty bit is set, so quiet workers do no extra I/O. Default
+    /// (when omitted): 30 seconds.
+    #[serde(default)]
+    pub flush_interval_seconds: Option<u64>,
 }
 
 impl CasConfig {
@@ -1183,5 +1222,83 @@ mod tests {
         let cfg: LocalWorkerConfig =
             serde_json5::from_str(cfg_json).expect("explicit-true cfg parses");
         assert!(cfg.experimental_digest_checked_hint_link);
+    }
+
+    /// Minimal `CasConfig` (no workers, no schedulers, no servers
+    /// beyond the empty array). The tests below pivot on
+    /// `path_digest_cache_persistence`; everything else must accept
+    /// reasonable empties so the tests aren't sensitive to unrelated
+    /// schema churn.
+    const MINIMAL_CAS_CFG: &str = r#"{
+        "stores": [],
+        "servers": []
+    }"#;
+
+    #[test]
+    fn path_digest_cache_persistence_default_is_none() {
+        let cfg: CasConfig =
+            serde_json5::from_str(MINIMAL_CAS_CFG).expect("minimal cfg parses");
+        assert!(
+            cfg.path_digest_cache_persistence.is_none(),
+            "absent key must yield None, preserving the in-memory-only default",
+        );
+    }
+
+    #[test]
+    fn path_digest_cache_persistence_parse_minimal() {
+        let cfg_json = r#"{
+            "stores": [],
+            "servers": [],
+            "path_digest_cache_persistence": {
+                "path": "/var/nl/plan_k.bin"
+            }
+        }"#;
+        let cfg: CasConfig =
+            serde_json5::from_str(cfg_json).expect("minimal persistence cfg parses");
+        let p = cfg
+            .path_digest_cache_persistence
+            .expect("persistence config present");
+        assert_eq!(p.path, "/var/nl/plan_k.bin");
+        assert_eq!(
+            p.flush_interval_seconds, None,
+            "flush_interval_seconds defaults to None when omitted",
+        );
+    }
+
+    #[test]
+    fn path_digest_cache_persistence_parse_full() {
+        let cfg_json = r#"{
+            "stores": [],
+            "servers": [],
+            "path_digest_cache_persistence": {
+                "path": "/var/nl/plan_k.bin",
+                "flush_interval_seconds": 60
+            }
+        }"#;
+        let cfg: CasConfig =
+            serde_json5::from_str(cfg_json).expect("full persistence cfg parses");
+        let p = cfg
+            .path_digest_cache_persistence
+            .expect("persistence config present");
+        assert_eq!(p.path, "/var/nl/plan_k.bin");
+        assert_eq!(p.flush_interval_seconds, Some(60));
+    }
+
+    #[test]
+    fn path_digest_cache_persistence_rejects_unknown_field() {
+        // `deny_unknown_fields` is what protects operators from typos.
+        let cfg_json = r#"{
+            "stores": [],
+            "servers": [],
+            "path_digest_cache_persistence": {
+                "path": "/var/nl/plan_k.bin",
+                "max_entries": 200000
+            }
+        }"#;
+        let res: Result<CasConfig, _> = serde_json5::from_str(cfg_json);
+        assert!(
+            res.is_err(),
+            "unknown field max_entries must be rejected so typos surface",
+        );
     }
 }
