@@ -2033,6 +2033,20 @@ impl RunningActionImpl {
         output_file_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
         output_directory_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
 
+        // Per-declared-output trace for cross-referencing NL's worker logs
+        // against siso_metrics.json when investigating local-fallback outputs
+        // that materialize in CAS but not on the build host's filesystem
+        // (docs/local_fallback_output_not_materialized.md). One info! per
+        // output_file, keyed by operation_id + declared path + digest.
+        for output_file in &output_files {
+            info!(
+                operation_id = ?self.operation_id,
+                declared_path = ?output_file.name_or_path,
+                digest = ?output_file.digest,
+                "upload_results: declared output uploaded",
+            );
+        }
+
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
         let first_output_file_summary = output_files

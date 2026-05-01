@@ -1917,6 +1917,185 @@ mod tests {
         Ok(())
     }
 
+    /// Reproduces the worker-side behavior described in
+    /// `docs/local_fallback_output_not_materialized.md`: after a successful
+    /// action, declared outputs exist only in CAS — the worker never copies
+    /// them to a path on the local filesystem, and `cleanup` deletes the
+    /// sandbox containing the only on-disk copy.
+    ///
+    /// This is the NL-side half of the doc's claim. It does not exercise
+    /// siso's local-fallback path — it only pins the worker behavior, so a
+    /// future fix that materializes outputs to a configured local root would
+    /// require updating this test.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn local_fallback_output_not_materialized_on_local_fs_test()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+        const OUTPUT_NAME: &str = "out.txt";
+        const OUTPUT_CONTENT: &str = "hello";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, slow_store, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory: root_action_directory.clone(),
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
+                shared_tree_path: None,
+                project_root: None,
+                digest_checked_hint_link: false,
+                input_tree_prewarm: false,
+                path_digest_cache: None,
+            dir_walk_coalescer: None,
+            path_digest_cache_dirty: None,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        let working_directory = "some_cwd";
+        let arguments = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf '{OUTPUT_CONTENT}' > ./{OUTPUT_NAME}"),
+        ];
+        let command = Command {
+            arguments,
+            output_paths: vec![OUTPUT_NAME.to_string()],
+            working_directory: working_directory.to_string(),
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory {
+                directories: vec![DirectoryNode {
+                    name: working_directory.to_string(),
+                    digest: Some(
+                        serialize_and_upload_message(
+                            &Directory::default(),
+                            cas_store.as_pin(),
+                            &mut DigestHasherFunc::Sha256.hasher(),
+                        )
+                        .await?
+                        .into(),
+                    ),
+                }],
+                ..Default::default()
+            },
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: operation_id.clone(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                },
+            )
+            .await?;
+
+        let action_result = run_action(running_action_impl).await?;
+
+        // 1. CAS holds the bytes — REAPI's contract is met.
+        assert_eq!(action_result.exit_code, 0);
+        assert_eq!(action_result.output_files.len(), 1);
+        assert_eq!(
+            action_result.output_files[0].name_or_path,
+            NameOrPath::Path(OUTPUT_NAME.to_string()),
+        );
+        let cas_bytes = slow_store
+            .as_ref()
+            .get_part_unchunked(action_result.output_files[0].digest, 0, None)
+            .await?;
+        assert_eq!(from_utf8(&cas_bytes)?, OUTPUT_CONTENT);
+
+        // 2. The sandbox under root_action_directory/<operation_id> is gone.
+        let sandbox_action_dir = format!("{root_action_directory}/{operation_id}");
+        assert!(
+            fs::metadata(&sandbox_action_dir).await.is_err(),
+            "sandbox at {sandbox_action_dir} should be torn down by cleanup",
+        );
+
+        // 3. The output bytes do NOT appear at any "build host" path on the
+        //    local filesystem. Today the worker only writes to CAS and to the
+        //    sandbox (which is now gone). This is the bug doc's worker-side
+        //    invariant: a successful local action leaves no on-FS replica of
+        //    its declared outputs at any caller-visible path.
+        let candidate_paths = {
+            let root_path = PathBuf::from(&root_action_directory);
+            let mut v = vec![root_path.join(OUTPUT_NAME)];
+            if let Some(parent) = root_path.parent() {
+                v.push(parent.join(OUTPUT_NAME));
+            }
+            v
+        };
+        for path in candidate_paths {
+            assert!(
+                fs::metadata(&path).await.is_err(),
+                "REGRESSION: worker materialized output at {} outside the sandbox; \
+                 today's worker should not write to any local-FS path",
+                path.display(),
+            );
+        }
+
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn blake3_upload_files() -> Result<(), Box<dyn core::error::Error>> {
         const WORKER_ID: &str = "foo_worker_id";
