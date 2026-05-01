@@ -983,6 +983,35 @@ pub struct LocalWorkerConfig {
     /// Default: false (opt-in).
     #[serde(default)]
     pub experimental_input_tree_prewarm: bool,
+
+    /// Optional absolute directory where this worker materializes
+    /// declared outputs to local disk *after* a successful CAS upload
+    /// and *before* committing the AC entry. Mirrors the action's
+    /// sandbox layout: each `output_files[i]` is hard-linked from
+    /// `<sandbox>/<working_directory>/<entry>` to
+    /// `<local_materialization_root>/<working_directory>/<entry>`.
+    ///
+    /// Use case: combined-mode (in-process scheduler+worker) on a
+    /// build host where the calling tool (e.g. siso) treats the
+    /// in-process worker as a *local* executor and expects the
+    /// produced files to appear on the host's filesystem. By default
+    /// NL's worker uploads outputs only to CAS, so any caller
+    /// relying on local-FS post-conditions sees "no such file" once
+    /// the sandbox is torn down. Setting this field re-establishes
+    /// the local-FS post-condition for that subset of actions.
+    ///
+    /// Idempotent: if the destination already exists (path-share
+    /// sandboxes, or a previous attempt), the link errors with
+    /// `EEXIST` and the materialization step records
+    /// `already_present` and continues.
+    ///
+    /// Should remain `None` on remote workers (separate machine from
+    /// the build host) — there is no useful destination on those
+    /// hosts and the caller relies on REAPI's CAS-pull semantics.
+    ///
+    /// Default: None (no local materialization; legacy behavior).
+    #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
+    pub local_materialization_root: Option<String>,
 }
 
 const fn default_experimental_digest_checked_hint_link() -> bool {

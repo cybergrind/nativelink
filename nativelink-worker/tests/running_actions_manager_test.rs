@@ -1346,6 +1346,7 @@ mod tests {
                 path_digest_cache: Some(shared_map.clone()),
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1374,6 +1375,7 @@ mod tests {
                 path_digest_cache: Some(shared_map.clone()),
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1628,6 +1630,7 @@ mod tests {
                 path_digest_cache: Some(shared_map.clone()),
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1688,6 +1691,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1821,6 +1825,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1970,6 +1975,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2096,6 +2102,176 @@ mod tests {
         Ok(())
     }
 
+    /// Sister test for `local_fallback_output_not_materialized_on_local_fs_test`:
+    /// when `local_materialization_root` is set, a successful action's
+    /// declared outputs land at `<root>/<working_directory>/<entry>` on
+    /// the local filesystem, even after the sandbox is torn down.
+    /// This is the post-condition that combined-mode in-process workers
+    /// need so that callers like siso (which treat the worker as a local
+    /// executor) don't get "no such file" after the action completes.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn local_materialization_root_lands_output_on_local_fs_test()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+        const OUTPUT_NAME: &str = "out.txt";
+        const OUTPUT_CONTENT: &str = "hello";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, slow_store, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        // The "build host's local materialization root" — must be on the
+        // same filesystem volume as the sandbox so hard_link works.
+        let materialization_root = make_temp_path("materialization_root");
+        fs::create_dir_all(&materialization_root).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory: root_action_directory.clone(),
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                shared_walked_dirs_redis_url: None,
+                machine_id: String::new(),
+                shared_tree_path: None,
+                project_root: None,
+                digest_checked_hint_link: false,
+                input_tree_prewarm: false,
+                path_digest_cache: None,
+                dir_walk_coalescer: None,
+                path_digest_cache_dirty: None,
+                local_materialization_root: Some(materialization_root.clone()),
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        let working_directory = "some_cwd";
+        let arguments = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf '{OUTPUT_CONTENT}' > ./{OUTPUT_NAME}"),
+        ];
+        let command = Command {
+            arguments,
+            output_paths: vec![OUTPUT_NAME.to_string()],
+            working_directory: working_directory.to_string(),
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory {
+                directories: vec![DirectoryNode {
+                    name: working_directory.to_string(),
+                    digest: Some(
+                        serialize_and_upload_message(
+                            &Directory::default(),
+                            cas_store.as_pin(),
+                            &mut DigestHasherFunc::Sha256.hasher(),
+                        )
+                        .await?
+                        .into(),
+                    ),
+                }],
+                ..Default::default()
+            },
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: operation_id.clone(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                },
+            )
+            .await?;
+
+        let action_result = run_action(running_action_impl).await?;
+
+        // CAS still holds the bytes (REAPI contract unchanged).
+        assert_eq!(action_result.exit_code, 0);
+        assert_eq!(action_result.output_files.len(), 1);
+        let cas_bytes = slow_store
+            .as_ref()
+            .get_part_unchunked(action_result.output_files[0].digest, 0, None)
+            .await?;
+        assert_eq!(from_utf8(&cas_bytes)?, OUTPUT_CONTENT);
+
+        // Sandbox is gone.
+        let sandbox_action_dir = format!("{root_action_directory}/{operation_id}");
+        assert!(
+            fs::metadata(&sandbox_action_dir).await.is_err(),
+            "sandbox at {sandbox_action_dir} should be torn down by cleanup",
+        );
+
+        // The new invariant: the output landed at
+        // <materialization_root>/<working_directory>/<entry> and survived
+        // the sandbox teardown, with the same bytes the action produced.
+        let materialized_path = PathBuf::from(&materialization_root)
+            .join(working_directory)
+            .join(OUTPUT_NAME);
+        let materialized_bytes = std::fs::read(&materialized_path).unwrap_or_else(|e| {
+            panic!(
+                "expected materialized output at {}, got error: {e}",
+                materialized_path.display(),
+            )
+        });
+        assert_eq!(from_utf8(&materialized_bytes)?, OUTPUT_CONTENT);
+
+        Ok(())
+    }
+
     #[nativelink_test]
     async fn blake3_upload_files() -> Result<(), Box<dyn core::error::Error>> {
         const WORKER_ID: &str = "foo_worker_id";
@@ -2135,6 +2311,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2326,6 +2503,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2518,6 +2696,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2736,6 +2915,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2881,6 +3061,7 @@ mod tests {
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -3094,6 +3275,7 @@ exit 0
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -3280,6 +3462,7 @@ exit 0
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -3460,6 +3643,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -3554,6 +3738,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3639,6 +3824,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3730,6 +3916,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3842,6 +4029,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3898,6 +4086,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3976,6 +4165,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -4105,6 +4295,7 @@ exit 1
                     path_digest_cache: None,
                 dir_walk_coalescer: None,
                 path_digest_cache_dirty: None,
+                local_materialization_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -4202,6 +4393,7 @@ exit 1
                     path_digest_cache: None,
                 dir_walk_coalescer: None,
                 path_digest_cache_dirty: None,
+                local_materialization_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -4299,6 +4491,7 @@ exit 1
                     path_digest_cache: None,
                 dir_walk_coalescer: None,
                 path_digest_cache_dirty: None,
+                local_materialization_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -4393,6 +4586,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4555,6 +4749,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4734,6 +4929,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4844,6 +5040,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -4968,6 +5165,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -5158,6 +5356,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -5288,6 +5487,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         // Create a simple action
@@ -5439,6 +5639,7 @@ exit 1
                 path_digest_cache: None,
             dir_walk_coalescer: None,
             path_digest_cache_dirty: None,
+            local_materialization_root: None,
             })?);
 
         // Create a simple action
@@ -5635,6 +5836,7 @@ exit 1
             path_digest_cache: None,
         dir_walk_coalescer: None,
         path_digest_cache_dirty: None,
+        local_materialization_root: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5693,6 +5895,7 @@ exit 1
             path_digest_cache: None,
         dir_walk_coalescer: None,
         path_digest_cache_dirty: None,
+        local_materialization_root: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5751,6 +5954,7 @@ exit 1
             path_digest_cache: None,
         dir_walk_coalescer: None,
         path_digest_cache_dirty: None,
+        local_materialization_root: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(
@@ -5812,6 +6016,7 @@ exit 1
             path_digest_cache: None,
         dir_walk_coalescer: None,
         path_digest_cache_dirty: None,
+        local_materialization_root: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;
@@ -5863,6 +6068,7 @@ exit 1
             path_digest_cache: None,
         dir_walk_coalescer: None,
         path_digest_cache_dirty: None,
+        local_materialization_root: None,
         })?);
 
         let (start_execute, _) = build_start_execute_with_platform(&cas_store, vec![]).await?;

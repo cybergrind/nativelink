@@ -2047,6 +2047,100 @@ impl RunningActionImpl {
             );
         }
 
+        // Local-FS materialization for combined-mode in-process workers.
+        // When `local_materialization_root` is set, hard-link each declared
+        // output from the FilesystemStore (where the upload step just
+        // deposited the bytes by digest) to
+        // `<root>/<working_directory>/<entry>`, mirroring the sandbox
+        // layout the action ran under. This re-establishes the local-FS
+        // post-condition that callers like siso assume for any action
+        // they treat as a local executor — without it, the bytes only
+        // exist in CAS and disappear from the host when the sandbox is
+        // torn down (the `local_fallback_output_not_materialized` bug
+        // class).
+        //
+        // The source is the CAS-content path (same approach as input
+        // materialization in `download_to_directory`) rather than the
+        // sandbox path, because `upload_file` moves the sandbox file
+        // into the FilesystemStore via `update_with_whole_file` — by the
+        // time we get here the sandbox copy is gone.
+        //
+        // EEXIST is the idempotent path: covers both prior attempts and
+        // the path-share-lucky case where the destination already holds
+        // the right bytes from a sandbox-share or rsync.
+        //
+        // Failures bubble up as upload_results errors, so the AC entry
+        // is never committed and the scheduler can retry — matching the
+        // existing failure semantics of upload itself.
+        if let Some(materialization_root) =
+            self.running_actions_manager.local_materialization_root.as_ref()
+        {
+            let materialize_start = std::time::Instant::now();
+            let mut linked = 0usize;
+            let mut already_present = 0usize;
+            let filesystem_store =
+                Pin::new(self.running_actions_manager.filesystem_store.as_ref());
+            for output_file in &output_files {
+                let NameOrPath::Path(ref entry) = output_file.name_or_path else {
+                    continue;
+                };
+                let dst = if command_proto.working_directory.is_empty() {
+                    format!("{materialization_root}/{entry}")
+                } else {
+                    format!(
+                        "{materialization_root}/{}/{entry}",
+                        command_proto.working_directory
+                    )
+                };
+                if let Some(parent) = std::path::Path::new(&dst).parent() {
+                    fs::create_dir_all(parent).await.err_tip(|| {
+                        format!(
+                            "materialize_outputs_locally: create_dir_all({}) failed",
+                            parent.display()
+                        )
+                    })?;
+                }
+                let file_entry = filesystem_store
+                    .get_file_entry_for_digest(&output_file.digest)
+                    .await
+                    .err_tip(|| {
+                        format!(
+                            "materialize_outputs_locally: get_file_entry_for_digest({:?}) failed",
+                            output_file.digest
+                        )
+                    })?;
+                let src_path = file_entry
+                    .get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) })
+                    .await
+                    .err_tip(|| "materialize_outputs_locally: get_file_path_locked failed")?;
+                match fs::hard_link(&src_path, &dst).await {
+                    Ok(()) => linked += 1,
+                    Err(e)
+                        if e.code == Code::AlreadyExists
+                            || format!("{e:?}").contains("os error 17") =>
+                    {
+                        already_present += 1;
+                    }
+                    Err(e) => {
+                        return Err(e).err_tip(|| {
+                            format!(
+                                "materialize_outputs_locally: hard_link({} -> {dst}) failed",
+                                src_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+            info!(
+                operation_id = ?self.operation_id,
+                elapsed_ms = materialize_start.elapsed().as_millis(),
+                linked,
+                already_present,
+                root = %materialization_root,
+                "materialize_outputs_locally: completed",
+            );
+        }
+
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
         let first_output_file_summary = output_files
@@ -2668,6 +2762,12 @@ pub struct RunningActionsManagerArgs<'a> {
     /// the cache behaves as in-memory-only — the historical default.
     /// See `nativelink-worker/src/path_digest_persistence.rs`.
     pub path_digest_cache_dirty: Option<crate::path_digest_persistence::DirtyBit>,
+    /// Optional absolute directory where declared outputs are
+    /// hard-linked to local disk after a successful CAS upload, mirroring
+    /// the action's sandbox layout
+    /// (`<root>/<working_directory>/<entry>`). See
+    /// `LocalWorkerConfig::local_materialization_root`.
+    pub local_materialization_root: Option<String>,
 }
 
 struct CleanupGuard {
@@ -2729,6 +2829,12 @@ pub struct RunningActionsManagerImpl {
     /// Experimental: gate for the GetTree input-tree prewarm. See
     /// `LocalWorkerConfig::experimental_input_tree_prewarm`.
     pub(crate) input_tree_prewarm: bool,
+    /// Optional local-FS materialization root. When `Some`, every
+    /// successful action's declared output_files are hard-linked from
+    /// the sandbox to `<root>/<working_directory>/<entry>` between
+    /// `upload_results` and `store_action_result`. See
+    /// `LocalWorkerConfig::local_materialization_root`.
+    local_materialization_root: Option<String>,
 }
 
 impl RunningActionsManagerImpl {
@@ -2776,6 +2882,7 @@ impl RunningActionsManagerImpl {
             project_root: args.project_root,
             digest_checked_hint_link: args.digest_checked_hint_link,
             input_tree_prewarm: args.input_tree_prewarm,
+            local_materialization_root: args.local_materialization_root,
             path_digest_cache: {
                 // Plan L provider is always per-manager: each worker honors
                 // its own `shared_walked_dirs_redis_url`/`machine_id` even

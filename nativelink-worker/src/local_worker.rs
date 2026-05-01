@@ -647,6 +647,7 @@ pub async fn new_local_worker(
             digest_checked_hint_link: config.experimental_digest_checked_hint_link
                 && !plan_i_disabled_via_env(),
             input_tree_prewarm: config.experimental_input_tree_prewarm,
+            local_materialization_root: config.local_materialization_root.clone(),
             path_digest_cache,
             dir_walk_coalescer,
             path_digest_cache_dirty,
