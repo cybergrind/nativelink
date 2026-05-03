@@ -74,6 +74,22 @@ mod tests {
 
     const DEFAULT_MAX_UPLOAD_TIMEOUT: u64 = 600;
 
+    /// Plan J test helper: merge an `InputRootAbsolutePath` property into
+    /// an Action's platform (or create one if absent). Plan J requires
+    /// every action to carry this property; without it
+    /// `RunningActionImpl::new` returns `Err(InvalidArgument)`. Tests
+    /// that don't care about the input root simply pass their existing
+    /// `root_action_directory` here. See CLAUDE.md.
+    fn with_input_root(mut action: Action, input_root: &str) -> Action {
+        let mut platform = action.platform.unwrap_or_default();
+        platform.properties.push(Property {
+            name: "InputRootAbsolutePath".into(),
+            value: input_root.to_string(),
+        });
+        action.platform = Some(platform);
+        action
+    }
+
     /// Get temporary path from either `TEST_TMPDIR` or best effort temp directory if
     /// not set.
     fn make_temp_path(data: &str) -> String {
@@ -454,7 +470,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -519,6 +535,7 @@ mod tests {
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -581,7 +598,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -648,6 +665,7 @@ mod tests {
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -710,7 +728,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -792,6 +810,7 @@ mod tests {
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -895,7 +914,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -977,6 +996,7 @@ mod tests {
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -1081,7 +1101,7 @@ mod tests {
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -1145,6 +1165,7 @@ mod tests {
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -1352,6 +1373,7 @@ mod tests {
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -1504,6 +1526,7 @@ mod tests {
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -1688,6 +1711,7 @@ exit 0
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -1878,6 +1902,7 @@ exit 0
             }),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -2039,6 +2064,7 @@ exit 1
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -2587,6 +2613,7 @@ exit 1
                 }),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -2678,6 +2705,7 @@ exit 1
                 }),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -2769,6 +2797,7 @@ exit 1
                 }),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -2938,6 +2967,7 @@ exit 1
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -3089,6 +3119,7 @@ exit 1
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -3195,7 +3226,7 @@ exit 1
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
                 execution_configuration: ExecutionConfiguration::default(),
@@ -3253,6 +3284,7 @@ exit 1
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -3352,6 +3384,7 @@ exit 1
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -3417,7 +3450,7 @@ exit 1
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -3490,6 +3523,7 @@ exit 1
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             };
+            let action = with_input_root(action, &root_action_directory);
             let action_digest = serialize_and_upload_message(
                 &action,
                 cas_store.as_pin(),
@@ -3601,7 +3635,7 @@ exit 1
 
         let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
             RunningActionsManagerArgs {
-                root_action_directory,
+                root_action_directory: root_action_directory.clone(),
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -3675,6 +3709,7 @@ exit 1
             }),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -3767,6 +3802,7 @@ exit 1
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -3912,6 +3948,7 @@ exit 1
             input_root_digest: Some(input_root_digest.into()),
             ..Default::default()
         };
+        let action = with_input_root(action, &root_action_directory);
         let action_digest = serialize_and_upload_message(
             &action,
             cas_store.as_pin(),
@@ -3971,6 +4008,252 @@ exit 1
         if let Ok(action2) = result {
             action2.cleanup().await?;
         }
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    // =================================================================
+    // Plan J contract tests — pin the load-bearing invariant.
+    // If you (future agent) need to modify these, the change is almost
+    // certainly wrong. See CLAUDE.md.
+    // =================================================================
+
+    /// Build a `RunningActionsManagerImpl` plus the `FastSlowStore` it
+    /// holds, so tests can upload artifacts referenced by their actions.
+    async fn plan_j_running_actions_manager(
+        root_action_directory: &str,
+    ) -> Result<(Arc<RunningActionsManagerImpl>, Arc<FastSlowStore>), Error> {
+        let (_fs_store, _mem_store, cas_store, ac_store) = setup_stores().await?;
+        let manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory: root_action_directory.to_string(),
+                execution_configuration: ExecutionConfiguration {
+                    entrypoint: None,
+                    additional_environment: None,
+                },
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
+            },
+            Callbacks {
+                now_fn: SystemTime::now,
+                sleep_fn: |duration| Box::pin(tokio::time::sleep(duration)),
+            },
+        )?);
+        Ok((manager, cas_store))
+    }
+
+    /// Helper: produce a (command_digest, input_root_digest) pair that
+    /// exists in the manager's CAS so an Action proto can reference them.
+    async fn upload_minimal_action_artifacts(
+        cas_store: &Arc<FastSlowStore>,
+    ) -> Result<(DigestInfo, DigestInfo), Error> {
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        Ok((command_digest, input_root_digest))
+    }
+
+    /// Plan J contract: when the action carries `InputRootAbsolutePath`,
+    /// `RunningActionImpl::new` MUST set `work_directory` to that path
+    /// (after `project_root` translation). This is the test that, had it
+    /// existed in Phase A red, would have prevented the silent regression
+    /// in commit `995627bd`.
+    #[nativelink_test]
+    async fn work_directory_is_input_root_when_property_set() -> Result<(), Error> {
+        let root_action_directory = make_temp_path("plan_j_contract_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_shared_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager(&root_action_directory).await?;
+        let (command_digest, input_root_digest) =
+            upload_minimal_action_artifacts(&cas_store).await?;
+
+        let action = with_input_root(
+            Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            },
+            &shared_tree,
+        );
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        assert_eq!(
+            running_action.get_work_directory().as_str(),
+            shared_tree.as_str(),
+            "Plan J contract: work_directory must alias InputRootAbsolutePath"
+        );
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    /// Plan J contract: an action arriving without `InputRootAbsolutePath`
+    /// MUST be rejected with `InvalidArgument`. Sandbox execution is
+    /// banned in this fork.
+    #[nativelink_test]
+    async fn new_action_without_input_root_property_fails_fast() -> Result<(), Error> {
+        let root_action_directory = make_temp_path("plan_j_no_irap_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager(&root_action_directory).await?;
+        let (command_digest, input_root_digest) =
+            upload_minimal_action_artifacts(&cas_store).await?;
+
+        // No platform_properties → no InputRootAbsolutePath.
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+
+        let result = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await;
+
+        let err = result.err().expect("Plan J: must reject action without IRAP");
+        assert_eq!(err.code, Code::InvalidArgument);
+        assert!(
+            err.to_string().contains("InputRootAbsolutePath"),
+            "error must reference the missing key; got: {err}"
+        );
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    /// Plan J: `inner_prepare_action` calls `create_dir_all` on the
+    /// shared tree, which already exists. Must not error on EEXIST.
+    #[nativelink_test]
+    async fn prepare_action_tolerates_pre_existing_work_directory() -> Result<(), Error> {
+        let root_action_directory = make_temp_path("plan_j_pre_existing_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_pre_existing_tree");
+        fs::create_dir_all(&shared_tree).await?;
+        // Plant a file in the shared tree to confirm prepare_action does
+        // NOT clobber the pre-existing contents.
+        let canary_path = format!("{}/canary.txt", shared_tree);
+        let mut canary = fs::create_file(OsString::from(&canary_path)).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut canary, b"canary").await?;
+        canary.as_mut().sync_all().await?;
+        drop(canary);
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager(&root_action_directory).await?;
+        let (command_digest, input_root_digest) =
+            upload_minimal_action_artifacts(&cas_store).await?;
+
+        let action = with_input_root(
+            Action {
+                command_digest: Some(command_digest.into()),
+                input_root_digest: Some(input_root_digest.into()),
+                ..Default::default()
+            },
+            &shared_tree,
+        );
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        // Should succeed despite shared_tree (and the canary) already existing.
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        assert!(
+            fs::metadata(&canary_path).await.is_ok(),
+            "Plan J must NOT clobber pre-existing files in the shared tree"
+        );
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
         fs::remove_dir_all(&root_action_directory).await?;
         Ok(())
     }

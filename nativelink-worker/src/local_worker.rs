@@ -26,7 +26,7 @@ use std::sync::{Arc, Weak};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt, TryFutureExt, select};
-use nativelink_config::cas_server::{EnvironmentSource, LocalWorkerConfig};
+use nativelink_config::cas_server::{EnvironmentSource, LocalWorkerConfig, WorkerProperty};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update;
@@ -515,6 +515,29 @@ pub async fn new_local_worker(
     ac_store: Option<Store>,
     historical_store: Store,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
+    // Plan J load-bearing config gate. The fork only supports in-place
+    // execution in a pre-staged shared tree; every action requires
+    // `InputRootAbsolutePath` as a platform property, so the worker
+    // must declare it (the scheduler matches on the property's
+    // presence). Refuse to start a misconfigured worker rather than
+    // letting it accept actions it can't legally execute. See
+    // `CLAUDE.md` at the repo root.
+    let has_input_root = match config.platform_properties.get("InputRootAbsolutePath") {
+        Some(WorkerProperty::Values(vs)) => vs.iter().any(|v| !v.is_empty()),
+        Some(WorkerProperty::QueryCmd(cmd)) => !cmd.is_empty(),
+        None => false,
+    };
+    if !has_input_root {
+        return Err(make_err!(
+            Code::InvalidArgument,
+            "Worker '{}' refuses to start: platform_properties.InputRootAbsolutePath \
+             must be declared (non-empty Values or QueryCmd). Sandbox execution \
+             is unsupported in this fork; every action must execute in-place in \
+             a pre-staged shared tree. See CLAUDE.md.",
+            config.name,
+        ));
+    }
+
     let fast_slow_store = cas_store
         .downcast_ref::<FastSlowStore>(None)
         .err_tip(|| "Expected store for LocalWorker's store to be a FastSlowStore")?

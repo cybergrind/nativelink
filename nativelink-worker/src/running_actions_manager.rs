@@ -12,6 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! # Plan J shared-tree execution (load-bearing)
+//!
+//! Workers in this fork execute actions IN-PLACE inside the action's
+//! `InputRootAbsolutePath`. There is NO per-action sandbox. The input
+//! tree walk is skipped entirely — the rsync invariant guarantees every
+//! input is already at its canonical path. See `CLAUDE.md` at the repo
+//! root and `RunningActionImpl::new` for the contract. This principle
+//! has been silently regressed once already (Phase A green-rewrite,
+//! commit `995627bd`); the contract tests in
+//! `tests/running_actions_manager_test.rs` exist to prevent a third.
+
 use core::cmp::min;
 use core::convert::Into;
 use core::fmt::Debug;
@@ -886,6 +897,15 @@ pub struct RunningActionImpl {
 }
 
 impl RunningActionImpl {
+    /// Plan J shared-tree binding: `work_directory` is aliased to the
+    /// action's `InputRootAbsolutePath` platform property (after
+    /// `project_root` user remap). The action's command will run with
+    /// cwd inside that tree. There is NO per-action sandbox in this
+    /// fork — see `CLAUDE.md` at the repo root.
+    ///
+    /// Returns `Err(Code::InvalidArgument)` when the property is
+    /// missing or empty. The fork bans the upstream
+    /// `format!("{}/{}", action_directory, "work")` fallback.
     pub fn new(
         execution_metadata: ExecutionMetadata,
         operation_id: OperationId,
@@ -893,10 +913,28 @@ impl RunningActionImpl {
         action_info: ActionInfo,
         timeout: Duration,
         running_actions_manager: Arc<RunningActionsManagerImpl>,
-    ) -> Self {
-        let work_directory = format!("{}/{}", action_directory, "work");
+    ) -> Result<Self, Error> {
+        let work_directory = match action_info
+            .platform_properties
+            .get("InputRootAbsolutePath")
+            .filter(|v| !v.is_empty())
+        {
+            Some(p) => translate_input_root_path(
+                p,
+                running_actions_manager.project_root.as_ref(),
+            ),
+            None => {
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "Action carries no InputRootAbsolutePath platform property; \
+                     sandbox execution is banned in this fork. Misconfigured \
+                     siso or scheduler — every action must specify a shared \
+                     tree path. See CLAUDE.md."
+                ));
+            }
+        };
         let (kill_channel_tx, kill_channel_rx) = oneshot::channel();
-        Self {
+        Ok(Self {
             operation_id,
             action_directory,
             work_directory,
@@ -916,7 +954,7 @@ impl RunningActionImpl {
             has_manager_entry: AtomicBool::new(true),
             // Only needs to be cleaned up after a prepare_action call, set there.
             did_cleanup: AtomicBool::new(true),
-        }
+        })
     }
 
     #[allow(
@@ -941,7 +979,17 @@ impl RunningActionImpl {
                 (self.running_actions_manager.callbacks.now_fn)();
         }
         let command = {
-            // Download and build out our input files/folders. Also fetch and decode our Command.
+            // Plan J shared-tree mode: the worker executes IN-PLACE inside
+            // the action's `InputRootAbsolutePath` (the `work_directory`
+            // alias was set in `RunningActionImpl::new`). The shared tree
+            // is the rsync invariant — every input is already at its
+            // canonical path, so we DO NOT walk `input_root_digest`. If a
+            // file is missing the action will fail at exec time with a
+            // clear "no such file" error, which is the correct signal that
+            // rsync was incomplete. See CLAUDE.md.
+            //
+            // We still fetch the Command proto in parallel with the
+            // (idempotent) work_directory creation.
             let command_fut = self.metrics().get_proto_command_from_store.wrap(async {
                 get_and_decode_digest::<ProtoCommand>(
                     self.running_actions_manager.cas_store.as_ref(),
@@ -950,45 +998,17 @@ impl RunningActionImpl {
                 .await
                 .err_tip(|| "Converting command_digest to Command")
             });
-            let filesystem_store_pin =
-                Pin::new(self.running_actions_manager.filesystem_store.as_ref());
             let (command, ()) = try_join(command_fut, async {
-                fs::create_dir(&self.work_directory)
+                // create_dir_all so the pre-existing shared tree is tolerated.
+                fs::create_dir_all(&self.work_directory)
                     .await
                     .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
-                // Now the work directory has been created, we have to clean up.
+                // The shared tree itself must NOT be removed on cleanup.
+                // do_cleanup only touches `action_directory` (a separate
+                // per-op-id scratch dir), but we still flip the flag so
+                // any per-action transients there get torn down.
                 self.did_cleanup.store(false, Ordering::Release);
-                // Download the input files/folder and place them into the temp directory.
-                // Use directory cache if available for better performance.
-                // Derive Plan I `hint_root` for this action: if the action
-                // carries `InputRootAbsolutePath` as a platform property, use
-                // it (translated through `project_root` if configured).
-                // Without `InputRootAbsolutePath`, Plan I is disabled for
-                // this action and download_to_directory falls through to
-                // the existing CAS path.
-                let hint_root_owned: Option<PathBuf> = self
-                    .action_info
-                    .platform_properties
-                    .get("InputRootAbsolutePath")
-                    .map(|in_action| {
-                        PathBuf::from(translate_input_root_path(
-                            in_action,
-                            self.running_actions_manager.project_root.as_ref(),
-                        ))
-                    });
-                self.metrics()
-                    .download_to_directory
-                    .wrap(prepare_action_inputs(
-                        &self.running_actions_manager.directory_cache,
-                        &self.running_actions_manager.cas_store,
-                        filesystem_store_pin,
-                        &self.action_info.input_root_digest,
-                        &self.work_directory,
-                        self.running_actions_manager.input_cache.as_ref(),
-                        hint_root_owned.as_deref(),
-                        self.action_info.unique_qualifier.digest_function(),
-                    ))
-                    .await
+                Ok::<(), Error>(())
             })
             .await?;
             command
@@ -1577,38 +1597,102 @@ impl RunningActionImpl {
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
 
-        // Phase C — local_materialization_root: also place declared
-        // outputs at <local_root>/<declared_path> so siso's local-
-        // fallback path finds them. Idempotent on matching size.
-        // Failures are logged, never fatal.
+        // Phase C — local_materialization_root: place declared outputs at
+        // <local_root>/<declared_path>. In Plan J shared-tree mode the
+        // outputs are ALREADY at the right place (work_directory IS the
+        // shared tree), so we skip the loop entirely. Mismatched paths
+        // (local_root configured to a different tree than work_directory)
+        // get a warn — that's a config drift, not a normal mode.
         if let Some(local_root) = &self.running_actions_manager.local_materialization_root {
-            for output_file in &output_files {
-                let declared_path = match &output_file.name_or_path {
-                    NameOrPath::Name(s) | NameOrPath::Path(s) => s.as_str(),
-                };
-                let size = output_file.digest.size_bytes();
-                if let Err(e) = materialize_one_output_locally(
-                    &self.work_directory,
-                    local_root,
-                    declared_path,
-                    size,
-                )
-                .await
-                {
-                    warn!(
-                        operation_id = ?self.operation_id,
+            let work_path = PathBuf::from(&self.work_directory);
+            let local_path = PathBuf::from(local_root);
+            if work_path == local_path {
+                // Plan J fast path — outputs already in the shared tree.
+            } else if work_path.starts_with(&local_path) || local_path.starts_with(&work_path) {
+                warn!(
+                    operation_id = ?self.operation_id,
+                    work_directory = %self.work_directory,
+                    local_materialization_root = %local_root,
+                    "local_materialization_root is a sub/super-tree of work_directory; \
+                     skipping Phase C mirror to avoid clobbering the shared tree",
+                );
+            } else {
+                for output_file in &output_files {
+                    let declared_path = match &output_file.name_or_path {
+                        NameOrPath::Name(s) | NameOrPath::Path(s) => s.as_str(),
+                    };
+                    let size = output_file.digest.size_bytes();
+                    if let Err(e) = materialize_one_output_locally(
+                        &self.work_directory,
+                        local_root,
                         declared_path,
-                        error = ?e,
-                        "local_materialization_root: failed to place output on disk; \
-                         action result still committed (CAS has the bytes)",
-                    );
+                        size,
+                    )
+                    .await
+                    {
+                        warn!(
+                            operation_id = ?self.operation_id,
+                            declared_path,
+                            error = ?e,
+                            "local_materialization_root: failed to place output on disk; \
+                             action result still committed (CAS has the bytes)",
+                        );
+                    }
                 }
             }
         }
+        // Plan J telemetry: emit per-action timing breakdown so operators
+        // can answer "actions/sec" and "% prep overhead" without parsing
+        // metric snapshots. All values are wall-clock millis derived from
+        // ExecutionMetadata timestamps. `prep_ms` covers
+        // create_dir + Command-proto fetch (the input walk is skipped
+        // entirely in shared-tree mode). `exec_ms` is the child process.
+        // `upload_ms` is output upload + Phase C mirror. Totals sum to
+        // `total_ms` which is wall-clock from worker_start to
+        // worker_completed.
+        let now = (self.running_actions_manager.callbacks.now_fn)();
+        let total_actions = self
+            .running_actions_manager
+            .total_actions_completed
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let prep_ms = execution_metadata
+            .input_fetch_completed_timestamp
+            .duration_since(execution_metadata.input_fetch_start_timestamp)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let exec_ms = execution_metadata
+            .execution_completed_timestamp
+            .duration_since(execution_metadata.execution_start_timestamp)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let upload_ms = now
+            .duration_since(execution_metadata.output_upload_start_timestamp)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let total_ms = now
+            .duration_since(execution_metadata.worker_start_timestamp)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prep_overhead_pct = if total_ms > 0 {
+            (prep_ms * 100) / total_ms
+        } else {
+            0
+        };
+        info!(
+            target: "nativelink.worker.action_timings",
+            operation_id = %self.operation_id,
+            total_actions_completed = total_actions,
+            prep_ms,
+            exec_ms,
+            upload_ms,
+            total_ms,
+            prep_overhead_pct,
+            "Plan J: action timing breakdown",
+        );
         {
             let mut state = self.state.lock();
-            execution_metadata.worker_completed_timestamp =
-                (self.running_actions_manager.callbacks.now_fn)();
+            execution_metadata.worker_completed_timestamp = now;
             state.action_result = Some(ActionResult {
                 output_files,
                 output_folders,
@@ -2145,6 +2229,11 @@ pub struct RunningActionsManagerImpl {
     root_action_directory: String,
     execution_configuration: ExecutionConfiguration,
     cas_store: Arc<FastSlowStore>,
+    /// Plan J: unused now that the input walk is skipped. Held only so
+    /// `RunningActionsManagerArgs` can stay shape-compatible with
+    /// upstream / tests; remove when `prepare_action_inputs` is also
+    /// removed from the public API.
+    #[allow(dead_code)]
     filesystem_store: Arc<FilesystemStore>,
     upload_action_results: UploadActionResults,
     max_action_timeout: Duration,
@@ -2164,15 +2253,23 @@ pub struct RunningActionsManagerImpl {
     /// Notify waiters when a cleanup operation completes. This is used in conjunction with
     /// `cleaning_up_operations` to coordinate directory cleanup and creation.
     cleanup_complete_notify: Arc<Notify>,
-    /// Optional directory cache for improving performance by caching reconstructed
-    /// input directories and using hardlinks.
+    /// Plan J: unused (input walk skipped). See `filesystem_store` note.
+    #[allow(dead_code)]
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
-    /// Process-shared Plan I/K/L caches.
+    /// Plan J: unused (input walk skipped). See `filesystem_store` note.
+    #[allow(dead_code)]
     input_cache: Arc<InputCache>,
     /// Per-worker `InputRootAbsolutePath` → local-FS remap.
     project_root: Option<ProjectRoot>,
     /// In-process worker output materialization root (Phase C).
     local_materialization_root: Option<String>,
+    /// Plan J telemetry: count of actions that have completed
+    /// successfully on this worker process. Operators compute
+    /// actions/sec externally as `rate(total_actions_completed[1m])`.
+    /// Sibling per-action info logs (target
+    /// `nativelink.worker.action_timings`) carry prep/exec/upload/total
+    /// ms breakdowns.
+    total_actions_completed: core::sync::atomic::AtomicU64,
 }
 
 impl RunningActionsManagerImpl {
@@ -2220,6 +2317,7 @@ impl RunningActionsManagerImpl {
             input_cache: args.input_cache,
             project_root: args.project_root,
             local_materialization_root: args.local_materialization_root,
+            total_actions_completed: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2467,14 +2565,23 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                         self.max_action_timeout.as_secs_f32()
                     ));
                 }
-                let running_action = Arc::new(RunningActionImpl::new(
+                let running_action = match RunningActionImpl::new(
                     execution_metadata,
                     operation_id.clone(),
-                    action_directory,
+                    action_directory.clone(),
                     action_info,
                     timeout,
                     self.clone(),
-                ));
+                ) {
+                    Ok(ra) => Arc::new(ra),
+                    Err(e) => {
+                        // Plan J: action rejected (no InputRootAbsolutePath).
+                        // Clean up the action_directory we just made so it
+                        // doesn't leak on the worker filesystem.
+                        drop(fs::remove_dir_all(&action_directory).await);
+                        return Err(e);
+                    }
+                };
                 {
                     let mut running_actions = self.running_actions.lock();
                     // Check if action already exists and is still alive

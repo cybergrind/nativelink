@@ -446,9 +446,15 @@ async fn new_local_worker_creates_work_directory_test() -> Result<(), Error> {
     ));
     let ac_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let work_directory = make_temp_path("foo");
+    let mut platform_properties = HashMap::new();
+    platform_properties.insert(
+        "InputRootAbsolutePath".to_string(),
+        WorkerProperty::Values(vec![work_directory.clone()]),
+    );
     new_local_worker(
         Arc::new(LocalWorkerConfig {
             work_directory: work_directory.clone(),
+            platform_properties,
             ..Default::default()
         }),
         cas_store.clone(),
@@ -493,9 +499,15 @@ async fn new_local_worker_removes_work_directory_before_start_test() -> Result<(
     file.write_all(b"Hello, world!").await?;
     file.as_mut().sync_all().await?;
     drop(file);
+    let mut platform_properties = HashMap::new();
+    platform_properties.insert(
+        "InputRootAbsolutePath".to_string(),
+        WorkerProperty::Values(vec![work_directory.clone()]),
+    );
     new_local_worker(
         Arc::new(LocalWorkerConfig {
             work_directory: work_directory.clone(),
+            platform_properties,
             ..Default::default()
         }),
         cas_store.clone(),
@@ -972,5 +984,142 @@ async fn preconditions_met_extra_envs() -> Result<(), Error> {
 
     preconditions_met(Some("bash -c \"echo $DEMO_ENV\"".to_string()), &extra_envs).await?;
     assert!(logs_contain("test_value_for_demo_env"));
+    Ok(())
+}
+
+// =====================================================================
+// Plan J contract tests — pin the load-bearing invariant.
+// If you (future agent) need to modify these tests, the change is
+// almost certainly wrong. See CLAUDE.md.
+// =====================================================================
+
+async fn dummy_cas_stores_for_plan_j() -> Result<(Store, Store), Error> {
+    // RunningActionsManagerImpl requires the fast store to be a real
+    // FilesystemStore — using Memory for both layers yields "Expected
+    // FilesystemStore store for .fast_store()" deep in construction.
+    let cas_store = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(
+            <FilesystemStore>::new(&FilesystemSpec {
+                content_path: make_temp_path("plan_j_content"),
+                temp_path: make_temp_path("plan_j_temp"),
+                ..Default::default()
+            })
+            .await?,
+        ),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let ac_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    Ok((cas_store, ac_store))
+}
+
+#[nativelink_test]
+async fn worker_refuses_to_start_without_input_root_in_platform_properties()
+-> Result<(), Error> {
+    // Plan J: a worker config without `platform_properties.InputRootAbsolutePath`
+    // is misconfigured for this fork. `new_local_worker` must refuse to
+    // start it rather than letting it accept actions it can't legally
+    // execute.
+    let (cas_store, ac_store) = dummy_cas_stores_for_plan_j().await?;
+    let work_directory = make_temp_path("plan_j_no_irap");
+    let result = new_local_worker(
+        Arc::new(LocalWorkerConfig {
+            work_directory,
+            // Note: no platform_properties → no InputRootAbsolutePath.
+            ..Default::default()
+        }),
+        cas_store.clone(),
+        Some(ac_store),
+        cas_store,
+    )
+    .await;
+    let err = result.err().expect("Plan J: must fail without InputRootAbsolutePath");
+    assert_eq!(err.code, Code::InvalidArgument);
+    assert!(
+        err.to_string().contains("InputRootAbsolutePath"),
+        "error must reference the missing key; got: {err}"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn worker_refuses_to_start_with_empty_input_root_values() -> Result<(), Error> {
+    // Empty `Values` vector is the same as missing — refuse.
+    let (cas_store, ac_store) = dummy_cas_stores_for_plan_j().await?;
+    let work_directory = make_temp_path("plan_j_empty_irap");
+    let mut platform_properties = HashMap::new();
+    platform_properties.insert(
+        "InputRootAbsolutePath".to_string(),
+        WorkerProperty::Values(vec![String::new()]),
+    );
+    let result = new_local_worker(
+        Arc::new(LocalWorkerConfig {
+            work_directory,
+            platform_properties,
+            ..Default::default()
+        }),
+        cas_store.clone(),
+        Some(ac_store),
+        cas_store,
+    )
+    .await;
+    assert_eq!(
+        result.err().expect("must fail").code,
+        Code::InvalidArgument
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn worker_starts_with_input_root_values() -> Result<(), Error> {
+    // Happy path: non-empty `Values` is accepted.
+    let (cas_store, ac_store) = dummy_cas_stores_for_plan_j().await?;
+    let work_directory = make_temp_path("plan_j_values_ok");
+    let mut platform_properties = HashMap::new();
+    platform_properties.insert(
+        "InputRootAbsolutePath".to_string(),
+        WorkerProperty::Values(vec!["/some/shared/tree".to_string()]),
+    );
+    new_local_worker(
+        Arc::new(LocalWorkerConfig {
+            work_directory: work_directory.clone(),
+            platform_properties,
+            ..Default::default()
+        }),
+        cas_store.clone(),
+        Some(ac_store),
+        cas_store,
+    )
+    .await?;
+    Ok(())
+}
+
+#[nativelink_test]
+async fn worker_starts_with_input_root_querycmd() -> Result<(), Error> {
+    // Happy path: dynamic `QueryCmd` is accepted (we trust it produces a
+    // value at runtime).
+    let (cas_store, ac_store) = dummy_cas_stores_for_plan_j().await?;
+    let work_directory = make_temp_path("plan_j_querycmd_ok");
+    let mut platform_properties = HashMap::new();
+    platform_properties.insert(
+        "InputRootAbsolutePath".to_string(),
+        WorkerProperty::QueryCmd("printf /some/path".to_string()),
+    );
+    new_local_worker(
+        Arc::new(LocalWorkerConfig {
+            work_directory: work_directory.clone(),
+            platform_properties,
+            ..Default::default()
+        }),
+        cas_store.clone(),
+        Some(ac_store),
+        cas_store,
+    )
+    .await?;
     Ok(())
 }
