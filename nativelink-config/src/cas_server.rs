@@ -118,6 +118,17 @@ pub struct AcStoreConfig {
     /// it is only possible to read from the Action Cache.
     #[serde(default)]
     pub read_only: bool,
+
+    /// Optional CAS store name to verify Action Cache reads against.
+    /// When set, every successful AC GET additionally checks that the
+    /// first output digest in the action result exists in the named
+    /// CAS. If it does not, the AC entry is treated as stale: the
+    /// server returns `NotFound`, and the caller (e.g. siso) re-runs
+    /// the action. Closes the AC-says-yes/CAS-says-no class of bugs
+    /// observed on the 3-Mac Chromium cluster.
+    /// Default: None (no self-check; behavior identical to upstream).
+    #[serde(default)]
+    pub get_self_check_store: Option<StoreRefName>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

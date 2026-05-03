@@ -81,6 +81,7 @@ fn make_ac_server(store_manager: &StoreManager) -> Result<AcServer, Error> {
             config: nativelink_config::cas_server::AcStoreConfig {
                 ac_store: "main_ac".to_string(),
                 read_only: false,
+                get_self_check_store: None,
             },
         }],
         store_manager,
@@ -221,5 +222,125 @@ async fn one_item_update_test() -> Result<(), Box<dyn core::error::Error>> {
 
     let decoded_action_result = ActionResult::decode(raw_data)?;
     assert_eq!(decoded_action_result, action_result);
+    Ok(())
+}
+
+// ============================================================================
+// Phase D — `get_self_check_store` AC self-check tests.
+// ============================================================================
+
+use nativelink_proto::build::bazel::remote::execution::v2::OutputFile;
+
+/// Build an AcServer where the configured AC reads its `cas_self_check`
+/// from the store named `cas_name`. Used by TD4–TD6.
+async fn make_ac_server_with_self_check(
+    store_manager: &StoreManager,
+    cas_name: &str,
+) -> Result<AcServer, Error> {
+    AcServer::new(
+        &[WithInstanceName {
+            instance_name: "foo_instance_name".to_string(),
+            config: nativelink_config::cas_server::AcStoreConfig {
+                ac_store: "main_ac".to_string(),
+                read_only: false,
+                get_self_check_store: Some(cas_name.to_string()),
+            },
+        }],
+        store_manager,
+    )
+}
+
+#[nativelink_test]
+async fn td4_get_self_check_invalidates_when_blob_missing()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let ac_store = store_manager.get_store("main_ac").unwrap();
+    // CAS is empty; AC has an entry whose first output digest is *not* in CAS.
+    let output_digest = DigestInfo::try_new(HASH1, HASH1_SIZE)?;
+    let action_result = ActionResult {
+        output_files: vec![OutputFile {
+            path: "out.o".to_string(),
+            digest: Some(output_digest.into()),
+            is_executable: false,
+            contents: Default::default(),
+            node_properties: None,
+        }],
+        ..Default::default()
+    };
+    let action_size =
+        insert_into_store(ac_store.as_pin(), HASH1, HASH1_SIZE, &action_result).await?;
+
+    let ac_server = make_ac_server_with_self_check(&store_manager, "main_cas").await?;
+
+    let result = get_action_result(&ac_server, HASH1, HASH1_SIZE).await;
+    let err = result.expect_err("self-check must invalidate when CAS lacks the blob");
+    assert_eq!(
+        err.code(),
+        Code::NotFound,
+        "AC self-check failure must surface as NotFound; got {err:?}"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn td5_get_self_check_passes_when_blob_present()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let cas_store = store_manager.get_store("main_cas").unwrap();
+    let ac_store = store_manager.get_store("main_ac").unwrap();
+    let output_digest = DigestInfo::try_new(HASH1, HASH1_SIZE)?;
+
+    // Make sure the blob is in CAS.
+    cas_store.as_pin()
+        .update_oneshot(output_digest, vec![0u8; HASH1_SIZE as usize].into())
+        .await?;
+
+    let action_result = ActionResult {
+        output_files: vec![OutputFile {
+            path: "out.o".to_string(),
+            digest: Some(output_digest.into()),
+            is_executable: false,
+            contents: Default::default(),
+            node_properties: None,
+        }],
+        ..Default::default()
+    };
+    let action_size =
+        insert_into_store(ac_store.as_pin(), HASH1, HASH1_SIZE, &action_result).await?;
+
+    let ac_server = make_ac_server_with_self_check(&store_manager, "main_cas").await?;
+
+    let result = get_action_result(&ac_server, HASH1, HASH1_SIZE).await;
+    let response = result.expect("self-check must pass when CAS has the blob");
+    assert_eq!(response.into_inner(), action_result);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn td6_get_self_check_off_when_unconfigured()
+-> Result<(), Box<dyn core::error::Error>> {
+    // The default make_ac_server() leaves get_self_check_store=None.
+    // Even with an empty CAS, an AC entry pointing at a missing digest
+    // must succeed (no extra check).
+    let store_manager = make_store_manager().await?;
+    let ac_store = store_manager.get_store("main_ac").unwrap();
+    let output_digest = DigestInfo::try_new(HASH1, HASH1_SIZE)?;
+    let action_result = ActionResult {
+        output_files: vec![OutputFile {
+            path: "out.o".to_string(),
+            digest: Some(output_digest.into()),
+            is_executable: false,
+            contents: Default::default(),
+            node_properties: None,
+        }],
+        ..Default::default()
+    };
+    let action_size =
+        insert_into_store(ac_store.as_pin(), HASH1, HASH1_SIZE, &action_result).await?;
+
+    let ac_server = make_ac_server(&store_manager)?;
+    let result = get_action_result(&ac_server, HASH1, HASH1_SIZE).await;
+    let response = result.expect("with self-check off, AC GET must succeed regardless of CAS");
+    assert_eq!(response.into_inner(), action_result);
     Ok(())
 }

@@ -40,6 +40,10 @@ use tracing::{Instrument, Level, error, error_span, instrument};
 pub struct AcStoreInfo {
     store: Store,
     read_only: bool,
+    /// Optional CAS store referenced by `get_self_check_store` config.
+    /// When set, AC reads invalidate themselves on a CAS-miss for the
+    /// first output digest.
+    cas_self_check: Option<Store>,
 }
 
 pub struct AcServer {
@@ -52,6 +56,22 @@ impl Debug for AcServer {
     }
 }
 
+/// Pick the first output blob's digest off an `ActionResult` — used
+/// by the optional CAS self-check on AC reads. Prefers `output_files`
+/// (most actions); falls back to `stdout_digest` so an action that
+/// only produces stdout still has a verifiable witness in CAS.
+fn first_output_digest(ar: &ActionResult) -> Option<DigestInfo> {
+    if let Some(f) = ar.output_files.first() {
+        if let Some(d) = &f.digest {
+            return DigestInfo::try_from(d.clone()).ok();
+        }
+    }
+    if let Some(d) = &ar.stdout_digest {
+        return DigestInfo::try_from(d.clone()).ok();
+    }
+    None
+}
+
 impl AcServer {
     pub fn new(
         configs: &[WithInstanceName<AcStoreConfig>],
@@ -62,11 +82,18 @@ impl AcServer {
             let store = store_manager.get_store(&config.ac_store).ok_or_else(|| {
                 make_input_err!("'ac_store': '{}' does not exist", config.ac_store)
             })?;
+            let cas_self_check = match &config.get_self_check_store {
+                Some(name) => Some(store_manager.get_store(name).ok_or_else(|| {
+                    make_input_err!("'get_self_check_store': '{name}' does not exist")
+                })?),
+                None => None,
+            };
             stores.insert(
                 config.instance_name.to_string(),
                 AcStoreInfo {
                     store,
                     read_only: config.read_only,
+                    cas_self_check,
                 },
             );
         }
@@ -106,7 +133,43 @@ impl AcServer {
 
         let res = get_and_decode_digest::<ActionResult>(&store_info.store, digest.into()).await;
         match res {
-            Ok(action_result) => Ok(Response::new(action_result)),
+            Ok(action_result) => {
+                // Optional self-check: invalidate the AC entry if its
+                // first output blob is no longer in CAS. This is a
+                // cheap defense-in-depth catch for AC-says-yes /
+                // CAS-says-no, observed in the 3-Mac runbook.
+                if let Some(cas) = &store_info.cas_self_check {
+                    if let Some(first_digest) = first_output_digest(&action_result) {
+                        let key: nativelink_util::store_trait::StoreKey<'static> =
+                            first_digest.into();
+                        match cas.has(key).await {
+                            Ok(Some(_)) => { /* present — fall through */ }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    %digest,
+                                    %first_digest,
+                                    "AC self-check FAILED: first output blob missing from CAS — \
+                                     returning NotFound to invalidate the stale AC entry",
+                                );
+                                return Err(make_err!(
+                                    Code::NotFound,
+                                    "AC self-check failed: first output digest {first_digest} \
+                                     not in CAS for AC entry {digest}"
+                                ));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %digest,
+                                    error = ?e,
+                                    "AC self-check: CAS .has() errored; treating as pass to avoid \
+                                     false-invalidation",
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(Response::new(action_result))
+            }
             Err(mut e) => {
                 if e.code == Code::NotFound {
                     // `get_action_result` is frequent to get NotFound errors, so remove all
@@ -117,6 +180,7 @@ impl AcServer {
             }
         }
     }
+
 
     async fn inner_update_action_result(
         &self,
