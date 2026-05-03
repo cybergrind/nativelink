@@ -243,7 +243,8 @@ pub async fn try_hint_link(
 }
 
 // ---------------------------------------------------------------------------
-// InputCache — bundle handed to `download_to_directory` by Phase B.3.
+// InputCache — process-shared state handed to `download_to_directory`.
+// Per-action data (hint_root, hasher_func) flows as separate parameters.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -251,18 +252,25 @@ pub struct InputCache {
     pub path_digests: Arc<PathDigestCache>,
     pub walked_dirs: Arc<WalkedDirsCache>,
     pub walk_singleflight: Arc<SingleFlight>,
-    pub hint_root: Option<PathBuf>,
     pub plan_i_enabled: bool,
 }
 
 impl InputCache {
-    pub fn new_shared() -> Self {
-        Self {
+    pub fn new_shared() -> Arc<Self> {
+        Arc::new(Self {
             path_digests: PathDigestCache::new(),
             walked_dirs: WalkedDirsCache::new(),
             walk_singleflight: SingleFlight::new(),
-            hint_root: None,
             plan_i_enabled: true,
-        }
+        })
+    }
+
+    pub fn with_plan_i_enabled(plan_i_enabled: bool) -> Arc<Self> {
+        Arc::new(Self {
+            path_digests: PathDigestCache::new(),
+            walked_dirs: WalkedDirsCache::new(),
+            walk_singleflight: SingleFlight::new(),
+            plan_i_enabled,
+        })
     }
 }

@@ -40,7 +40,8 @@ use futures::future::{
 };
 use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use nativelink_config::cas_server::{
-    EnvironmentSource, UploadActionResultConfig, UploadCacheResultsStrategy,
+    EnvironmentSource, ProjectRoot, UploadActionResultConfig, UploadCacheResultsStrategy,
+    translate_input_root_path,
 };
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
@@ -68,6 +69,8 @@ use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
+
+use crate::input_cache::{HintLinkResult, InputCache, try_hint_link};
 use parking_lot::Mutex;
 use prost::Message;
 use relative_path::RelativePath;
@@ -126,6 +129,9 @@ pub fn download_to_directory<'a>(
     filesystem_store: Pin<&'a FilesystemStore>,
     digest: &'a DigestInfo,
     current_directory: &'a str,
+    cache: &'a InputCache,
+    current_hint_dir: Option<&'a Path>,
+    hasher_func: DigestHasherFunc,
 ) -> BoxFuture<'a, Result<(), Error>> {
     async move {
         let directory = get_and_decode_digest::<ProtoDirectory>(cas_store, digest.into())
@@ -134,12 +140,13 @@ pub fn download_to_directory<'a>(
         let mut futures = FuturesUnordered::new();
 
         for file in directory.files {
-            let digest: DigestInfo = file
+            let file_digest: DigestInfo = file
                 .digest
                 .err_tip(|| "Expected Digest to exist in Directory::file::digest")?
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
             let dest = format!("{}/{}", current_directory, file.name);
+            let file_name = file.name.clone();
             let (mtime, mut unix_mode) = match file.node_properties {
                 Some(properties) => (properties.mtime, properties.unix_mode),
                 None => (None, None),
@@ -149,16 +156,44 @@ pub fn download_to_directory<'a>(
                 unix_mode = Some(unix_mode.unwrap_or(0o444) | 0o111);
             }
             futures.push(
-                cas_store
-                    .populate_fast_store(digest.into())
-                    .and_then(move |()| async move {
-                        if is_zero_digest(digest) {
+                async move {
+                    let dest_path = PathBuf::from(&dest);
+
+                    // Plan K — verified (path, digest) already on disk.
+                    if cache.path_digests.contains(&dest_path, &file_digest).await {
+                        return Ok(());
+                    }
+
+                    // Plan I — try the hint tree before going to CAS.
+                    let mut planned_via_hint = false;
+                    if cache.plan_i_enabled {
+                        if let Some(hint_dir) = current_hint_dir {
+                            if let HintLinkResult::Hit = try_hint_link(
+                                hint_dir,
+                                &file_name,
+                                &file_digest,
+                                hasher_func,
+                                &dest_path,
+                            )
+                            .await
+                            {
+                                planned_via_hint = true;
+                            }
+                        }
+                    }
+
+                    if !planned_via_hint {
+                        // Existing CAS path: populate fast store, then hardlink/clonefile.
+                        cas_store
+                            .populate_fast_store(file_digest.into())
+                            .await
+                            .map_err(|e| e.append(format!("for digest {file_digest}")))?;
+                        if is_zero_digest(file_digest) {
                             let mut file_slot = fs::create_file(&dest).await?;
                             file_slot.write_all(&[]).await?;
-                        }
-                        else {
+                        } else {
                             let file_entry = filesystem_store
-                                .get_file_entry_for_digest(&digest)
+                                .get_file_entry_for_digest(&file_digest)
                                 .await
                                 .err_tip(|| "During hard link")?;
                             // TODO: add a test for #2051: deadlock with large number of files
@@ -185,59 +220,85 @@ pub fn download_to_directory<'a>(
                                         make_err!(Code::Internal, "Could not make hardlink, {e:?} : {dest}")
                                     }
                                 })?;
-                            }
-                        #[cfg(target_family = "unix")]
-                        if let Some(unix_mode) = unix_mode {
-                            fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
-                                .await
-                                .err_tip(|| {
-                                    format!(
-                                        "Could not set unix mode in download_to_directory {dest}"
-                                    )
-                                })?;
                         }
-                        if let Some(mtime) = mtime {
-                            spawn_blocking!("download_to_directory_set_mtime", move || {
-                                set_file_mtime(
-                                    &dest,
-                                    FileTime::from_unix_time(mtime.seconds, mtime.nanos as u32),
-                                )
-                                .err_tip(|| {
-                                    format!("Failed to set mtime in download_to_directory {dest}")
-                                })
-                            })
+                    }
+
+                    #[cfg(target_family = "unix")]
+                    if let Some(unix_mode) = unix_mode {
+                        fs::set_permissions(&dest, Permissions::from_mode(unix_mode))
                             .await
-                            .err_tip(
-                                || "Failed to launch spawn_blocking in download_to_directory",
-                            )??;
-                        }
-                        Ok(())
-                    })
-                    .map_err(move |e| e.append(format!("for digest {digest}")))
-                    .boxed(),
+                            .err_tip(|| {
+                                format!(
+                                    "Could not set unix mode in download_to_directory {dest}"
+                                )
+                            })?;
+                    }
+                    if let Some(mtime) = mtime {
+                        let dest_for_mtime = dest.clone();
+                        spawn_blocking!("download_to_directory_set_mtime", move || {
+                            set_file_mtime(
+                                &dest_for_mtime,
+                                FileTime::from_unix_time(mtime.seconds, mtime.nanos as u32),
+                            )
+                            .err_tip(|| {
+                                format!("Failed to set mtime in download_to_directory {dest_for_mtime}")
+                            })
+                        })
+                        .await
+                        .err_tip(
+                            || "Failed to launch spawn_blocking in download_to_directory",
+                        )??;
+                    }
+
+                    // Mark Plan K — file is now at dest with the verified digest.
+                    // We swallow insertion errors (e.g. transient stat failure)
+                    // because materialization itself succeeded; missing PK
+                    // entry only means the next action re-verifies.
+                    let _result = cache.path_digests.insert(dest_path, file_digest).await;
+                    Ok(())
+                }
+                .map_err(move |e: Error| e.append(format!("for digest {file_digest}")))
+                .boxed(),
             );
         }
 
-        for directory in directory.directories {
-            let digest: DigestInfo = directory
+        for directory_node in directory.directories {
+            let dir_digest: DigestInfo = directory_node
                 .digest
                 .err_tip(|| "Expected Digest to exist in Directory::directories::digest")?
                 .try_into()
                 .err_tip(|| "In Directory::file::digest")?;
-            let new_directory_path = format!("{}/{}", current_directory, directory.name);
+            let new_directory_path = format!("{}/{}", current_directory, directory_node.name);
+            let dir_name = directory_node.name.clone();
+            // Per-action hint dir descends one segment at the cost of one PathBuf
+            // alloc per subdir. Cheap relative to the work we're saving.
+            let child_hint_dir_owned: Option<PathBuf> =
+                current_hint_dir.map(|h| h.join(&dir_name));
             futures.push(
                 async move {
+                    let new_path = PathBuf::from(&new_directory_path);
+
+                    // Plan L — already-walked (path, digest) subtree.
+                    if cache.walked_dirs.contains(&new_path, &dir_digest).await {
+                        return Ok(());
+                    }
+
                     fs::create_dir(&new_directory_path)
                         .await
                         .err_tip(|| format!("Could not create directory {new_directory_path}"))?;
                     download_to_directory(
                         cas_store,
                         filesystem_store,
-                        &digest,
+                        &dir_digest,
                         &new_directory_path,
+                        cache,
+                        child_hint_dir_owned.as_deref(),
+                        hasher_func,
                     )
                     .await
                     .err_tip(|| format!("in download_to_directory : {new_directory_path}"))?;
+
+                    cache.walked_dirs.insert(new_path, dir_digest).await;
                     Ok(())
                 }
                 .boxed(),
@@ -278,6 +339,9 @@ pub async fn prepare_action_inputs(
     filesystem_store: Pin<&FilesystemStore>,
     digest: &DigestInfo,
     work_directory: &str,
+    input_cache: &InputCache,
+    hint_root: Option<&Path>,
+    hasher_func: DigestHasherFunc,
 ) -> Result<(), Error> {
     // Try cache first if available
     if let Some(cache) = directory_cache {
@@ -303,8 +367,19 @@ pub async fn prepare_action_inputs(
         }
     }
 
-    // Traditional path (cache disabled or failed)
-    download_to_directory(cas_store, filesystem_store, digest, work_directory).await
+    // Traditional path (directory_cache disabled or failed) — wired through
+    // input_cache for Plan K/I/L. Plan I activates only when hint_root is
+    // Some and input_cache.plan_i_enabled is true.
+    download_to_directory(
+        cas_store,
+        filesystem_store,
+        digest,
+        work_directory,
+        input_cache,
+        hint_root,
+        hasher_func,
+    )
+    .await
 }
 
 #[cfg(target_family = "windows")]
@@ -830,6 +905,22 @@ impl RunningActionImpl {
                 self.did_cleanup.store(false, Ordering::Release);
                 // Download the input files/folder and place them into the temp directory.
                 // Use directory cache if available for better performance.
+                // Derive Plan I `hint_root` for this action: if the action
+                // carries `InputRootAbsolutePath` as a platform property, use
+                // it (translated through `project_root` if configured).
+                // Without `InputRootAbsolutePath`, Plan I is disabled for
+                // this action and download_to_directory falls through to
+                // the existing CAS path.
+                let hint_root_owned: Option<PathBuf> = self
+                    .action_info
+                    .platform_properties
+                    .get("InputRootAbsolutePath")
+                    .map(|in_action| {
+                        PathBuf::from(translate_input_root_path(
+                            in_action,
+                            self.running_actions_manager.project_root.as_ref(),
+                        ))
+                    });
                 self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -838,6 +929,9 @@ impl RunningActionImpl {
                         filesystem_store_pin,
                         &self.action_info.input_root_digest,
                         &self.work_directory,
+                        self.running_actions_manager.input_cache.as_ref(),
+                        hint_root_owned.as_deref(),
+                        self.action_info.unique_qualifier.digest_function(),
                     ))
                     .await
             })
@@ -1933,6 +2027,15 @@ pub struct RunningActionsManagerArgs<'a> {
     pub max_upload_timeout: Duration,
     pub timeout_handled_externally: bool,
     pub directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    /// Process-shared input cache (Plan I/K/L). Workers in the same
+    /// process share these maps so warming one warms the rest.
+    pub input_cache: Arc<InputCache>,
+    /// Per-worker remap of action-borne `InputRootAbsolutePath` to a
+    /// local on-disk path. None disables the remap.
+    pub project_root: Option<ProjectRoot>,
+    /// In-process worker output materialization root. None disables.
+    /// Phase C wires this into `inner_upload_results`.
+    pub local_materialization_root: Option<String>,
 }
 
 struct CleanupGuard {
@@ -1980,6 +2083,12 @@ pub struct RunningActionsManagerImpl {
     /// Optional directory cache for improving performance by caching reconstructed
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    /// Process-shared Plan I/K/L caches.
+    input_cache: Arc<InputCache>,
+    /// Per-worker `InputRootAbsolutePath` → local-FS remap.
+    project_root: Option<ProjectRoot>,
+    /// In-process worker output materialization root (Phase C).
+    local_materialization_root: Option<String>,
 }
 
 impl RunningActionsManagerImpl {
@@ -2024,6 +2133,9 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
+            input_cache: args.input_cache,
+            project_root: args.project_root,
+            local_materialization_root: args.local_materialization_root,
         })
     }
 

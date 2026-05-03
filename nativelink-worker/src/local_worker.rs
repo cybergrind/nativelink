@@ -595,6 +595,13 @@ pub async fn new_local_worker(
         None
     };
 
+    // Process-shared input cache (Plan I/K/L). One per worker is fine for
+    // single-worker hosts; combined-mode multi-worker hosts would pass a
+    // single shared Arc<InputCache> here.
+    let input_cache = crate::input_cache::InputCache::with_plan_i_enabled(
+        config.experimental_digest_checked_hint_link,
+    );
+
     let running_actions_manager =
         Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: config.work_directory.clone(),
@@ -610,6 +617,9 @@ pub async fn new_local_worker(
             max_upload_timeout,
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
+            input_cache,
+            project_root: config.project_root.clone(),
+            local_materialization_root: config.local_materialization_root.clone(),
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),

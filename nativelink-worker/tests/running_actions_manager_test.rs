@@ -230,7 +230,10 @@ mod tests {
                 fast_store.as_pin(),
                 &root_directory_digest,
                 &download_dir,
-            )
+                &nativelink_worker::input_cache::InputCache::new_shared(),
+                None,
+                nativelink_util::digest_hasher::DigestHasherFunc::Sha256,
+                )
             .await?;
             download_dir
         };
@@ -335,7 +338,10 @@ mod tests {
                 fast_store.as_pin(),
                 &root_directory_digest,
                 &download_dir,
-            )
+                &nativelink_worker::input_cache::InputCache::new_shared(),
+                None,
+                nativelink_util::digest_hasher::DigestHasherFunc::Sha256,
+                )
             .await?;
             download_dir
         };
@@ -409,7 +415,10 @@ mod tests {
                 fast_store.as_pin(),
                 &root_directory_digest,
                 &download_dir,
-            )
+                &nativelink_worker::input_cache::InputCache::new_shared(),
+                None,
+                nativelink_util::digest_hasher::DigestHasherFunc::Sha256,
+                )
             .await?;
             download_dir
         };
@@ -460,6 +469,9 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -584,6 +596,9 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -710,6 +725,9 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -892,6 +910,9 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1075,6 +1096,9 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1284,6 +1308,9 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1420,6 +1447,9 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -1624,6 +1654,9 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -1801,6 +1834,9 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -1972,6 +2008,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2057,6 +2096,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2133,6 +2175,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2215,6 +2260,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2318,6 +2366,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2365,6 +2416,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2434,6 +2488,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2554,6 +2611,9 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2642,6 +2702,9 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2730,6 +2793,9 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2815,6 +2881,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -2968,6 +3037,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3138,6 +3210,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3239,6 +3314,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3354,6 +3432,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3535,6 +3616,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3656,6 +3740,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         // Create a simple action
@@ -3798,6 +3885,9 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
+                project_root: None,
+                local_materialization_root: None,
             })?);
 
         // Create a simple action
