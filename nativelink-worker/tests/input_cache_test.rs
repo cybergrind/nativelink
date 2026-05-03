@@ -17,7 +17,8 @@ use std::time::Duration;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_worker::input_cache::{
-    HintLinkResult, PathDigestCache, SingleFlight, WalkedDirsCache, try_hint_link,
+    HintLinkResult, PathDigestCache, SingleFlight, WalkedDirsCache, idempotent_hard_link,
+    try_hint_link,
 };
 use tempfile::TempDir;
 
@@ -281,4 +282,80 @@ async fn single_flight_distinct_keys_run_independently() {
         h.await.unwrap().unwrap();
     }
     assert_eq!(counter.load(Ordering::SeqCst), 8);
+}
+
+// ----- idempotent_hard_link ----------------------------------------------------
+//
+// Closes the EEXIST class on the file branch of `download_to_directory`.
+// The shared-tree-as-cache model means the canonical destination may
+// already hold matching content (concurrent walk via symlink-resolved
+// duplicate paths) or stale content (prior action). The helper:
+//   - links src→dst on the happy path,
+//   - on EEXIST, verifies dst's digest; accepts a matching race winner,
+//   - on EEXIST + mismatch, unlinks dst and retries the link once.
+
+#[tokio::test]
+async fn idempotent_hard_link_creates_when_dest_missing() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("dst.txt");
+    std::fs::write(&src, b"payload-bytes").unwrap();
+
+    let expected = digest_of(b"payload-bytes");
+    idempotent_hard_link(&src, &dst, &expected, DigestHasherFunc::Sha256)
+        .await
+        .expect("happy path must succeed");
+
+    assert_eq!(std::fs::read(&dst).unwrap(), b"payload-bytes");
+}
+
+#[tokio::test]
+async fn idempotent_hard_link_accepts_dest_with_matching_digest() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("dst.txt");
+    std::fs::write(&src, b"matching-bytes").unwrap();
+    // Independent file at dst with the same content (different inode).
+    std::fs::write(&dst, b"matching-bytes").unwrap();
+
+    let dst_inode_before = std::fs::metadata(&dst).unwrap().ino();
+    let expected = digest_of(b"matching-bytes");
+
+    idempotent_hard_link(&src, &dst, &expected, DigestHasherFunc::Sha256)
+        .await
+        .expect(
+            "EEXIST + matching digest must be accepted (race winner already produced \
+             the right content)",
+        );
+
+    // dst untouched — same inode, same bytes.
+    assert_eq!(std::fs::metadata(&dst).unwrap().ino(), dst_inode_before);
+    assert_eq!(std::fs::read(&dst).unwrap(), b"matching-bytes");
+}
+
+#[tokio::test]
+async fn idempotent_hard_link_replaces_dest_with_wrong_digest() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("dst.txt");
+    std::fs::write(&src, b"fresh-from-src").unwrap();
+    std::fs::write(&dst, b"stale-wrong-digest").unwrap();
+
+    let stale_inode = std::fs::metadata(&dst).unwrap().ino();
+    let src_inode = std::fs::metadata(&src).unwrap().ino();
+    let expected = digest_of(b"fresh-from-src");
+
+    idempotent_hard_link(&src, &dst, &expected, DigestHasherFunc::Sha256)
+        .await
+        .expect("EEXIST + mismatched digest must unlink dst and retry");
+
+    // dst now hardlinks to src (same inode), bytes match src.
+    let dst_inode_after = std::fs::metadata(&dst).unwrap().ino();
+    assert_ne!(dst_inode_after, stale_inode, "stale dst should be unlinked");
+    assert_eq!(dst_inode_after, src_inode, "dst should now hardlink to src");
+    assert_eq!(std::fs::read(&dst).unwrap(), b"fresh-from-src");
 }

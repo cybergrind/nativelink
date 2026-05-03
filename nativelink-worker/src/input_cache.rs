@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use nativelink_error::Error;
+use nativelink_error::{Code, Error};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::fs;
@@ -300,6 +300,49 @@ pub async fn try_existing_dest_link(
     }
 
     HintLinkResult::Hit
+}
+
+/// Idempotent hardlink: link `src` → `dst`. The shared-tree-as-cache
+/// model means the canonical destination may already hold matching
+/// content (a concurrent walk-future arriving at the same on-disk inode
+/// via a symlink-resolved duplicate path) or stale content (a prior
+/// action), and the older "remove-then-link" pattern fails EEXIST when:
+///   1. Two walk-futures within one action race on the same inode via
+///      symlink chains (common in macOS framework input trees).
+///   2. `dst` is a directory: `remove_file` returns EISDIR (silenced
+///      via `.ok()`), then `hard_link` returns EEXIST.
+///   3. `dst`'s removal is denied (immutable flag, EACCES); silenced.
+///
+/// This helper:
+///   - Tries `hard_link` first.
+///   - On `Ok`, returns.
+///   - On `AlreadyExists`, verifies `dst`'s digest via
+///     `try_existing_dest_link`. A `Hit` is accepted (race winner has
+///     the right content). Anything else triggers a single
+///     unlink+retry attempt; `remove_dir_all` covers the EISDIR case.
+///   - Any other error from the initial link is returned unchanged so
+///     the caller can attribute Code::NotFound to filesystem-store
+///     eviction (existing call site behavior).
+pub async fn idempotent_hard_link(
+    src: &Path,
+    dst: &Path,
+    expected_digest: &DigestInfo,
+    hasher_func: DigestHasherFunc,
+) -> Result<(), Error> {
+    match fs::hard_link(src, dst).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.code == Code::AlreadyExists => {
+            match try_existing_dest_link(dst, expected_digest, hasher_func).await {
+                HintLinkResult::Hit => Ok(()),
+                _ => {
+                    fs::remove_file(dst).await.ok();
+                    tokio::fs::remove_dir_all(dst).await.ok();
+                    fs::hard_link(src, dst).await
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
