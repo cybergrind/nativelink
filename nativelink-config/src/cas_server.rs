@@ -853,6 +853,79 @@ pub struct LocalWorkerConfig {
     /// them from CAS for every action.
     /// Default: None (directory cache disabled)
     pub directory_cache: Option<DirectoryCacheConfig>,
+
+    /// Per-worker remap of action-borne `InputRootAbsolutePath` onto this
+    /// worker's local filesystem. Used when cluster nodes have differing
+    /// `$USER` (or otherwise non-identical) prefixes for the shared source
+    /// tree. The remap is purely local: it never flows into the action
+    /// digest or any cross-machine state. When unset, paths are passed
+    /// through unchanged.
+    #[serde(default)]
+    pub project_root: Option<ProjectRoot>,
+
+    /// Enable Plan I (digest-checked hardlink/clonefile from a pre-staged
+    /// hint tree). When true and the action carries `InputRootAbsolutePath`,
+    /// each input file is verified against its expected digest by hashing
+    /// the local hint-root copy; on match the worker hardlinks/clones from
+    /// there and skips the CAS file fetch. Falls back to CAS on any miss.
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub experimental_digest_checked_hint_link: bool,
+
+    /// In-process (combined-mode) worker output materialization root.
+    /// When set, after each action's outputs are uploaded to CAS, declared
+    /// outputs are also clone/hardlinked from the sandbox into
+    /// `<root>/<declared_path>`, idempotent on a matching digest. This is
+    /// the fix for siso's local-fallback path on a worker that shares its
+    /// host with the build tree (combined mode) — outputs land on disk
+    /// where siso's next action will look for them. Leave unset on
+    /// remote-only workers.
+    #[serde(default)]
+    pub local_materialization_root: Option<String>,
+}
+
+/// Per-worker path remap for the action-borne `InputRootAbsolutePath`.
+///
+/// Substitutes `on_disk` for `in_action` at a path boundary. Substring
+/// matches that don't fall on a path separator are intentionally not
+/// remapped (so `/Users/octo` does not match `/Users/octocat`).
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct ProjectRoot {
+    /// Absolute path prefix as it appears on actions arriving from the
+    /// scheduler — typically the action-origin host's local path.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub in_action: String,
+    /// Absolute path prefix on this worker's local filesystem; the worker
+    /// substitutes this for `in_action` before using the resulting path.
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub on_disk: String,
+}
+
+/// Translate a path under `in_action` to the equivalent path under
+/// `on_disk`. Returns the path unchanged when `project_root` is `None`,
+/// when the path does not start with `in_action`, or when the prefix
+/// match isn't on a path boundary (`/` or end of string).
+pub fn translate_input_root_path(
+    in_action_path: &str,
+    project_root: Option<&ProjectRoot>,
+) -> String {
+    let Some(pr) = project_root else {
+        return in_action_path.to_string();
+    };
+    let Some(rest) = in_action_path.strip_prefix(&pr.in_action) else {
+        return in_action_path.to_string();
+    };
+    if rest.is_empty() || rest.starts_with('/') {
+        format!("{}{}", pr.on_disk, rest)
+    } else {
+        in_action_path.to_string()
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
