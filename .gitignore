@@ -25,3 +25,7 @@ nativelink.bazelrc
 *.log
 buck-out/
 nativelink_config.schema.json
+
+# Local-only working contract; never commit. See plan
+# /home/kpi/.claude/plans/i-don-t-want-to-polished-tiger.md
+/CLAUDE.md
