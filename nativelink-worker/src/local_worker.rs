@@ -36,6 +36,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     execute_result,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
+use nativelink_store::filesystem_store::FilesystemStore;
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
 use nativelink_util::common::fs;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -582,6 +583,51 @@ pub async fn new_local_worker(
         .err_tip(|| "Expected store for LocalWorker's store to be a FastSlowStore")?
         .get_arc()
         .err_tip(|| "FastSlowStore's Arc doesn't exist")?;
+
+    // Same-volume gate: input materialization in the shared tree relies
+    // on `fs::hard_link` from the filesystem store entry to the canonical
+    // input path. Cross-volume hardlink returns EXDEV and there is no
+    // copy fallback in `download_to_directory`, so refuse to start when
+    // the two paths would resolve to different filesystems. The shared
+    // tree dir is created if missing — the volume of an empty dir is
+    // determined by its parent, which is enough for the check.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let fs_store = fast_slow_store
+            .fast_store()
+            .downcast_ref::<FilesystemStore>(None)
+            .err_tip(|| "Expected fast_store to be a FilesystemStore for same-volume check")?;
+        let fs_store_path = fs_store.content_path().to_string();
+        fs::create_dir_all(&shared_tree_root)
+            .await
+            .err_tip(|| format!("Could not create shared_tree_root '{shared_tree_root}'"))?;
+        let fs_dev = std::fs::metadata(&fs_store_path)
+            .map_err(|e| {
+                make_err!(
+                    Code::InvalidArgument,
+                    "Failed to stat filesystem_store content_path '{fs_store_path}': {e}",
+                )
+            })?
+            .dev();
+        let tree_dev = std::fs::metadata(&shared_tree_root)
+            .map_err(|e| {
+                make_err!(
+                    Code::InvalidArgument,
+                    "Failed to stat shared_tree_root '{shared_tree_root}': {e}",
+                )
+            })?
+            .dev();
+        if fs_dev != tree_dev {
+            return Err(make_err!(
+                Code::InvalidArgument,
+                "Worker '{}' refuses to start: filesystem_store content_path '{fs_store_path}' \
+                 (dev={fs_dev}) and shared_tree_root '{shared_tree_root}' (dev={tree_dev}) \
+                 must be on the same volume. Cross-volume `hard_link` returns EXDEV with no \
+                 copy fallback. See CLAUDE.md.",
+                config.name,
+            ));
+        }
+    }
 
     // Log warning about CAS configuration for multi-worker setups
     event!(

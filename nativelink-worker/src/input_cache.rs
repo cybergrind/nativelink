@@ -192,6 +192,15 @@ pub enum HintLinkResult {
 /// hint into `dst`. The size short-circuit avoids hashing files that
 /// can't possibly match. Caller is responsible for marking Plan K
 /// after a `Hit`.
+///
+/// CALLER CONTRACT: `hint_root` MUST NOT resolve so that
+/// `hint_root/<file_name>` equals `dst`. If it does, `fs::hard_link`
+/// returns EEXIST, this function returns `MissIoError`, and the caller
+/// falls through to the CAS path — which then ALSO returns EEXIST when
+/// it tries to hardlink onto the existing dest. For Plan J's
+/// "shared tree as canonical destination" use case, callers must pass
+/// `hint_root: None` and rely on `try_existing_dest_link` for the
+/// stat-and-hash short-circuit. See CLAUDE.md hard rule #4.
 pub async fn try_hint_link(
     hint_root: &Path,
     file_name: &str,
@@ -239,6 +248,57 @@ pub async fn try_hint_link(
     if let Err(e) = fs::hard_link(&hint_path, dst).await {
         return HintLinkResult::MissIoError(e);
     }
+    HintLinkResult::Hit
+}
+
+/// Cold-cache short-circuit for shared-tree mode: returns `Hit` when
+/// `dst` itself already exists with size + digest matching
+/// `expected_digest` — no link is performed because `dst` is already
+/// the right file. Caller is responsible for replacing `dst` on Miss
+/// variants (typical pattern: unlink then hardlink from the filesystem
+/// store entry).
+///
+/// Distinct from `try_hint_link` which dereferences a separate hint
+/// tree; here the hint and destination are the same path. Used by the
+/// shared-tree input walk where `prepare_action_inputs` is called with
+/// `hint_root: None` and the canonical input destinations live inside
+/// the shared `src/` checkout.
+pub async fn try_existing_dest_link(
+    dst: &Path,
+    expected_digest: &DigestInfo,
+    hasher_func: DigestHasherFunc,
+) -> HintLinkResult {
+    let meta = match tokio::fs::metadata(dst).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return HintLinkResult::MissNotFound;
+        }
+        Err(e) => return HintLinkResult::MissIoError(Error::from(e)),
+    };
+    if !meta.is_file() {
+        return HintLinkResult::MissIoError(nativelink_error::make_err!(
+            nativelink_error::Code::InvalidArgument,
+            "dest path is not a regular file: {}",
+            dst.display()
+        ));
+    }
+    if meta.len() != expected_digest.size_bytes() {
+        return HintLinkResult::MissSizeMismatch;
+    }
+
+    let mut hasher = hasher_func.hasher();
+    let mut file = match tokio::fs::File::open(dst).await {
+        Ok(f) => f,
+        Err(e) => return HintLinkResult::MissIoError(Error::from(e)),
+    };
+    let computed = match hasher.compute_from_reader(&mut file).await {
+        Ok(d) => d,
+        Err(e) => return HintLinkResult::MissIoError(e),
+    };
+    if computed != *expected_digest {
+        return HintLinkResult::MissDigestMismatch;
+    }
+
     HintLinkResult::Hit
 }
 

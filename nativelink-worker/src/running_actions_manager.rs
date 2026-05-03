@@ -12,21 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # Plan J shared-tree execution (load-bearing)
+//! # Shared-tree execution with CAS-backed input materialization
 //!
 //! Workers in this fork execute actions IN-PLACE inside the worker's
 //! configured `InputRootAbsolutePath`. There is NO per-action sandbox.
-//! The input tree walk is skipped entirely — the rsync invariant
-//! guarantees every input is already at its canonical path.
+//! The action's input tree walk runs (`prepare_action_inputs` →
+//! `download_to_directory`), but every file is short-circuited per file
+//! when its canonical destination already holds the right digest:
+//!
+//! - **Plan K (warm)**: `(path, digest)` already verified in
+//!   `InputCache.path_digests` — no I/O.
+//! - **Cold-cache stat-and-hash**: `try_existing_dest_link` stats the
+//!   destination and hashes only on size match — no link, no CAS hit.
+//! - **Miss**: stale-file at dest is unlinked, then a hardlink from the
+//!   filesystem store entry replaces it. CAS is the source of truth.
 //!
 //! The shared-tree path is a worker deployment fact, not an action fact:
 //! it comes from `LocalWorkerConfig.platform_properties` and is plumbed
 //! into `RunningActionsManagerImpl.shared_tree_root`. The action proto's
 //! `InputRootAbsolutePath` (if any) is ignored — siso, clang, and the
-//! scheduler do NOT need to know about it. See `CLAUDE.md` at the repo
-//! root and `RunningActionImpl::new` for the contract. This principle
-//! has been silently regressed once already (Phase A green-rewrite,
-//! commit `995627bd`); the contract tests in
+//! scheduler do NOT need to know about it. The `hint_root` parameter to
+//! `prepare_action_inputs` MUST be `None` from the worker — passing
+//! `Some(&shared_tree_root)` triggers a `src == dst` EEXIST trap in
+//! `try_hint_link`. See `CLAUDE.md` at the repo root and
+//! `RunningActionImpl::new` for the full contract. The cwd-binding half
+//! of this invariant has been silently regressed once already (Phase A
+//! green-rewrite, commit `995627bd`); the contract tests in
 //! `tests/running_actions_manager_test.rs` exist to prevent a third.
 
 use core::cmp::min;
@@ -88,7 +99,9 @@ use nativelink_util::{background_spawn, spawn, spawn_blocking};
 
 use nativelink_util::counters;
 
-use crate::input_cache::{HintLinkResult, InputCache, try_hint_link};
+use crate::input_cache::{
+    HintLinkResult, InputCache, try_existing_dest_link, try_hint_link,
+};
 
 /// Phase C — copy a set of declared outputs from the action's sandbox
 /// into a local materialization root, idempotent on a matching-size
@@ -226,9 +239,35 @@ pub fn download_to_directory<'a>(
                     }
                     counters::inc("worker.plan_k.miss");
 
+                    // Cold-cache short-circuit: dst already on disk with
+                    // matching digest (e.g., shared-tree pre-populated by
+                    // a prior worker process). Records into Plan K so
+                    // subsequent actions skip the rehash.
+                    let mut already_present = false;
+                    match try_existing_dest_link(
+                        &dest_path,
+                        &file_digest,
+                        hasher_func,
+                    )
+                    .await
+                    {
+                        HintLinkResult::Hit => {
+                            counters::inc("worker.plan_k.cold_hit");
+                            cache
+                                .path_digests
+                                .insert(dest_path.clone(), file_digest)
+                                .await
+                                .ok();
+                            already_present = true;
+                        }
+                        _ => {
+                            counters::inc("worker.plan_k.cold_miss");
+                        }
+                    }
+
                     // Plan I — try the hint tree before going to CAS.
-                    let mut planned_via_hint = false;
-                    if cache.plan_i_enabled {
+                    let mut planned_via_hint = already_present;
+                    if !planned_via_hint && cache.plan_i_enabled {
                         if let Some(hint_dir) = current_hint_dir {
                             match try_hint_link(
                                 hint_dir,
@@ -258,6 +297,11 @@ pub fn download_to_directory<'a>(
                             .await
                             .map_err(|e| e.append(format!("for digest {file_digest}")))?;
                         if is_zero_digest(file_digest) {
+                            // Stale or wrong-digest file at dest must be removed
+                            // first, otherwise create_file/hard_link below would
+                            // either trample or EEXIST. Ignore NotFound — the
+                            // common path is dest doesn't exist yet.
+                            fs::remove_file(&dest).await.ok();
                             let mut file_slot = fs::create_file(&dest).await?;
                             file_slot.write_all(&[]).await?;
                         } else {
@@ -267,6 +311,11 @@ pub fn download_to_directory<'a>(
                                 .err_tip(|| "During hard link")?;
                             // TODO: add a test for #2051: deadlock with large number of files
                             let src_path = file_entry.get_file_path_locked(|src| async move { Ok(PathBuf::from(src)) }).await?;
+                            // Same rationale as above: clear any stale dest so the
+                            // hardlink doesn't EEXIST. The shared-tree mode means
+                            // the canonical path may already hold a wrong-digest
+                            // file from a prior action.
+                            fs::remove_file(&dest).await.ok();
                             fs::hard_link(&src_path, &dest)
                                 .await
                                 .map_err(|e| {
@@ -968,17 +1017,16 @@ impl RunningActionImpl {
                 (self.running_actions_manager.callbacks.now_fn)();
         }
         let command = {
-            // Plan J shared-tree mode: the worker executes IN-PLACE inside
-            // the action's `InputRootAbsolutePath` (the `work_directory`
-            // alias was set in `RunningActionImpl::new`). The shared tree
-            // is the rsync invariant — every input is already at its
-            // canonical path, so we DO NOT walk `input_root_digest`. If a
-            // file is missing the action will fail at exec time with a
-            // clear "no such file" error, which is the correct signal that
-            // rsync was incomplete. See CLAUDE.md.
+            // Shared-tree mode (see CLAUDE.md): cwd is aliased to
+            // `shared_tree_root` (set in `RunningActionImpl::new`). The
+            // input walk runs below — files already at their canonical
+            // path with matching digest are short-circuited (Plan K warm
+            // cache + cold-cache stat-and-hash); missing or mismatched
+            // files come from CAS via hardlink. CAS is the source of
+            // truth and the cross-host bridge.
             //
-            // We still fetch the Command proto in parallel with the
-            // (idempotent) work_directory creation.
+            // We fetch the Command proto in parallel with the (idempotent)
+            // work_directory creation, then walk the inputs.
             let command_fut = self.metrics().get_proto_command_from_store.wrap(async {
                 get_and_decode_digest::<ProtoCommand>(
                     self.running_actions_manager.cas_store.as_ref(),
@@ -1002,6 +1050,24 @@ impl RunningActionImpl {
             .await?;
             command
         };
+        // Materialize action inputs into the shared tree. `hint_root: None`
+        // is mandatory — passing `Some(&self.work_directory)` would trigger
+        // a src==dst EEXIST trap in `try_hint_link` and erroneously fall
+        // through to a CAS hardlink that also EEXISTs. See CLAUDE.md hard
+        // rule #4.
+        let hasher = self.action_info.unique_qualifier.digest_function();
+        prepare_action_inputs(
+            &self.running_actions_manager.directory_cache,
+            self.running_actions_manager.cas_store.as_ref(),
+            self.running_actions_manager.filesystem_store.as_pin(),
+            &self.action_info.input_root_digest,
+            &self.work_directory,
+            &self.running_actions_manager.input_cache,
+            None,
+            hasher,
+        )
+        .await
+        .err_tip(|| "while materializing action inputs into shared tree")?;
         {
             // Create all directories needed for our output paths. This is required by the bazel spec.
             let prepare_output_directories = |output_file| {
@@ -1630,15 +1696,16 @@ impl RunningActionImpl {
                 }
             }
         }
-        // Plan J telemetry: emit per-action timing breakdown so operators
-        // can answer "actions/sec" and "% prep overhead" without parsing
-        // metric snapshots. All values are wall-clock millis derived from
-        // ExecutionMetadata timestamps. `prep_ms` covers
-        // create_dir + Command-proto fetch (the input walk is skipped
-        // entirely in shared-tree mode). `exec_ms` is the child process.
-        // `upload_ms` is output upload + Phase C mirror. Totals sum to
-        // `total_ms` which is wall-clock from worker_start to
-        // worker_completed.
+        // Per-action timing breakdown so operators can answer
+        // "actions/sec" and "% prep overhead" without parsing metric
+        // snapshots. All values are wall-clock millis derived from
+        // ExecutionMetadata timestamps. `prep_ms` covers create_dir +
+        // Command-proto fetch + input materialization (Plan K warm cache
+        // and cold-cache stat-and-hash short-circuit avoid CAS hits for
+        // files already at their canonical path). `exec_ms` is the
+        // child process. `upload_ms` is output upload + Phase C mirror.
+        // Totals sum to `total_ms` which is wall-clock from worker_start
+        // to worker_completed.
         let now = (self.running_actions_manager.callbacks.now_fn)();
         let total_actions = self
             .running_actions_manager
@@ -2231,11 +2298,8 @@ pub struct RunningActionsManagerImpl {
     root_action_directory: String,
     execution_configuration: ExecutionConfiguration,
     cas_store: Arc<FastSlowStore>,
-    /// Plan J: unused now that the input walk is skipped. Held only so
-    /// `RunningActionsManagerArgs` can stay shape-compatible with
-    /// upstream / tests; remove when `prepare_action_inputs` is also
-    /// removed from the public API.
-    #[allow(dead_code)]
+    /// Fast store under the FastSlowStore. Used by `prepare_action_inputs`
+    /// to hardlink already-cached entries directly into the shared tree.
     filesystem_store: Arc<FilesystemStore>,
     upload_action_results: UploadActionResults,
     max_action_timeout: Duration,
@@ -2255,11 +2319,12 @@ pub struct RunningActionsManagerImpl {
     /// Notify waiters when a cleanup operation completes. This is used in conjunction with
     /// `cleaning_up_operations` to coordinate directory cleanup and creation.
     cleanup_complete_notify: Arc<Notify>,
-    /// Plan J: unused (input walk skipped). See `filesystem_store` note.
-    #[allow(dead_code)]
+    /// Optional Directory-proto cache used by `prepare_action_inputs` to
+    /// short-circuit subtree walks for already-seen input roots.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
-    /// Plan J: unused (input walk skipped). See `filesystem_store` note.
-    #[allow(dead_code)]
+    /// Per-worker `(path, digest)` and walked-subtree cache (Plan K/L).
+    /// Read by `download_to_directory` to skip files already verified at
+    /// their canonical path; populated as actions materialize inputs.
     input_cache: Arc<InputCache>,
     /// Per-worker `InputRootAbsolutePath` → local-FS remap.
     /// Vestigial; see doc on the args struct.

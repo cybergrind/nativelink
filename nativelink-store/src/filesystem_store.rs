@@ -725,6 +725,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.weak_self.upgrade()
     }
 
+    /// Returns the content directory where digest-keyed files are stored.
+    /// Used by the worker startup check that verifies the filesystem store
+    /// and the shared tree are on the same volume (cross-volume
+    /// `fs::hard_link` returns EXDEV with no copy fallback).
+    pub fn content_path(&self) -> &str {
+        &self.shared_context.content_path
+    }
+
     pub async fn get_file_entry_for_digest(&self, digest: &DigestInfo) -> Result<Arc<Fe>, Error> {
         if is_zero_digest(digest) {
             return Ok(Arc::new(Fe::create(

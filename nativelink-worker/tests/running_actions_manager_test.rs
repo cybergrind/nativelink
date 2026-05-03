@@ -4310,4 +4310,276 @@ exit 1
         fs::remove_dir_all(&root_action_directory).await?;
         Ok(())
     }
+
+    /// Helper: build a Directory proto containing a single FileNode and
+    /// upload both the file content and the Directory proto to CAS. Returns
+    /// the file content's digest (so tests can assert on it) and the
+    /// Directory proto's digest (to wire into an Action's
+    /// `input_root_digest`).
+    async fn upload_single_file_input_root(
+        cas_store: &Arc<FastSlowStore>,
+        file_name: &str,
+        content: &[u8],
+    ) -> Result<(DigestInfo, DigestInfo), Error> {
+        let mut hasher = DigestHasherFunc::Sha256.hasher();
+        hasher.update(content);
+        let content_digest: DigestInfo = hasher.finalize_digest();
+        cas_store
+            .as_pin()
+            .update_oneshot(content_digest, content.to_vec().into())
+            .await?;
+
+        let directory = Directory {
+            files: vec![FileNode {
+                name: file_name.to_string(),
+                digest: Some(content_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        let dir_digest = serialize_and_upload_message(
+            &directory,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        Ok((content_digest, dir_digest))
+    }
+
+    /// Inputs missing from the shared tree are fetched from CAS and
+    /// hardlinked into place by `prepare_action_inputs`.
+    #[nativelink_test]
+    async fn inputs_materialize_from_cas_into_shared_tree() -> Result<(), Error> {
+        const FILE_NAME: &str = "hello.txt";
+        const FILE_CONTENT: &[u8] = b"hello-from-cas";
+
+        let root_action_directory = make_temp_path("plan_j_materialize_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_materialize_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree).await?;
+        let (_content_digest, input_root_digest) =
+            upload_single_file_input_root(&cas_store, FILE_NAME, FILE_CONTENT).await?;
+
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        // The file must now exist at the canonical path inside the shared tree.
+        let dest_path = format!("{}/{}", shared_tree, FILE_NAME);
+        let actual = fs::read(&dest_path).await?;
+        assert_eq!(
+            actual, FILE_CONTENT,
+            "Input file was not materialized at the canonical path"
+        );
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    /// Inputs already present at the canonical path with matching digest
+    /// must NOT be re-fetched from CAS (cold-cache stat-and-hash via
+    /// `try_existing_dest_link`). We assert this by checking the file's
+    /// inode is unchanged after `prepare_action()` — the CAS path
+    /// unlink+link would always produce a fresh inode.
+    #[nativelink_test]
+    async fn inputs_already_present_at_canonical_path_skip_cas() -> Result<(), Error> {
+        use std::os::unix::fs::MetadataExt;
+
+        const FILE_NAME: &str = "cached.txt";
+        const FILE_CONTENT: &[u8] = b"already-on-disk-bytes";
+
+        let root_action_directory = make_temp_path("plan_j_skip_cas_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_skip_cas_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        // Pre-plant the file at its canonical path with the SAME content
+        // we'll upload to CAS, so the digest matches.
+        let dest_path = format!("{}/{}", shared_tree, FILE_NAME);
+        let mut planted = fs::create_file(OsString::from(&dest_path)).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut planted, FILE_CONTENT).await?;
+        planted.as_mut().sync_all().await?;
+        drop(planted);
+        let pre_inode = fs::metadata(&dest_path).await?.ino();
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree).await?;
+        let (_content_digest, input_root_digest) =
+            upload_single_file_input_root(&cas_store, FILE_NAME, FILE_CONTENT).await?;
+
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        let post_inode = fs::metadata(&dest_path).await?.ino();
+        assert_eq!(
+            pre_inode, post_inode,
+            "Cold-cache fast path: file with matching digest must NOT be \
+             unlinked-and-relinked from CAS"
+        );
+        let actual = fs::read(&dest_path).await?;
+        assert_eq!(actual, FILE_CONTENT);
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    /// A stale file at the canonical path with a digest that does NOT
+    /// match the action's expected digest must be replaced with the
+    /// correct CAS content. Without the unlink-before-hardlink safety in
+    /// `download_to_directory`, this would EEXIST and fail the action.
+    #[nativelink_test]
+    async fn stale_file_at_canonical_path_is_replaced() -> Result<(), Error> {
+        const FILE_NAME: &str = "stale_then_fresh.txt";
+        const STALE_CONTENT: &[u8] = b"stale-bytes-that-do-not-match";
+        const FRESH_CONTENT: &[u8] = b"fresh-bytes-from-cas";
+
+        let root_action_directory = make_temp_path("plan_j_stale_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_stale_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        let dest_path = format!("{}/{}", shared_tree, FILE_NAME);
+        let mut planted = fs::create_file(OsString::from(&dest_path)).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut planted, STALE_CONTENT).await?;
+        planted.as_mut().sync_all().await?;
+        drop(planted);
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree).await?;
+        let (_content_digest, input_root_digest) =
+            upload_single_file_input_root(&cas_store, FILE_NAME, FRESH_CONTENT).await?;
+
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        let actual = fs::read(&dest_path).await?;
+        assert_eq!(
+            actual, FRESH_CONTENT,
+            "Stale file with mismatched digest must be replaced with CAS content"
+        );
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
 }

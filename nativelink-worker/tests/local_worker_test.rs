@@ -1080,10 +1080,11 @@ async fn worker_starts_with_input_root_values() -> Result<(), Error> {
     // Happy path: non-empty `Values` is accepted.
     let (cas_store, ac_store) = dummy_cas_stores_for_plan_j().await?;
     let work_directory = make_temp_path("plan_j_values_ok");
+    let shared_tree = make_temp_path("plan_j_values_tree");
     let mut platform_properties = HashMap::new();
     platform_properties.insert(
         "InputRootAbsolutePath".to_string(),
-        WorkerProperty::Values(vec!["/some/shared/tree".to_string()]),
+        WorkerProperty::Values(vec![shared_tree.clone()]),
     );
     new_local_worker(
         Arc::new(LocalWorkerConfig {
@@ -1105,10 +1106,11 @@ async fn worker_starts_with_input_root_querycmd() -> Result<(), Error> {
     // value at runtime).
     let (cas_store, ac_store) = dummy_cas_stores_for_plan_j().await?;
     let work_directory = make_temp_path("plan_j_querycmd_ok");
+    let shared_tree = make_temp_path("plan_j_querycmd_tree");
     let mut platform_properties = HashMap::new();
     platform_properties.insert(
         "InputRootAbsolutePath".to_string(),
-        WorkerProperty::QueryCmd("printf /some/path".to_string()),
+        WorkerProperty::QueryCmd(format!("printf {shared_tree}")),
     );
     new_local_worker(
         Arc::new(LocalWorkerConfig {
