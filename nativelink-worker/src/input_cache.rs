@@ -9,8 +9,6 @@
 //! hint link), Plan K (path→digest cache), Plan L (walked-dir cache),
 //! and a single-flight wrapper for deduping concurrent walks of the
 //! same `(path, digest)` subtree.
-//!
-//! Skeleton — all bodies are `unimplemented!()` until the green commit.
 
 use core::future::Future;
 use std::collections::{HashMap, HashSet};
@@ -20,8 +18,9 @@ use std::time::SystemTime;
 
 use nativelink_error::Error;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::DigestHasherFunc;
-use parking_lot::Mutex;
+use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
+use nativelink_util::fs;
+use parking_lot::Mutex as SyncMutex;
 use tokio::sync::{RwLock, broadcast};
 
 // ---------------------------------------------------------------------------
@@ -38,30 +37,47 @@ impl PathDigestCache {
         Arc::new(Self::default())
     }
 
-    /// Stat-gated membership: returns true only when the cached
-    /// `(path → (digest, mtime))` entry exists, the on-disk mtime
-    /// matches the recorded one, and the recorded digest equals
-    /// `digest`. If the on-disk file is missing or its mtime has
-    /// drifted, the stale entry is evicted and `false` is returned.
-    pub async fn contains(&self, _path: &Path, _digest: &DigestInfo) -> bool {
-        unimplemented!("Phase B.2 green: PathDigestCache::contains")
+    /// Stat-gated: returns `true` only when an entry exists, the on-disk
+    /// mtime equals the recorded mtime, and the recorded digest equals
+    /// `digest`. On stale or missing files, the entry is evicted.
+    pub async fn contains(&self, path: &Path, digest: &DigestInfo) -> bool {
+        let recorded = {
+            let guard = self.inner.read().await;
+            guard.get(path).cloned()
+        };
+        let Some((rec_digest, rec_mtime)) = recorded else {
+            return false;
+        };
+        if rec_digest != *digest {
+            return false;
+        }
+        let on_disk_mtime = match tokio::fs::metadata(path).await {
+            Ok(m) => m.modified().ok(),
+            Err(_) => None,
+        };
+        match on_disk_mtime {
+            Some(m) if m == rec_mtime => true,
+            _ => {
+                self.inner.write().await.remove(path);
+                false
+            }
+        }
     }
 
-    /// Record `path → digest` and remember the on-disk mtime at the
-    /// moment of insertion. Returns `Err` if the file cannot be stat'd.
-    pub async fn insert(
-        &self,
-        _path: PathBuf,
-        _digest: DigestInfo,
-    ) -> Result<(), Error> {
-        unimplemented!("Phase B.2 green: PathDigestCache::insert")
+    pub async fn insert(&self, path: PathBuf, digest: DigestInfo) -> Result<(), Error> {
+        let mtime = tokio::fs::metadata(&path)
+            .await
+            .map_err(Error::from)?
+            .modified()
+            .map_err(Error::from)?;
+        self.inner.write().await.insert(path, (digest, mtime));
+        Ok(())
     }
 
-    /// Test-only: number of entries currently held.
+    /// Test-only count of entries.
     #[doc(hidden)]
-    pub fn len_for_test(&self) -> usize {
-        // Always returns 0 in the red skeleton; green flips it.
-        0
+    pub async fn len_for_test(&self) -> usize {
+        self.inner.read().await.len()
     }
 }
 
@@ -79,12 +95,15 @@ impl WalkedDirsCache {
         Arc::new(Self::default())
     }
 
-    pub async fn contains(&self, _path: &Path, _digest: &DigestInfo) -> bool {
-        unimplemented!("Phase B.2 green: WalkedDirsCache::contains")
+    pub async fn contains(&self, path: &Path, digest: &DigestInfo) -> bool {
+        self.inner
+            .read()
+            .await
+            .contains(&(path.to_path_buf(), digest.clone()))
     }
 
-    pub async fn insert(&self, _path: PathBuf, _digest: DigestInfo) {
-        unimplemented!("Phase B.2 green: WalkedDirsCache::insert")
+    pub async fn insert(&self, path: PathBuf, digest: DigestInfo) {
+        self.inner.write().await.insert((path, digest));
     }
 }
 
@@ -94,7 +113,7 @@ impl WalkedDirsCache {
 
 #[derive(Debug, Default)]
 pub struct SingleFlight {
-    inner: Mutex<HashMap<(PathBuf, DigestInfo), broadcast::Sender<bool>>>,
+    inner: SyncMutex<HashMap<(PathBuf, DigestInfo), broadcast::Sender<bool>>>,
 }
 
 impl SingleFlight {
@@ -103,22 +122,56 @@ impl SingleFlight {
     }
 
     /// Run `f` for `key` if no other caller is currently running it;
-    /// otherwise wait for the in-flight caller to finish. On success
-    /// (leader returned `Ok(())`) followers also return `Ok(())`. On
-    /// leader failure followers retry by calling `f()` themselves —
-    /// the cache in `f` is expected to short-circuit a successful
-    /// retry.
-    pub async fn run<F, Fut>(
-        &self,
-        _key: (PathBuf, DigestInfo),
-        _f: F,
-    ) -> Result<(), Error>
+    /// otherwise wait for the in-flight caller to finish. On leader
+    /// success followers also return `Ok(())`. On leader failure
+    /// followers retry by calling `f()` themselves — the cache inside
+    /// `f` is expected to short-circuit the retry cheaply on a
+    /// successful walk by some other path.
+    pub async fn run<F, Fut>(&self, key: (PathBuf, DigestInfo), f: F) -> Result<(), Error>
     where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<(), Error>> + Send,
     {
-        unimplemented!("Phase B.2 green: SingleFlight::run")
+        // Acquire/insert the entry under the sync mutex; decide leader
+        // vs follower; release the mutex before awaiting anything.
+        let role = {
+            let mut guard = self.inner.lock();
+            match guard.get(&key) {
+                Some(tx) => Role::Follower(tx.subscribe()),
+                None => {
+                    let (tx, _rx) = broadcast::channel::<bool>(1);
+                    guard.insert(key.clone(), tx);
+                    Role::Leader
+                }
+            }
+        };
+
+        match role {
+            Role::Leader => {
+                let result = f().await;
+                let success = result.is_ok();
+                let tx_opt = self.inner.lock().remove(&key);
+                if let Some(tx) = tx_opt {
+                    let _ = tx.send(success);
+                }
+                result
+            }
+            Role::Follower(mut rx) => {
+                // If the leader's broadcast channel closes (sender dropped
+                // before sending), recv returns Err — treat as failure and
+                // retry via `f`.
+                match rx.recv().await {
+                    Ok(true) => Ok(()),
+                    Ok(false) | Err(_) => f().await,
+                }
+            }
+        }
     }
+}
+
+enum Role {
+    Leader,
+    Follower(broadcast::Receiver<bool>),
 }
 
 // ---------------------------------------------------------------------------
@@ -135,18 +188,58 @@ pub enum HintLinkResult {
 }
 
 /// Try to satisfy `expected_digest` for `dst` by hashing
-/// `hint_root/<file_name>` and, on match, hardlink-or-clonefile from
-/// hint_root into `dst`. Caller is responsible for marking Plan K
-/// after a `Hit`. The size short-circuit avoids hashing files that
-/// can't possibly match.
+/// `hint_root/<file_name>`. On match, hardlink-or-clonefile from the
+/// hint into `dst`. The size short-circuit avoids hashing files that
+/// can't possibly match. Caller is responsible for marking Plan K
+/// after a `Hit`.
 pub async fn try_hint_link(
-    _hint_root: &Path,
-    _file_name: &str,
-    _expected_digest: &DigestInfo,
-    _hasher_func: DigestHasherFunc,
-    _dst: &Path,
+    hint_root: &Path,
+    file_name: &str,
+    expected_digest: &DigestInfo,
+    hasher_func: DigestHasherFunc,
+    dst: &Path,
 ) -> HintLinkResult {
-    unimplemented!("Phase B.2 green: try_hint_link")
+    let hint_path = hint_root.join(file_name);
+
+    // Stat for existence + size; short-circuit on mismatch.
+    let meta = match tokio::fs::metadata(&hint_path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return HintLinkResult::MissNotFound;
+        }
+        Err(e) => return HintLinkResult::MissIoError(Error::from(e)),
+    };
+    if !meta.is_file() {
+        // Directory or special file at the hint path.
+        return HintLinkResult::MissIoError(nativelink_error::make_err!(
+            nativelink_error::Code::InvalidArgument,
+            "hint path is not a regular file: {}",
+            hint_path.display()
+        ));
+    }
+    if meta.len() != expected_digest.size_bytes() {
+        return HintLinkResult::MissSizeMismatch;
+    }
+
+    // Hash the file. compute_from_reader pulls the whole file through.
+    let mut hasher = hasher_func.hasher();
+    let mut file = match tokio::fs::File::open(&hint_path).await {
+        Ok(f) => f,
+        Err(e) => return HintLinkResult::MissIoError(Error::from(e)),
+    };
+    let computed = match hasher.compute_from_reader(&mut file).await {
+        Ok(d) => d,
+        Err(e) => return HintLinkResult::MissIoError(e),
+    };
+    if computed != *expected_digest {
+        return HintLinkResult::MissDigestMismatch;
+    }
+
+    // Verified match — hardlink (or clonefile on macOS via fs::hard_link).
+    if let Err(e) = fs::hard_link(&hint_path, dst).await {
+        return HintLinkResult::MissIoError(e);
+    }
+    HintLinkResult::Hit
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +256,6 @@ pub struct InputCache {
 }
 
 impl InputCache {
-    /// Process-shared default constructor. All workers in the same
-    /// `nativelink` process share these maps; this is intentional —
-    /// warming one worker warms its siblings.
     pub fn new_shared() -> Self {
         Self {
             path_digests: PathDigestCache::new(),
