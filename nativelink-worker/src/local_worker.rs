@@ -507,6 +507,41 @@ impl<
     }
 }
 
+/// Plan J: resolve an `InputRootAbsolutePath` `QueryCmd` at worker
+/// startup. The shared-tree path must be deterministic at startup time
+/// because every action this worker accepts will be aliased to it; we
+/// cannot defer to per-action evaluation. Mirrors the shlex+exec dance
+/// in `worker_utils::make_connect_worker_request` but returns a single
+/// trimmed stdout line.
+async fn resolve_input_root_query_cmd(cmd: &str) -> Result<String, Error> {
+    let split = shlex::split(cmd).ok_or_else(|| {
+        make_input_err!(
+            "Could not parse InputRootAbsolutePath QueryCmd: '{cmd}'"
+        )
+    })?;
+    let (program, args) = split.split_first().ok_or_else(|| {
+        make_input_err!("InputRootAbsolutePath QueryCmd is empty: '{cmd}'")
+    })?;
+    let output = process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .err_tip(|| format!("Spawning InputRootAbsolutePath QueryCmd '{cmd}'"))?;
+    if !output.status.success() {
+        return Err(make_err!(
+            Code::Internal,
+            "InputRootAbsolutePath QueryCmd '{cmd}' exited with status {}: {}",
+            output.status,
+            str::from_utf8(&output.stderr).unwrap_or("<non-utf8 stderr>"),
+        ));
+    }
+    Ok(str::from_utf8(&output.stdout)
+        .map_err(|e| make_input_err!("InputRootAbsolutePath QueryCmd stdout not utf8: {e:?}"))?
+        .trim()
+        .to_string())
+}
+
 /// Creates a new `LocalWorker`. The `cas_store` must be an instance of
 /// `FastSlowStore` and will be checked at runtime.
 pub async fn new_local_worker(
@@ -516,24 +551,28 @@ pub async fn new_local_worker(
     historical_store: Store,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
     // Plan J load-bearing config gate. The fork only supports in-place
-    // execution in a pre-staged shared tree; every action requires
-    // `InputRootAbsolutePath` as a platform property, so the worker
-    // must declare it (the scheduler matches on the property's
-    // presence). Refuse to start a misconfigured worker rather than
-    // letting it accept actions it can't legally execute. See
-    // `CLAUDE.md` at the repo root.
-    let has_input_root = match config.platform_properties.get("InputRootAbsolutePath") {
-        Some(WorkerProperty::Values(vs)) => vs.iter().any(|v| !v.is_empty()),
-        Some(WorkerProperty::QueryCmd(cmd)) => !cmd.is_empty(),
-        None => false,
+    // execution in a pre-staged shared tree; the worker MUST declare its
+    // shared-tree path as `platform_properties.InputRootAbsolutePath`,
+    // and that single value drives every action this worker accepts
+    // (see `RunningActionImpl::new`). Refuse to start a misconfigured
+    // worker rather than letting it accept actions it can't legally
+    // execute. See `CLAUDE.md` at the repo root.
+    let shared_tree_root: String = match config.platform_properties.get("InputRootAbsolutePath") {
+        Some(WorkerProperty::Values(vs)) => vs
+            .iter()
+            .find(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or_default(),
+        Some(WorkerProperty::QueryCmd(cmd)) => resolve_input_root_query_cmd(cmd).await?,
+        None => String::new(),
     };
-    if !has_input_root {
+    if shared_tree_root.is_empty() {
         return Err(make_err!(
             Code::InvalidArgument,
             "Worker '{}' refuses to start: platform_properties.InputRootAbsolutePath \
-             must be declared (non-empty Values or QueryCmd). Sandbox execution \
-             is unsupported in this fork; every action must execute in-place in \
-             a pre-staged shared tree. See CLAUDE.md.",
+             must be declared (non-empty Values or QueryCmd that resolves to a \
+             non-empty path). Sandbox execution is unsupported in this fork; every \
+             action must execute in-place in a pre-staged shared tree. See CLAUDE.md.",
             config.name,
         ));
     }
@@ -643,6 +682,7 @@ pub async fn new_local_worker(
             input_cache,
             project_root: config.project_root.clone(),
             local_materialization_root: config.local_materialization_root.clone(),
+            shared_tree_root,
         })?);
     let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         config.clone(),

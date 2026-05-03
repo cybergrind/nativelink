@@ -14,10 +14,16 @@
 
 //! # Plan J shared-tree execution (load-bearing)
 //!
-//! Workers in this fork execute actions IN-PLACE inside the action's
-//! `InputRootAbsolutePath`. There is NO per-action sandbox. The input
-//! tree walk is skipped entirely — the rsync invariant guarantees every
-//! input is already at its canonical path. See `CLAUDE.md` at the repo
+//! Workers in this fork execute actions IN-PLACE inside the worker's
+//! configured `InputRootAbsolutePath`. There is NO per-action sandbox.
+//! The input tree walk is skipped entirely — the rsync invariant
+//! guarantees every input is already at its canonical path.
+//!
+//! The shared-tree path is a worker deployment fact, not an action fact:
+//! it comes from `LocalWorkerConfig.platform_properties` and is plumbed
+//! into `RunningActionsManagerImpl.shared_tree_root`. The action proto's
+//! `InputRootAbsolutePath` (if any) is ignored — siso, clang, and the
+//! scheduler do NOT need to know about it. See `CLAUDE.md` at the repo
 //! root and `RunningActionImpl::new` for the contract. This principle
 //! has been silently regressed once already (Phase A green-rewrite,
 //! commit `995627bd`); the contract tests in
@@ -52,7 +58,6 @@ use futures::future::{
 use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use nativelink_config::cas_server::{
     EnvironmentSource, ProjectRoot, UploadActionResultConfig, UploadCacheResultsStrategy,
-    translate_input_root_path,
 };
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
@@ -898,14 +903,16 @@ pub struct RunningActionImpl {
 
 impl RunningActionImpl {
     /// Plan J shared-tree binding: `work_directory` is aliased to the
-    /// action's `InputRootAbsolutePath` platform property (after
-    /// `project_root` user remap). The action's command will run with
-    /// cwd inside that tree. There is NO per-action sandbox in this
-    /// fork — see `CLAUDE.md` at the repo root.
+    /// worker-configured `shared_tree_root` (resolved at startup from
+    /// `LocalWorkerConfig.platform_properties["InputRootAbsolutePath"]`).
+    /// The action's command runs with cwd inside that tree.
     ///
-    /// Returns `Err(Code::InvalidArgument)` when the property is
-    /// missing or empty. The fork bans the upstream
-    /// `format!("{}/{}", action_directory, "work")` fallback.
+    /// The action proto's own `InputRootAbsolutePath`, if any, is
+    /// ignored: shared-tree execution is a worker-deployment fact, not
+    /// an action fact. siso/clang/scheduler do not need to stamp the
+    /// property; the worker applies its own configured root to every
+    /// action it accepts. There is NO per-action sandbox in this fork.
+    /// See `CLAUDE.md` at the repo root.
     pub fn new(
         execution_metadata: ExecutionMetadata,
         operation_id: OperationId,
@@ -914,25 +921,7 @@ impl RunningActionImpl {
         timeout: Duration,
         running_actions_manager: Arc<RunningActionsManagerImpl>,
     ) -> Result<Self, Error> {
-        let work_directory = match action_info
-            .platform_properties
-            .get("InputRootAbsolutePath")
-            .filter(|v| !v.is_empty())
-        {
-            Some(p) => translate_input_root_path(
-                p,
-                running_actions_manager.project_root.as_ref(),
-            ),
-            None => {
-                return Err(make_err!(
-                    Code::InvalidArgument,
-                    "Action carries no InputRootAbsolutePath platform property; \
-                     sandbox execution is banned in this fork. Misconfigured \
-                     siso or scheduler — every action must specify a shared \
-                     tree path. See CLAUDE.md."
-                ));
-            }
-        };
+        let work_directory = running_actions_manager.shared_tree_root.clone();
         let (kill_channel_tx, kill_channel_rx) = oneshot::channel();
         Ok(Self {
             operation_id,
@@ -2200,10 +2189,23 @@ pub struct RunningActionsManagerArgs<'a> {
     pub input_cache: Arc<InputCache>,
     /// Per-worker remap of action-borne `InputRootAbsolutePath` to a
     /// local on-disk path. None disables the remap.
+    ///
+    /// Vestigial in the post-1.4.x model: `shared_tree_root` is now
+    /// supplied directly by the worker config in this worker's local
+    /// path-space, so the action-side path no longer needs translation.
+    /// Kept on the args to stay shape-compatible with existing call sites.
     pub project_root: Option<ProjectRoot>,
     /// In-process worker output materialization root. None disables.
     /// Phase C wires this into `inner_upload_results`.
     pub local_materialization_root: Option<String>,
+    /// Plan J: absolute path to the pre-staged shared source tree this
+    /// worker executes inside. Resolved at startup from
+    /// `LocalWorkerConfig.platform_properties["InputRootAbsolutePath"]`
+    /// (validated for presence in `local_worker.rs::new_local_worker`).
+    /// Every action that this worker accepts runs with `cwd` aliased to
+    /// this path; the action proto's own `InputRootAbsolutePath` is
+    /// ignored. See `CLAUDE.md`.
+    pub shared_tree_root: String,
 }
 
 struct CleanupGuard {
@@ -2260,9 +2262,13 @@ pub struct RunningActionsManagerImpl {
     #[allow(dead_code)]
     input_cache: Arc<InputCache>,
     /// Per-worker `InputRootAbsolutePath` → local-FS remap.
+    /// Vestigial; see doc on the args struct.
+    #[allow(dead_code)]
     project_root: Option<ProjectRoot>,
     /// In-process worker output materialization root (Phase C).
     local_materialization_root: Option<String>,
+    /// Plan J shared-tree path. See args struct for the contract.
+    shared_tree_root: String,
     /// Plan J telemetry: count of actions that have completed
     /// successfully on this worker process. Operators compute
     /// actions/sec externally as `rate(total_actions_completed[1m])`.
@@ -2317,6 +2323,7 @@ impl RunningActionsManagerImpl {
             input_cache: args.input_cache,
             project_root: args.project_root,
             local_materialization_root: args.local_materialization_root,
+            shared_tree_root: args.shared_tree_root,
             total_actions_completed: core::sync::atomic::AtomicU64::new(0),
         })
     }

@@ -74,12 +74,13 @@ mod tests {
 
     const DEFAULT_MAX_UPLOAD_TIMEOUT: u64 = 600;
 
-    /// Plan J test helper: merge an `InputRootAbsolutePath` property into
-    /// an Action's platform (or create one if absent). Plan J requires
-    /// every action to carry this property; without it
-    /// `RunningActionImpl::new` returns `Err(InvalidArgument)`. Tests
-    /// that don't care about the input root simply pass their existing
-    /// `root_action_directory` here. See CLAUDE.md.
+    /// Test helper kept from the prior contract: stamps an
+    /// `InputRootAbsolutePath` property onto an Action. Under the
+    /// post-1.4.x contract `RunningActionImpl::new` ignores this
+    /// property entirely (the worker uses its own configured
+    /// `shared_tree_root`), so calling this is a no-op for `work_directory`
+    /// resolution. The helper stays only so existing tests that stamp
+    /// the property keep their old shape with no churn. See CLAUDE.md.
     fn with_input_root(mut action: Action, input_root: &str) -> Action {
         let mut platform = action.platform.unwrap_or_default();
         platform.properties.push(Property {
@@ -488,6 +489,7 @@ mod tests {
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -616,6 +618,7 @@ mod tests {
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -746,6 +749,7 @@ mod tests {
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -932,6 +936,7 @@ mod tests {
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1119,6 +1124,7 @@ mod tests {
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1332,6 +1338,7 @@ mod tests {
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1472,6 +1479,7 @@ mod tests {
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             })?);
 
         #[cfg(target_family = "unix")]
@@ -1680,6 +1688,7 @@ exit 0
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -1861,6 +1870,7 @@ exit 0
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2036,6 +2046,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2125,6 +2136,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2204,6 +2216,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2289,6 +2302,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2395,6 +2409,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2445,6 +2460,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2517,6 +2533,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2641,6 +2658,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2733,6 +2751,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2825,6 +2844,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -2913,6 +2933,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3070,6 +3091,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3244,6 +3266,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3349,6 +3372,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3468,6 +3492,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3653,6 +3678,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3778,6 +3804,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             })?);
 
         // Create a simple action
@@ -3924,6 +3951,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: root_action_directory.clone(),
             })?);
 
         // Create a simple action
@@ -4020,8 +4048,23 @@ exit 1
 
     /// Build a `RunningActionsManagerImpl` plus the `FastSlowStore` it
     /// holds, so tests can upload artifacts referenced by their actions.
+    /// `shared_tree_root` is the worker-configured Plan J root that will
+    /// alias every action's `work_directory`. Defaults to
+    /// `root_action_directory` when callers don't care about the
+    /// distinction.
     async fn plan_j_running_actions_manager(
         root_action_directory: &str,
+    ) -> Result<(Arc<RunningActionsManagerImpl>, Arc<FastSlowStore>), Error> {
+        plan_j_running_actions_manager_with_root(
+            root_action_directory,
+            root_action_directory,
+        )
+        .await
+    }
+
+    async fn plan_j_running_actions_manager_with_root(
+        root_action_directory: &str,
+        shared_tree_root: &str,
     ) -> Result<(Arc<RunningActionsManagerImpl>, Arc<FastSlowStore>), Error> {
         let (_fs_store, _mem_store, cas_store, ac_store) = setup_stores().await?;
         let manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
@@ -4047,6 +4090,7 @@ exit 1
                 input_cache: nativelink_worker::input_cache::InputCache::new_shared(),
                 project_root: None,
                 local_materialization_root: None,
+                shared_tree_root: shared_tree_root.to_string(),
             },
             Callbacks {
                 now_fn: SystemTime::now,
@@ -4080,30 +4124,36 @@ exit 1
         Ok((command_digest, input_root_digest))
     }
 
-    /// Plan J contract: when the action carries `InputRootAbsolutePath`,
-    /// `RunningActionImpl::new` MUST set `work_directory` to that path
-    /// (after `project_root` translation). This is the test that, had it
-    /// existed in Phase A red, would have prevented the silent regression
-    /// in commit `995627bd`.
+    /// Plan J contract: `work_directory` is sourced from the worker's
+    /// configured `shared_tree_root`, NOT from the action proto's
+    /// `InputRootAbsolutePath`. This is the test that, had it existed
+    /// in Phase A red, would have prevented the silent regression
+    /// in commit `995627bd`. Post-1.4.x update: the source of truth is
+    /// the worker config, so this test also stamps a *different* path
+    /// on the action to prove the action-side property is ignored.
     #[nativelink_test]
-    async fn work_directory_is_input_root_when_property_set() -> Result<(), Error> {
+    async fn work_directory_is_worker_configured_shared_tree_root() -> Result<(), Error> {
         let root_action_directory = make_temp_path("plan_j_contract_root");
         fs::create_dir_all(&root_action_directory).await?;
         let shared_tree = make_temp_path("plan_j_shared_tree");
         fs::create_dir_all(&shared_tree).await?;
+        let bogus_action_root = make_temp_path("plan_j_action_side_path_should_be_ignored");
 
         let (running_actions_manager, cas_store) =
-            plan_j_running_actions_manager(&root_action_directory).await?;
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree)
+                .await?;
         let (command_digest, input_root_digest) =
             upload_minimal_action_artifacts(&cas_store).await?;
 
+        // Stamp a deliberately-wrong InputRootAbsolutePath on the action
+        // to prove the worker ignores it.
         let action = with_input_root(
             Action {
                 command_digest: Some(command_digest.into()),
                 input_root_digest: Some(input_root_digest.into()),
                 ..Default::default()
             },
-            &shared_tree,
+            &bogus_action_root,
         );
         let action_digest = serialize_and_upload_message(
             &action,
@@ -4132,7 +4182,8 @@ exit 1
         assert_eq!(
             running_action.get_work_directory().as_str(),
             shared_tree.as_str(),
-            "Plan J contract: work_directory must alias InputRootAbsolutePath"
+            "Plan J contract: work_directory must come from worker-config \
+             shared_tree_root, not the action's InputRootAbsolutePath"
         );
         running_action.cleanup().await?;
         fs::remove_dir_all(&shared_tree).await?;
@@ -4140,11 +4191,12 @@ exit 1
         Ok(())
     }
 
-    /// Plan J contract: an action arriving without `InputRootAbsolutePath`
-    /// MUST be rejected with `InvalidArgument`. Sandbox execution is
-    /// banned in this fork.
+    /// Plan J contract (post-1.4.x): an action arriving WITHOUT any
+    /// `InputRootAbsolutePath` property is accepted normally. The worker
+    /// stamps its own configured shared-tree root onto every action it
+    /// runs; siso/clang are not required to emit the property.
     #[nativelink_test]
-    async fn new_action_without_input_root_property_fails_fast() -> Result<(), Error> {
+    async fn new_action_without_input_root_property_is_accepted() -> Result<(), Error> {
         let root_action_directory = make_temp_path("plan_j_no_irap_root");
         fs::create_dir_all(&root_action_directory).await?;
         let (running_actions_manager, cas_store) =
@@ -4152,7 +4204,7 @@ exit 1
         let (command_digest, input_root_digest) =
             upload_minimal_action_artifacts(&cas_store).await?;
 
-        // No platform_properties → no InputRootAbsolutePath.
+        // No platform_properties → no InputRootAbsolutePath. Must NOT fail.
         let action = Action {
             command_digest: Some(command_digest.into()),
             input_root_digest: Some(input_root_digest.into()),
@@ -4169,7 +4221,7 @@ exit 1
             ..Default::default()
         };
 
-        let result = running_actions_manager
+        let running_action = running_actions_manager
             .create_and_add_action(
                 "plan-j-worker".to_string(),
                 StartExecute {
@@ -4180,14 +4232,15 @@ exit 1
                     worker_id: "plan-j-worker".to_string(),
                 },
             )
-            .await;
+            .await?;
 
-        let err = result.err().expect("Plan J: must reject action without IRAP");
-        assert_eq!(err.code, Code::InvalidArgument);
-        assert!(
-            err.to_string().contains("InputRootAbsolutePath"),
-            "error must reference the missing key; got: {err}"
+        assert_eq!(
+            running_action.get_work_directory().as_str(),
+            root_action_directory.as_str(),
+            "Plan J contract: work_directory falls back to worker-config \
+             shared_tree_root even when the action stamps no property"
         );
+        running_action.cleanup().await?;
         fs::remove_dir_all(&root_action_directory).await?;
         Ok(())
     }
