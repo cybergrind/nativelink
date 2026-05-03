@@ -42,19 +42,18 @@ use tokio::fs;
 /// - Filesystem doesn't support hardlinks
 /// - Permission denied
 pub async fn hardlink_directory_tree(src_dir: &Path, dst_dir: &Path) -> Result<(), Error> {
-    error_if!(
-        !src_dir.exists(),
-        "Source directory does not exist: {}",
-        src_dir.display()
-    );
+    if !src_dir.exists() {
+        return Err(make_err!(
+            Code::InvalidArgument,
+            "Source directory does not exist: {}",
+            src_dir.display()
+        ));
+    }
 
-    error_if!(
-        dst_dir.exists(),
-        "Destination directory already exists: {}",
-        dst_dir.display()
-    );
-
-    // Create the root destination directory
+    // Pre-existing dst_dir is intentionally accepted: input-materialization
+    // callers create the work directory before invoking this function, so dst
+    // always pre-exists on the cache-hit path. The recursive walker will surface
+    // per-entry conflicts (true file collisions) on its own.
     fs::create_dir_all(dst_dir).await.err_tip(|| {
         format!(
             "Failed to create destination directory: {}",
@@ -187,9 +186,17 @@ fn set_readonly_recursive_impl<'a>(
             use std::os::unix::fs::PermissionsExt;
             let mut perms = metadata.permissions();
 
-            // If it's a directory, set to r-xr-xr-x (555)
-            // If it's a file, set to r--r--r-- (444)
-            let mode = if metadata.is_dir() { 0o555 } else { 0o444 };
+            // Strip write bits but preserve execute bits already present.
+            // Directories get 0o555. Files get (current_mode & 0o555), which
+            // preserves any existing +x (e.g. clang) while removing +w. This
+            // matters because the directory_cache hardlinks executables and
+            // non-executables alike — flattening to 0o444 breaks executables.
+            let current_mode = perms.mode();
+            let mode = if metadata.is_dir() {
+                0o555
+            } else {
+                current_mode & 0o555
+            };
             perms.set_mode(mode);
 
             fs::set_permissions(path, perms)
@@ -371,14 +378,16 @@ mod tests {
     }
 
     #[nativelink_test("crate")]
-    async fn test_hardlink_existing_destination() -> Result<(), Error> {
+    async fn test_hardlink_existing_destination_is_idempotent() -> Result<(), Error> {
+        // Pre-existing dst is intentionally accepted; see hardlink_directory_tree
+        // doc comment. The recursive walker still surfaces real per-entry conflicts.
         let (temp_dir, src_dir) = create_test_directory().await?;
         let dst_dir = temp_dir.path().join("existing");
 
         fs::create_dir(&dst_dir).await?;
 
-        let result = hardlink_directory_tree(&src_dir, &dst_dir).await;
-        assert!(result.is_err());
+        hardlink_directory_tree(&src_dir, &dst_dir).await?;
+        assert!(dst_dir.join("file1.txt").exists());
 
         Ok(())
     }

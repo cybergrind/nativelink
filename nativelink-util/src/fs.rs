@@ -286,7 +286,38 @@ pub async fn create_file(path: impl AsRef<Path>) -> Result<FileSlot, Error> {
 pub async fn hard_link(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), Error> {
     let src = src.as_ref().to_owned();
     let dst = dst.as_ref().to_owned();
-    call_with_permit(move |_| std::fs::hard_link(src, dst).map_err(Into::<Error>::into)).await
+    call_with_permit(move |_| -> Result<(), Error> {
+        // On macOS, prefer APFS clonefile() over hard_link.
+        // clonefile() creates a new inode that COW-shares blocks with src — O(1)
+        // metadata operation, no shared-inode lock contention. hard_link on APFS
+        // serializes severely when many parallel actions hard-link the same source
+        // file. Falls back to hard_link only on errors that indicate the FS does
+        // not support clonefile (cross-volume, non-APFS).
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            if let (Ok(src_c), Ok(dst_c)) = (
+                std::ffi::CString::new(src.as_os_str().as_bytes()),
+                std::ffi::CString::new(dst.as_os_str().as_bytes()),
+            ) {
+                // SAFETY: clonefile is a standard libc function on macOS taking
+                // two NUL-terminated C strings and a u32 flags argument.
+                let ret = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+                if ret == 0 {
+                    return Ok(());
+                }
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno != Some(libc::ENOTSUP)
+                    && errno != Some(libc::EXDEV)
+                    && errno != Some(libc::EOPNOTSUPP)
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+        }
+        std::fs::hard_link(&src, &dst).map_err(Into::<Error>::into)
+    })
+    .await
 }
 
 pub async fn set_permissions(src: impl AsRef<Path>, perm: Permissions) -> Result<(), Error> {
