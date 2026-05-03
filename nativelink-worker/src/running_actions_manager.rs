@@ -70,6 +70,8 @@ use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
 
+use nativelink_util::counters;
+
 use crate::input_cache::{HintLinkResult, InputCache, try_hint_link};
 
 /// Phase C — copy a set of declared outputs from the action's sandbox
@@ -203,14 +205,16 @@ pub fn download_to_directory<'a>(
 
                     // Plan K — verified (path, digest) already on disk.
                     if cache.path_digests.contains(&dest_path, &file_digest).await {
+                        counters::inc("worker.plan_k.hit");
                         return Ok(());
                     }
+                    counters::inc("worker.plan_k.miss");
 
                     // Plan I — try the hint tree before going to CAS.
                     let mut planned_via_hint = false;
                     if cache.plan_i_enabled {
                         if let Some(hint_dir) = current_hint_dir {
-                            if let HintLinkResult::Hit = try_hint_link(
+                            match try_hint_link(
                                 hint_dir,
                                 &file_name,
                                 &file_digest,
@@ -219,12 +223,19 @@ pub fn download_to_directory<'a>(
                             )
                             .await
                             {
-                                planned_via_hint = true;
+                                HintLinkResult::Hit => {
+                                    counters::inc("worker.plan_i.hit");
+                                    planned_via_hint = true;
+                                }
+                                _ => {
+                                    counters::inc("worker.plan_i.miss");
+                                }
                             }
                         }
                     }
 
                     if !planned_via_hint {
+                        counters::inc("worker.cas.populate_fast_store");
                         // Existing CAS path: populate fast store, then hardlink/clonefile.
                         cas_store
                             .populate_fast_store(file_digest.into())
@@ -322,8 +333,10 @@ pub fn download_to_directory<'a>(
 
                     // Plan L — already-walked (path, digest) subtree.
                     if cache.walked_dirs.contains(&new_path, &dir_digest).await {
+                        counters::inc("worker.plan_l.hit");
                         return Ok(());
                     }
+                    counters::inc("worker.plan_l.miss");
 
                     fs::create_dir(&new_directory_path)
                         .await
