@@ -35,6 +35,7 @@ use nativelink_store::ac_utils::get_and_decode_digest;
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
+use nativelink_util::counters;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::store_trait::{Store, StoreLike};
 use opentelemetry::context::FutureExt;
@@ -71,6 +72,11 @@ impl CasServer {
         &self,
         request: FindMissingBlobsRequest,
     ) -> Result<Response<FindMissingBlobsResponse>, Error> {
+        counters::inc("cas.find_missing_blobs.requests");
+        counters::add(
+            "cas.find_missing_blobs.digests",
+            request.blob_digests.len() as u64,
+        );
         let instance_name = &request.instance_name;
         let store = self
             .stores
@@ -86,11 +92,15 @@ impl CasServer {
             .has_many(&requested_blobs)
             .await
             .err_tip(|| "In find_missing_blobs")?;
-        let missing_blob_digests = sizes
+        let missing_blob_digests: Vec<_> = sizes
             .into_iter()
             .zip(request.blob_digests)
             .filter_map(|(maybe_size, digest)| maybe_size.map_or_else(|| Some(digest), |_| None))
             .collect();
+        counters::add(
+            "cas.find_missing_blobs.missing",
+            missing_blob_digests.len() as u64,
+        );
 
         Ok(Response::new(FindMissingBlobsResponse {
             missing_blob_digests,
@@ -101,6 +111,17 @@ impl CasServer {
         &self,
         request: BatchUpdateBlobsRequest,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Error> {
+        counters::inc("cas.batch_update_blobs.requests");
+        counters::add(
+            "cas.batch_update_blobs.blobs",
+            request.requests.len() as u64,
+        );
+        let total_bytes: u64 = request
+            .requests
+            .iter()
+            .map(|r| r.data.len() as u64)
+            .sum();
+        counters::add("cas.batch_update_blobs.bytes", total_bytes);
         let instance_name = &request.instance_name;
 
         let store = self
@@ -156,6 +177,14 @@ impl CasServer {
         &self,
         request: BatchReadBlobsRequest,
     ) -> Result<Response<BatchReadBlobsResponse>, Error> {
+        counters::inc("cas.batch_read_blobs.requests");
+        counters::add("cas.batch_read_blobs.blobs", request.digests.len() as u64);
+        let total_bytes: u64 = request
+            .digests
+            .iter()
+            .map(|d| u64::try_from(d.size_bytes).unwrap_or(0))
+            .sum();
+        counters::add("cas.batch_read_blobs.bytes", total_bytes);
         let instance_name = &request.instance_name;
 
         let store = self
@@ -213,6 +242,7 @@ impl CasServer {
         &self,
         request: GetTreeRequest,
     ) -> Result<impl Stream<Item = Result<GetTreeResponse, Status>> + Send + use<>, Error> {
+        counters::inc("cas.get_tree.requests");
         let instance_name = &request.instance_name;
 
         let store = self
@@ -293,6 +323,8 @@ impl CasServer {
         let next_page_token: String = deque
             .front()
             .map_or_else(String::new, |value| format!("{value}"));
+
+        counters::add("cas.get_tree.directories", directories.len() as u64);
 
         Ok(futures::stream::once(async {
             Ok(GetTreeResponse {
