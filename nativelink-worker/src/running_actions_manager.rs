@@ -71,6 +71,48 @@ use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
 
 use crate::input_cache::{HintLinkResult, InputCache, try_hint_link};
+
+/// Phase C — copy a set of declared outputs from the action's sandbox
+/// into a local materialization root, idempotent on a matching-size
+/// destination.
+///
+/// Closes the in-process worker / siso-local-fallback bug: when the
+/// worker shares its host with the build tree (combined mode), siso
+/// expects outputs to land on disk where the next action will look for
+/// them. A remote worker leaves `local_materialization_root` unset and
+/// keeps the upload-to-CAS-only behavior.
+///
+/// Idempotency rule: if `<local_root>/<declared_path>` already exists
+/// with the expected byte size, leave it alone (the path-share-lucky
+/// case where clang already wrote the canonical bytes). Otherwise
+/// remove any stale file and hardlink/clonefile from the sandbox path.
+///
+/// Errors are propagated by the caller as warnings — a materialization
+/// failure must not abort the action whose outputs are already in CAS.
+pub async fn materialize_one_output_locally(
+    work_dir: &str,
+    local_root: &str,
+    declared_path: &str,
+    expected_size: u64,
+) -> Result<(), Error> {
+    let src = format!("{work_dir}/{declared_path}");
+    let dst = format!("{local_root}/{declared_path}");
+
+    // Idempotent skip when dst already has matching bytes.
+    if let Ok(meta) = tokio::fs::metadata(&dst).await {
+        if meta.len() == expected_size {
+            return Ok(());
+        }
+        let _stale = tokio::fs::remove_file(&dst).await;
+    }
+
+    if let Some(parent) = std::path::Path::new(&dst).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(Error::from)?;
+    }
+    fs::hard_link(&src, &dst).await
+}
 use parking_lot::Mutex;
 use prost::Message;
 use relative_path::RelativePath;
@@ -1521,6 +1563,35 @@ impl RunningActionImpl {
         output_directory_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
+
+        // Phase C — local_materialization_root: also place declared
+        // outputs at <local_root>/<declared_path> so siso's local-
+        // fallback path finds them. Idempotent on matching size.
+        // Failures are logged, never fatal.
+        if let Some(local_root) = &self.running_actions_manager.local_materialization_root {
+            for output_file in &output_files {
+                let declared_path = match &output_file.name_or_path {
+                    NameOrPath::Name(s) | NameOrPath::Path(s) => s.as_str(),
+                };
+                let size = output_file.digest.size_bytes();
+                if let Err(e) = materialize_one_output_locally(
+                    &self.work_directory,
+                    local_root,
+                    declared_path,
+                    size,
+                )
+                .await
+                {
+                    warn!(
+                        operation_id = ?self.operation_id,
+                        declared_path,
+                        error = ?e,
+                        "local_materialization_root: failed to place output on disk; \
+                         action result still committed (CAS has the bytes)",
+                    );
+                }
+            }
+        }
         {
             let mut state = self.state.lock();
             execution_metadata.worker_completed_timestamp =
