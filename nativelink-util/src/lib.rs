@@ -29,6 +29,7 @@ pub mod known_platform_property_provider;
 pub mod metrics;
 pub mod metrics_utils;
 pub mod operation_state_manager;
+pub mod perm_warn;
 pub mod origin_event;
 pub mod origin_event_publisher;
 pub mod platform_properties;
