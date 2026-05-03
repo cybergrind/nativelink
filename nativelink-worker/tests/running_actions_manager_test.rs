@@ -4582,4 +4582,306 @@ exit 1
         fs::remove_dir_all(&root_action_directory).await?;
         Ok(())
     }
+
+    /// Upload a two-level input root: `<subdir>/<file_name>`. Returns
+    /// (file_content_digest, root_dir_digest). Used by tests that need
+    /// the input walk to traverse a nested directory.
+    async fn upload_nested_file_input_root(
+        cas_store: &Arc<FastSlowStore>,
+        subdir: &str,
+        file_name: &str,
+        content: &[u8],
+    ) -> Result<(DigestInfo, DigestInfo), Error> {
+        let mut hasher = DigestHasherFunc::Sha256.hasher();
+        hasher.update(content);
+        let content_digest: DigestInfo = hasher.finalize_digest();
+        cas_store
+            .as_pin()
+            .update_oneshot(content_digest, content.to_vec().into())
+            .await?;
+
+        let child = Directory {
+            files: vec![FileNode {
+                name: file_name.to_string(),
+                digest: Some(content_digest.into()),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        let child_digest = serialize_and_upload_message(
+            &child,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let root = Directory {
+            directories: vec![DirectoryNode {
+                name: subdir.to_string(),
+                digest: Some(child_digest.into()),
+            }],
+            ..Default::default()
+        };
+        let root_digest = serialize_and_upload_message(
+            &root,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        Ok((content_digest, root_digest))
+    }
+
+    /// A directory that already exists at the canonical path inside the
+    /// shared tree must not fail the action. Shared-tree-as-cache means
+    /// directories normally pre-exist (from rsync staging or from a
+    /// prior action). EEXIST on `fs::create_dir` is the expected case.
+    #[nativelink_test]
+    async fn pre_existing_directory_in_shared_tree_does_not_fail_action()
+    -> Result<(), Error> {
+        const SUBDIR: &str = "build";
+        const FILE_NAME: &str = "manifest.txt";
+        const FILE_CONTENT: &[u8] = b"manifest-from-cas";
+
+        let root_action_directory = make_temp_path("plan_j_predir_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_predir_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        // Plant the subdirectory before the walk runs.
+        let preexisting_subdir = format!("{}/{}", shared_tree, SUBDIR);
+        fs::create_dir_all(&preexisting_subdir).await?;
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree).await?;
+        let (_content_digest, input_root_digest) =
+            upload_nested_file_input_root(&cas_store, SUBDIR, FILE_NAME, FILE_CONTENT).await?;
+
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        let dest_path = format!("{}/{}/{}", shared_tree, SUBDIR, FILE_NAME);
+        let actual = fs::read(&dest_path).await?;
+        assert_eq!(
+            actual, FILE_CONTENT,
+            "Input file inside pre-existing subdir was not materialized"
+        );
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    /// Upload a flat input root containing a single SymlinkNode. Returns
+    /// the root directory digest.
+    async fn upload_single_symlink_input_root(
+        cas_store: &Arc<FastSlowStore>,
+        link_name: &str,
+        target: &str,
+    ) -> Result<DigestInfo, Error> {
+        let directory = Directory {
+            symlinks: vec![SymlinkNode {
+                name: link_name.to_string(),
+                target: target.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        serialize_and_upload_message(
+            &directory,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await
+    }
+
+    /// A symlink already at the canonical path with the SAME target must
+    /// not fail the action. Without idempotent handling, `fs::symlink`
+    /// would EEXIST and abort the walk.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn pre_existing_correct_symlink_does_not_fail_action() -> Result<(), Error> {
+        const LINK_NAME: &str = "alias";
+        const LINK_TARGET: &str = "../some/external/path";
+
+        let root_action_directory = make_temp_path("plan_j_presym_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_presym_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        // Plant a symlink with the matching target before the walk.
+        let dest_path = format!("{}/{}", shared_tree, LINK_NAME);
+        fs::symlink(LINK_TARGET, &dest_path).await?;
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree).await?;
+        let input_root_digest =
+            upload_single_symlink_input_root(&cas_store, LINK_NAME, LINK_TARGET).await?;
+
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        let observed = tokio::fs::read_link(&dest_path).await?;
+        assert_eq!(
+            observed.to_string_lossy(),
+            LINK_TARGET,
+            "Pre-existing matching symlink should be left in place"
+        );
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
+
+    /// A symlink already at the canonical path but pointing at a DIFFERENT
+    /// target must be replaced with the action-declared target. Mirrors
+    /// `stale_file_at_canonical_path_is_replaced` for the symlink case.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn pre_existing_wrong_symlink_is_replaced() -> Result<(), Error> {
+        const LINK_NAME: &str = "alias";
+        const STALE_TARGET: &str = "../wrong/old/target";
+        const FRESH_TARGET: &str = "../correct/new/target";
+
+        let root_action_directory = make_temp_path("plan_j_wrongsym_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_wrongsym_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        let dest_path = format!("{}/{}", shared_tree, LINK_NAME);
+        fs::symlink(STALE_TARGET, &dest_path).await?;
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree).await?;
+        let input_root_digest =
+            upload_single_symlink_input_root(&cas_store, LINK_NAME, FRESH_TARGET).await?;
+
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        let observed = tokio::fs::read_link(&dest_path).await?;
+        assert_eq!(
+            observed.to_string_lossy(),
+            FRESH_TARGET,
+            "Stale symlink with wrong target must be replaced"
+        );
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
 }

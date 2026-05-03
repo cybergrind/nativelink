@@ -403,9 +403,16 @@ pub fn download_to_directory<'a>(
                     }
                     counters::inc("worker.plan_l.miss");
 
-                    fs::create_dir(&new_directory_path)
-                        .await
-                        .err_tip(|| format!("Could not create directory {new_directory_path}"))?;
+                    // Shared-tree-as-cache: directories normally pre-exist
+                    // because the tree was rsync-staged or populated by a
+                    // prior action. EEXIST is the expected case, not an error.
+                    if let Err(e) = fs::create_dir(&new_directory_path).await
+                        && e.code != Code::AlreadyExists
+                    {
+                        return Err(e).err_tip(|| {
+                            format!("Could not create directory {new_directory_path}")
+                        });
+                    }
                     download_to_directory(
                         cas_store,
                         filesystem_store,
@@ -430,6 +437,23 @@ pub fn download_to_directory<'a>(
             let dest = format!("{}/{}", current_directory, symlink_node.name);
             futures.push(
                 async move {
+                    // Shared-tree-as-cache: a symlink may already sit at
+                    // the canonical path. Mirror the file path's idempotent
+                    // shape — read the existing link target; if it already
+                    // matches, skip; only remove+recreate on mismatch.
+                    match tokio::fs::read_link(&dest).await {
+                        Ok(existing) if existing == Path::new(&symlink_node.target) => {
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            fs::remove_file(&dest).await.ok();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => {
+                            // Not a symlink (regular file/dir at dest) — clear it.
+                            fs::remove_file(&dest).await.ok();
+                        }
+                    }
                     fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
                         format!(
                             "Could not create symlink {} -> {}",
