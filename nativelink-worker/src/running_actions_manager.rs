@@ -1735,11 +1735,9 @@ impl RunningActionImpl {
         // Totals sum to `total_ms` which is wall-clock from worker_start
         // to worker_completed.
         let now = (self.running_actions_manager.callbacks.now_fn)();
-        let total_actions = self
-            .running_actions_manager
-            .total_actions_completed
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
+        counters::add_with_rate("worker.actions_completed", 1);
+        let total_actions = counters::get("worker.actions_completed");
+        let actions_per_minute = counters::rate_last_60s("worker.actions_completed");
         let prep_ms = execution_metadata
             .input_fetch_completed_timestamp
             .duration_since(execution_metadata.input_fetch_start_timestamp)
@@ -1767,6 +1765,7 @@ impl RunningActionImpl {
             target: "nativelink.worker.action_timings",
             operation_id = %self.operation_id,
             total_actions_completed = total_actions,
+            actions_per_minute,
             prep_ms,
             exec_ms,
             upload_ms,
@@ -2362,13 +2361,11 @@ pub struct RunningActionsManagerImpl {
     local_materialization_root: Option<String>,
     /// Plan J shared-tree path. See args struct for the contract.
     shared_tree_root: String,
-    /// Plan J telemetry: count of actions that have completed
-    /// successfully on this worker process. Operators compute
-    /// actions/sec externally as `rate(total_actions_completed[1m])`.
-    /// Sibling per-action info logs (target
-    /// `nativelink.worker.action_timings`) carry prep/exec/upload/total
-    /// ms breakdowns.
-    total_actions_completed: core::sync::atomic::AtomicU64,
+    // Plan J telemetry note: per-action completions are tracked via
+    // the global `nativelink_util::counters` registry under the name
+    // `worker.actions_completed`. The per-action info log (target
+    // `nativelink.worker.action_timings`) carries the cumulative count
+    // plus a 60s sliding rate (`actions_per_minute`) computed in-process.
 }
 
 impl RunningActionsManagerImpl {
@@ -2417,7 +2414,6 @@ impl RunningActionsManagerImpl {
             project_root: args.project_root,
             local_materialization_root: args.local_materialization_root,
             shared_tree_root: args.shared_tree_root,
-            total_actions_completed: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
