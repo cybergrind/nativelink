@@ -345,6 +345,44 @@ pub async fn idempotent_hard_link(
     }
 }
 
+/// Idempotent symlink: ensure `dst` is a symlink to `target`. Same
+/// shared-tree-as-cache invariants as `idempotent_hard_link` for the
+/// symlink branch of `download_to_directory`:
+///   - matching symlink already at `dst` → Ok (race winner / prior
+///     action / pre-staged tree).
+///   - wrong-target symlink → unlink + retry.
+///   - regular file at `dst` → `remove_file` + retry.
+///   - real directory at `dst` (the in-the-wild case where files were
+///     materialized through a framework's `Versions/Current/...` path
+///     before the `Current → A` symlink itself was processed; the
+///     legacy pre-clean used `remove_file(...).ok()` which fails
+///     EISDIR on a directory and was silenced, leaving `fs::symlink`
+///     to fail EEXIST) → `remove_dir_all` + retry.
+///
+/// `remove_file`'s and `remove_dir_all`'s errors are intentionally
+/// swallowed because we only care whether the *retry* `fs::symlink`
+/// succeeds; if both removal paths failed but the second `fs::symlink`
+/// somehow succeeds (e.g. a peer cleared the path), we accept the win.
+/// Any genuine failure surfaces through the second `fs::symlink`'s
+/// returned error.
+#[cfg(target_family = "unix")]
+pub async fn idempotent_symlink(target: &str, dst: &Path) -> Result<(), Error> {
+    match fs::symlink(target, dst).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.code == Code::AlreadyExists => {
+            if let Ok(existing) = fs::read_link(dst).await
+                && existing == Path::new(target)
+            {
+                return Ok(());
+            }
+            fs::remove_file(dst).await.ok();
+            tokio::fs::remove_dir_all(dst).await.ok();
+            fs::symlink(target, dst).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InputCache — process-shared state handed to `download_to_directory`.
 // Per-action data (hint_root, hasher_func) flows as separate parameters.

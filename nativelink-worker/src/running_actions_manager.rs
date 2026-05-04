@@ -100,7 +100,8 @@ use nativelink_util::{background_spawn, spawn, spawn_blocking};
 use nativelink_util::counters;
 
 use crate::input_cache::{
-    HintLinkResult, InputCache, idempotent_hard_link, try_existing_dest_link, try_hint_link,
+    HintLinkResult, InputCache, idempotent_hard_link, idempotent_symlink, try_existing_dest_link,
+    try_hint_link,
 };
 
 /// Phase C — copy a set of declared outputs from the action's sandbox
@@ -441,29 +442,21 @@ pub fn download_to_directory<'a>(
             let dest = format!("{}/{}", current_directory, symlink_node.name);
             futures.push(
                 async move {
-                    // Shared-tree-as-cache: a symlink may already sit at
-                    // the canonical path. Mirror the file path's idempotent
-                    // shape — read the existing link target; if it already
-                    // matches, skip; only remove+recreate on mismatch.
-                    match tokio::fs::read_link(&dest).await {
-                        Ok(existing) if existing == Path::new(&symlink_node.target) => {
-                            return Ok(());
-                        }
-                        Ok(_) => {
-                            fs::remove_file(&dest).await.ok();
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(_) => {
-                            // Not a symlink (regular file/dir at dest) — clear it.
-                            fs::remove_file(&dest).await.ok();
-                        }
-                    }
-                    fs::symlink(&symlink_node.target, &dest).await.err_tip(|| {
-                        format!(
-                            "Could not create symlink {} -> {}",
-                            symlink_node.target, dest
-                        )
-                    })?;
+                    // Shared-tree-as-cache: idempotent against matching
+                    // pre-existing symlinks, wrong-target symlinks, stray
+                    // regular files, and real directories planted at the
+                    // canonical path (the SiriMessagesUI.framework
+                    // Versions/Current case where files were materialized
+                    // through the symlink path before the symlink itself
+                    // was processed).
+                    idempotent_symlink(&symlink_node.target, Path::new(&dest))
+                        .await
+                        .err_tip(|| {
+                            format!(
+                                "Could not create symlink {} -> {}",
+                                symlink_node.target, dest
+                            )
+                        })?;
                     Ok(())
                 }
                 .boxed(),

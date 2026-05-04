@@ -4884,4 +4884,93 @@ exit 1
         fs::remove_dir_all(&root_action_directory).await?;
         Ok(())
     }
+
+    /// A real directory already sits at the canonical symlink path —
+    /// the production failure shape from the SiriMessagesUI.framework
+    /// report (Versions/Current as a directory, not a symlink). Walk
+    /// must replace it with the action-declared symlink. Without
+    /// idempotent handling, the existing pre-clean uses
+    /// `fs::remove_file(...).ok()` which fails EISDIR, then
+    /// `fs::symlink` fails EEXIST and the walk aborts.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn pre_existing_directory_at_symlink_path_is_replaced() -> Result<(), Error> {
+        const LINK_NAME: &str = "Current";
+        const FRESH_TARGET: &str = "A";
+
+        let root_action_directory = make_temp_path("plan_j_dirsym_root");
+        fs::create_dir_all(&root_action_directory).await?;
+        let shared_tree = make_temp_path("plan_j_dirsym_tree");
+        fs::create_dir_all(&shared_tree).await?;
+
+        // Plant a real directory (with a child file) where the symlink
+        // should land. Mimics the in-the-wild case where files were
+        // materialized through the symlink path before the symlink
+        // itself was processed.
+        let dest_path = format!("{}/{}", shared_tree, LINK_NAME);
+        fs::create_dir_all(&dest_path).await?;
+        tokio::fs::write(format!("{}/{}", dest_path, "stale_child"), b"stale").await?;
+
+        let (running_actions_manager, cas_store) =
+            plan_j_running_actions_manager_with_root(&root_action_directory, &shared_tree).await?;
+        let input_root_digest =
+            upload_single_symlink_input_root(&cas_store, LINK_NAME, FRESH_TARGET).await?;
+
+        let command = Command {
+            arguments: vec!["true".to_string()],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                "plan-j-worker".to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: None,
+                    worker_id: "plan-j-worker".to_string(),
+                },
+            )
+            .await?;
+
+        let _prepared = running_action.clone().prepare_action().await?;
+
+        let meta = tokio::fs::symlink_metadata(&dest_path).await?;
+        assert!(
+            meta.file_type().is_symlink(),
+            "Pre-existing directory must be replaced with a symlink"
+        );
+        let observed = tokio::fs::read_link(&dest_path).await?;
+        assert_eq!(
+            observed.to_string_lossy(),
+            FRESH_TARGET,
+            "Replaced symlink must point at the action-declared target"
+        );
+
+        running_action.cleanup().await?;
+        fs::remove_dir_all(&shared_tree).await?;
+        fs::remove_dir_all(&root_action_directory).await?;
+        Ok(())
+    }
 }
